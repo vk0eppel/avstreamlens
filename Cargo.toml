@@ -1,0 +1,10 @@
+[package]
+name = "avstreamlens"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+pcap = "1.1"
+pnet_packet = "0.34"
+chrono = "0.4"
+
