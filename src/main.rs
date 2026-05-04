@@ -12,6 +12,7 @@ use pnet_packet::{
     ethernet::{EthernetPacket, EtherTypes},
     ipv4::Ipv4Packet,
     udp::UdpPacket,
+    tcp::TcpPacket,
     Packet,
 };
 use chrono::{Datelike, Local, Timelike};
@@ -67,9 +68,16 @@ struct PtpInfo {
     correction_ns: Option<i64>,
     path_delay_ns: Option<i64>,
     origin_timestamp_ns: Option<u64>,
+    // PTP message parsing improvements
+    message_name: String,        // "Sync", "Follow_Up", "Delay_Req", "Delay_Resp", etc.
+    port_id: Option<u16>,
+    sequence_id: u16,
+    log_sync_interval: i8,
+    log_min_pdelay_req_interval: i8,
 }
 
 #[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)]
 enum ProtocolChoice { All, AES67, ST2110, Dante, NDI, AVB, PTP }
 
 impl ProtocolChoice {
@@ -168,32 +176,62 @@ struct SdpMedia {
 
 #[derive(Debug, Clone)]
 struct StreamStats {
-    protocol:     String,
-    packets:      u64,
-    lost_packets: u64,
-    last_seq:     Option<u16>,
-    jitter:       f64,        // seconds, RFC 3550
-    last_rtp_ts:  Option<u32>,
-    last_arrival: Option<Instant>,
-    clock_hz:     f64,
-    sdp_name:     Option<String>,
-    sdp_rtpmap:   Option<String>,
+    protocol:          String,
+    packets:           u64,
+    lost_packets:      u64,
+    last_seq:          Option<u16>,
+    jitter:            f64,        // seconds, RFC 3550
+    last_rtp_ts:       Option<u32>,
+    last_arrival:      Option<Instant>,
+    clock_hz:          f64,
+    sdp_name:          Option<String>,
+    sdp_rtpmap:        Option<String>,
+    // Enhanced information
+    is_multicast:      bool,
+    dst_ip:            Option<Ipv4Addr>,
+    dst_port:          u16,
+    media_type:        String,    // "audio", "video", "ancillary" or "unknown"
+    channels:          u8,         // for audio
+    bitrate_bps:       u64,        // calculated bitrate
+    last_bitrate_check: Instant,
+    packets_at_check:  u64,
+    // Timestamp discontinuity detection
+    ts_discontinuities: u64,
+    last_ts_diff:      Option<i64>,
 }
 
 impl StreamStats {
     fn new(protocol: &str, clock_hz: f64) -> Self {
         Self {
-            protocol:     protocol.to_string(),
-            packets:      0,
-            lost_packets: 0,
-            last_seq:     None,
-            jitter:       0.0,
-            last_rtp_ts:  None,
-            last_arrival: None,
+            protocol:            protocol.to_string(),
+            packets:             0,
+            lost_packets:        0,
+            last_seq:            None,
+            jitter:              0.0,
+            last_rtp_ts:         None,
+            last_arrival:        None,
             clock_hz,
-            sdp_name:     None,
-            sdp_rtpmap:   None,
+            sdp_name:            None,
+            sdp_rtpmap:          None,
+            is_multicast:        false,
+            dst_ip:              None,
+            dst_port:            0,
+            media_type:          "unknown".to_string(),
+            channels:            0,
+            bitrate_bps:         0,
+            last_bitrate_check:  Instant::now(),
+            packets_at_check:    0,
+            ts_discontinuities:  0,
+            last_ts_diff:        None,
         }
+    }
+
+    fn new_with_info(protocol: &str, clock_hz: f64, is_multicast: bool, dst_ip: Ipv4Addr, dst_port: u16) -> Self {
+        let mut stats = Self::new(protocol, clock_hz);
+        stats.is_multicast = is_multicast;
+        stats.dst_ip = Some(dst_ip);
+        stats.dst_port = dst_port;
+        stats
     }
 
     fn update(&mut self, seq: u16, rtp_ts: u32) {
@@ -208,6 +246,23 @@ impl StreamStats {
         }
         self.last_seq = Some(seq);
 
+        // ── Timestamp discontinuity detection (AES67 compliance)
+        if let Some(last_ts) = self.last_rtp_ts {
+            let expected_diff = if self.clock_hz > 0.0 {
+                // For audio typically 48kHz, we expect ~2-20ms worth of timestamps
+                (self.clock_hz / 1000.0) as i64 * 5 // Assuming ~5ms packets
+            } else {
+                1000
+            };
+            let actual_diff = rtp_ts.wrapping_sub(last_ts) as i64;
+            // Allow +/- 50% tolerance
+            if (actual_diff as f64) < (expected_diff as f64 * 0.5) || 
+               (actual_diff as f64) > (expected_diff as f64 * 1.5) {
+                self.ts_discontinuities += 1;
+            }
+            self.last_ts_diff = Some(actual_diff);
+        }
+
         // ── RFC 3550 §6.4.1 Jitter ────────────────────
         //   D(i,j) = | (Rj−Ri) − (Sj−Si) |
         //   J(i)   = J(i−1) + (D − J(i−1)) / 16
@@ -220,6 +275,17 @@ impl StreamStats {
         }
         self.last_rtp_ts  = Some(rtp_ts);
         self.last_arrival = Some(now);
+
+        // ── Bitrate calculation ──────────────────────────
+        if self.last_bitrate_check.elapsed() > Duration::from_secs(1) {
+            let packets_delta = self.packets - self.packets_at_check;
+            if packets_delta > 0 && self.clock_hz > 0.0 {
+                // Rough estimate: assume 1500 byte packets on average
+                self.bitrate_bps = packets_delta * 1500 * 8;
+            }
+            self.packets_at_check = self.packets;
+            self.last_bitrate_check = now;
+        }
     }
 
     fn loss_pct(&self) -> f64 {
@@ -228,6 +294,167 @@ impl StreamStats {
     }
 
     fn jitter_ms(&self) -> f64 { self.jitter * 1000.0 }
+}
+
+// ─────────────────────────────────────────────────────────
+// TCP stream monitoring (for NDI, etc.)
+// ─────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+struct TcpStreamStats {
+    key: String,
+    src_ip: Ipv4Addr,
+    src_port: u16,
+    dst_ip: Ipv4Addr,
+    dst_port: u16,
+    packets: u64,
+    bytes: u64,
+    retransmissions: u64,      // packets with SYN/ACK but not new seq
+    fin_packets: u64,
+    rst_packets: u64,
+    last_seen: Instant,
+    stream_quality: StreamQuality,
+    bitrate_bps: u64,
+    last_bitrate_check: Instant,
+    bytes_at_check: u64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum StreamQuality {
+    Healthy,
+    Degrading,      // Growing retransmissions
+    Critical,       // High retransmission rate or FIN/RST
+    Terminated,
+}
+
+impl TcpStreamStats {
+    fn new(src_ip: Ipv4Addr, src_port: u16, dst_ip: Ipv4Addr, dst_port: u16) -> Self {
+        let key = format!("TCP {}:{} → {}:{}", src_ip, src_port, dst_ip, dst_port);
+        Self {
+            key,
+            src_ip,
+            src_port,
+            dst_ip,
+            dst_port,
+            packets: 0,
+            bytes: 0,
+            retransmissions: 0,
+            fin_packets: 0,
+            rst_packets: 0,
+            last_seen: Instant::now(),
+            stream_quality: StreamQuality::Healthy,
+            bitrate_bps: 0,
+            last_bitrate_check: Instant::now(),
+            bytes_at_check: 0,
+        }
+    }
+
+    fn update_bitrate(&mut self) {
+        if self.last_bitrate_check.elapsed() > Duration::from_secs(1) {
+            let bytes_delta = self.bytes - self.bytes_at_check;
+            self.bitrate_bps = bytes_delta * 8;
+            self.bytes_at_check = self.bytes;
+            self.last_bitrate_check = Instant::now();
+        }
+    }
+
+    fn update_quality(&mut self) {
+        if self.rst_packets > 0 || self.fin_packets > 2 {
+            self.stream_quality = StreamQuality::Terminated;
+        } else if self.retransmissions > 10 {
+            self.stream_quality = StreamQuality::Critical;
+        } else if self.retransmissions > 2 {
+            self.stream_quality = StreamQuality::Degrading;
+        } else {
+            self.stream_quality = StreamQuality::Healthy;
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────
+// Global network health statistics
+// ─────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+struct NetworkHealth {
+    total_packets: u64,
+    total_bytes: u64,
+    multicast_packets: u64,
+    unicast_packets: u64,
+    packet_loss_streams: u64,        // count of streams with loss
+    high_jitter_streams: u64,
+    aes67_discontinuities: u64,
+    timestamp_errors: u64,
+    tcp_retransmissions: u64,
+    detected_duplicates: u64,        // multicast duplicates
+    congestion_events: u64,
+    saturation_warnings: u64,
+    network_score: f64,              // 0-100
+}
+
+impl NetworkHealth {
+    fn new() -> Self {
+        Self {
+            total_packets: 0,
+            total_bytes: 0,
+            multicast_packets: 0,
+            unicast_packets: 0,
+            packet_loss_streams: 0,
+            high_jitter_streams: 0,
+            aes67_discontinuities: 0,
+            timestamp_errors: 0,
+            tcp_retransmissions: 0,
+            detected_duplicates: 0,
+            congestion_events: 0,
+            saturation_warnings: 0,
+            network_score: 100.0,
+        }
+    }
+
+    fn calculate_score(&mut self, streams: &HashMap<String, StreamStats>, tcp_streams: &HashMap<String, TcpStreamStats>) {
+        let mut score = 100.0;
+
+        // Deduct for packet loss
+        for stats in streams.values() {
+            if stats.loss_pct() > 0.0 {
+                score -= stats.loss_pct().min(10.0);
+            }
+        }
+
+        // Deduct for jitter
+        for stats in streams.values() {
+            if stats.jitter_ms() > 20.0 {
+                score -= 5.0;
+            } else if stats.jitter_ms() > 10.0 {
+                score -= 2.0;
+            }
+        }
+
+        // Deduct for timestamp discontinuities
+        for stats in streams.values() {
+            if stats.ts_discontinuities > 0 {
+                score -= 3.0 * (stats.ts_discontinuities as f64).min(5.0);
+            }
+        }
+
+        // Deduct for TCP issues
+        for tcp_stats in tcp_streams.values() {
+            match tcp_stats.stream_quality {
+                StreamQuality::Healthy => {},
+                StreamQuality::Degrading => score -= 5.0,
+                StreamQuality::Critical => score -= 15.0,
+                StreamQuality::Terminated => score -= 25.0,
+            }
+        }
+
+        // Deduct for detected issues
+        score -= (self.detected_duplicates as f64).min(10.0);
+        score -= (self.congestion_events as f64 * 0.5).min(15.0);
+
+        self.network_score = score.max(0.0);
+    }
 }
 
 // ─────────────────────────────────────────────────────────
@@ -314,6 +541,7 @@ impl Logger {
         let _ = writeln!(self.file, "{}", message);
     }
 
+    #[allow(dead_code)]
     fn log_fmt(&mut self, args: std::fmt::Arguments) {
         let message = args.to_string();
         let _ = writeln!(self.file, "{}", message);
@@ -487,7 +715,7 @@ fn parse_sdp(sdp: &str) -> SdpSession {
             }
 
             'a' => {
-                let media = match cur_media.as_mut() { Some(m) => m, None => continue };
+                let media = match cur_media.as_mut() { Some(m) => m, _ => continue };
 
                 if let Some(rest) = value.strip_prefix("rtpmap:") {
                     // a=rtpmap:<pt> <encoding>/<clock>[/<channels>]
@@ -617,7 +845,29 @@ fn detect_protocol(eth: &EthernetPacket) -> Option<AvProtocol> {
 }
 
 // ─────────────────────────────────────────────────────────
-// Network Helpers
+// TCP Parser and Retransmission Detection
+// ─────────────────────────────────────────────────────────
+
+fn parse_tcp_packet(eth: &EthernetPacket) -> Option<(Ipv4Addr, Ipv4Addr, u16, u16, bool, bool, bool)> {
+    if eth.get_ethertype() != EtherTypes::Ipv4 { return None; }
+    let ip = Ipv4Packet::new(eth.payload())?;
+    if ip.get_next_level_protocol() != pnet_packet::ip::IpNextHeaderProtocols::Tcp { return None; }
+    
+    let tcp = TcpPacket::new(ip.payload())?;
+    let src_ip = ip.get_source();
+    let dst_ip = ip.get_destination();
+    let src_port = tcp.get_source();
+    let dst_port = tcp.get_destination();
+    
+    let has_fin = tcp.get_flags() & 0x01 != 0;
+    let has_syn = tcp.get_flags() & 0x02 != 0;
+    let has_rst = tcp.get_flags() & 0x04 != 0;
+    
+    Some((src_ip, dst_ip, src_port, dst_port, has_fin, has_syn, has_rst))
+}
+
+// ─────────────────────────────────────────────────────────
+// Network Helpers - Multicast and Unicast Detection
 // ─────────────────────────────────────────────────────────
 
 fn is_aes67_multicast(ip: Ipv4Addr) -> bool {
@@ -625,6 +875,10 @@ fn is_aes67_multicast(ip: Ipv4Addr) -> bool {
 }
 fn is_st2110_multicast(ip: Ipv4Addr) -> bool {
     let o = ip.octets(); o[0] == 239 && o[1] != 69
+}
+fn is_multicast(ip: Ipv4Addr) -> bool {
+    // Class D: 224.0.0.0 to 239.255.255.255
+    ip.octets()[0] >= 224 && ip.octets()[0] <= 239
 }
 fn classify_st2110(pt: u8, port: u16) -> St2110Type {
     match port % 10 {
@@ -666,9 +920,40 @@ fn parse_rtp(payload: &[u8]) -> Option<(u16, u32)> {
 
 fn parse_ptp(payload: &[u8]) -> Option<PtpInfo> {
     if payload.len() < 34 { return None; } // PTP header is 34 bytes
+    
+    // PTP message types
     let message_type = payload[0] & 0x0F;
+    let message_name = match message_type {
+        0x0 => "Sync".to_string(),
+        0x1 => "Delay_Req".to_string(),
+        0x2 => "P_Delay_Req".to_string(),
+        0x3 => "P_Delay_Resp".to_string(),
+        0x8 => "Follow_Up".to_string(),
+        0x9 => "Delay_Resp".to_string(),
+        0xA => "P_Delay_Resp_Follow_Up".to_string(),
+        0xB => "Announce".to_string(),
+        0xC => "Signaling".to_string(),
+        0xD => "Management".to_string(),
+        _ => format!("Unknown(0x{:X})", message_type),
+    };
+
     let version_ptp = (payload[1] >> 4) & 0x0F;
     let domain = payload[4];
+    
+    let correction_field = i64::from_be_bytes([
+        payload[8], payload[9], payload[10], payload[11],
+        payload[12], payload[13], payload[14], payload[15],
+    ]);
+    
+    let sequence_id = u16::from_be_bytes([payload[30], payload[31]]);
+    let log_sync_interval = payload[33] as i8;
+
+    // Parse source port identity (port ID)
+    let port_id = if payload.len() >= 28 {
+        Some(u16::from_be_bytes([payload[26], payload[27]]))
+    } else {
+        None
+    };
 
     let clock_id = if payload.len() >= 28 {
         Some(format!("{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
@@ -678,16 +963,24 @@ fn parse_ptp(payload: &[u8]) -> Option<PtpInfo> {
         None
     };
 
-    let correction_ns = if payload.len() >= 16 {
-        let corr = i64::from_be_bytes([
-            payload[8], payload[9], payload[10], payload[11],
-            payload[12], payload[13], payload[14], payload[15],
+    let log_min_pdelay_req_interval = if payload.len() >= 55 {
+        payload[54] as i8
+    } else {
+        0
+    };
+
+    // Parse origin timestamp (for Sync and Delay_Req)
+    let origin_timestamp_ns = if payload.len() >= 48 {
+        let seconds = u64::from_be_bytes([
+            0, payload[34], payload[35], payload[36], payload[37], payload[38], payload[39], payload[40],
         ]);
-        Some(corr)
+        let nanos = u32::from_be_bytes([payload[41], payload[42], payload[43], payload[44]]);
+        Some(seconds * 1_000_000_000 + nanos as u64)
     } else {
         None
     };
 
+    // Parse grandmaster info (Announce messages)
     let grandmaster_id = if message_type == 0x0B && payload.len() >= 62 {
         Some(format!("{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
             payload[52], payload[53], payload[54], payload[55],
@@ -705,18 +998,17 @@ fn parse_ptp(payload: &[u8]) -> Option<PtpInfo> {
         None
     };
 
-    let origin_timestamp_ns = if (message_type == 0 || message_type == 8) && payload.len() >= 48 {
-        let seconds = u64::from_be_bytes([
-            0, payload[34], payload[35], payload[36], payload[37], payload[38], payload[39], payload[40],
-        ]);
-        let nanos = u32::from_be_bytes([payload[41], payload[42], payload[43], payload[44]]);
-        Some(seconds * 1_000_000_000 + nanos as u64)
+    // For Delay_Resp messages, path delay is in correction_field
+    let path_delay_ns = if message_type == 0x9 {
+        Some(correction_field)
+    } else if message_type == 0x3 {
+        Some(correction_field)
     } else {
         None
     };
 
-    let path_delay_ns = if message_type == 9 && payload.len() >= 42 {
-        Some(correction_ns.unwrap_or(0))
+    let correction_ns = if message_type != 0x0 && message_type != 0x8 {
+        Some(correction_field)
     } else {
         None
     };
@@ -731,6 +1023,11 @@ fn parse_ptp(payload: &[u8]) -> Option<PtpInfo> {
         correction_ns,
         path_delay_ns,
         origin_timestamp_ns,
+        message_name,
+        port_id,
+        sequence_id,
+        log_sync_interval,
+        log_min_pdelay_req_interval,
     })
 }
 
@@ -770,7 +1067,7 @@ fn main() {
 
     let device = match filtered.get(index) {
         Some(d) => d.clone(),
-        None    => { eprintln!("❌ Invalid selection."); return; }
+        _    => { eprintln!("❌ Invalid selection."); return; }
     };
 
     let selected_protocols = prompt_protocol_selection();
@@ -795,15 +1092,18 @@ fn main() {
         .expect("BPF filter failure — run as root/sudo");
 
     // ── Global state ──────────────────────────────────────
-    let mut streams:    HashMap<String, StreamStats> = HashMap::new();
-    let mut sdp_cache:  HashMap<String, SdpSession>  = HashMap::new();
-    let mut ptp_domains: HashMap<u8, PtpStats> = HashMap::new();
+    let mut streams:       HashMap<String, StreamStats> = HashMap::new();
+    let mut tcp_streams:   HashMap<String, TcpStreamStats> = HashMap::new();
+    let mut sdp_cache:     HashMap<String, SdpSession> = HashMap::new();
+    let mut ptp_domains:   HashMap<u8, PtpStats> = HashMap::new();
+    let mut network_health: NetworkHealth = NetworkHealth::new();
+    let mut multicast_seen: HashMap<(Ipv4Addr, u16), u64> = HashMap::new();  // Detect duplicate multicast
     let mut last_report = Instant::now();
 
     // ── Capture loop ────────────────────────────────
     loop {
         let packet = match cap.next_packet() { Ok(p) => p, Err(_) => continue };
-        let eth    = match EthernetPacket::new(packet.data) { Some(e) => e, None => continue };
+        let eth    = match EthernetPacket::new(packet.data) { Some(e) => e, _ => continue };
 
         match detect_protocol(&eth) {
 
@@ -854,8 +1154,10 @@ fn main() {
                         .find(|m| m.port == dst_port)
                         .map(|m| (m.clock_hz, Some(m.rtpmap.clone())))
                         .unwrap_or((DEFAULT_CLOCK_HZ, None));
-                    let mut s = StreamStats::new("AES67", clock);
+                    let mut s = StreamStats::new_with_info("AES67", clock, is_multicast(dst), dst, dst_port);
                     s.sdp_rtpmap = rtpmap;
+                    s.media_type = "audio".to_string();  // AES67 is typically audio
+                    s.channels = 1;  // Will be updated by SDP if available
                     s
                 });
                 let ip  = Ipv4Packet::new(eth.payload()).unwrap();
@@ -879,8 +1181,14 @@ fn main() {
                         .find(|m| m.port == dst_port)
                         .map(|m| (m.clock_hz, Some(m.rtpmap.clone())))
                         .unwrap_or((default_clock, None));
-                    let mut s = StreamStats::new(label, clock);
+                    let mut s = StreamStats::new_with_info(label, clock, is_multicast(dst), dst, dst_port);
                     s.sdp_rtpmap = rtpmap;
+                    s.media_type = match stream_type {
+                        St2110Type::Video => "video".to_string(),
+                        St2110Type::Audio => "audio".to_string(),
+                        St2110Type::Ancdata => "ancillary".to_string(),
+                        St2110Type::Unknown => "unknown".to_string(),
+                    };
                     s
                 });
                 let ip  = Ipv4Packet::new(eth.payload()).unwrap();
@@ -931,12 +1239,58 @@ fn main() {
                 stats.packets += 1;
             }
 
-            None => {}
+            _ => {}
+        }
+
+        // ── TCP Monitoring for NDI and other TCP streams
+        if let Some((src_ip, dst_ip, src_port, dst_port, has_fin, has_syn, has_rst)) = parse_tcp_packet(&eth) {
+            let key = format!("TCP {}:{} → {}:{}", src_ip, src_port, dst_ip, dst_port);
+            let tcp_stat = tcp_streams.entry(key.clone()).or_insert_with(|| TcpStreamStats::new(src_ip, src_port, dst_ip, dst_port));
+            tcp_stat.packets += 1;
+            
+            // Estimate TCP payload size (rough, using Ethernet frame size - headers)
+            // Typical TCP/IP header: 20 (IP) + 20 (TCP) = 40 bytes minimum
+            let frame_size = eth.packet().len() as u64;
+            let estimated_payload = if frame_size > 40 { frame_size - 40 } else { 0 };
+            tcp_stat.bytes += estimated_payload;
+            
+            if has_fin { tcp_stat.fin_packets += 1; }
+            if has_rst { tcp_stat.rst_packets += 1; }
+            
+            tcp_stat.update_bitrate();
+            tcp_stat.update_quality();
+            
+            // Track TCP retransmissions (simple heuristic: SYN flag after initial connection)
+            if has_syn && tcp_stat.packets > 1 {
+                tcp_stat.retransmissions += 1;
+                network_health.tcp_retransmissions += 1;
+            }
+        }
+
+        // ── Network health tracking
+        network_health.total_packets += 1;
+        if let Some(ip) = Ipv4Packet::new(eth.payload()) {
+            network_health.total_bytes += eth.packet().len() as u64;
+            if is_multicast(ip.get_destination()) {
+                network_health.multicast_packets += 1;
+                // Detect multicast duplicates (same dest + port seen twice in quick succession)
+                if let Some(udp) = UdpPacket::new(ip.payload()) {
+                    let multicast_key = (ip.get_destination(), udp.get_destination());
+                    let count = multicast_seen.entry(multicast_key).or_insert(0);
+                    *count += 1;
+                    if *count > 1 {
+                        network_health.detected_duplicates += 1;
+                    }
+                }
+            } else {
+                network_health.unicast_packets += 1;
+            }
         }
 
         // ── Report every 5 seconds ────────────────
         if last_report.elapsed() > Duration::from_secs(5) {
-            print_report(&streams, &ptp_domains, protocol_requires_ptp(&selected_protocols), &mut logger);
+            network_health.calculate_score(&streams, &tcp_streams);
+            print_report(&streams, &tcp_streams, &ptp_domains, protocol_requires_ptp(&selected_protocols), &mut logger, &network_health);
             last_report = Instant::now();
         }
     }
@@ -946,15 +1300,32 @@ fn main() {
 // SECTION 5 — REPORTING
 // ═══════════════════════════════════════════════════════════
 
-fn print_report(streams: &HashMap<String, StreamStats>, ptp_domains: &HashMap<u8, PtpStats>, requires_valid_ptp: bool, logger: &mut Logger) {
+fn print_report(streams: &HashMap<String, StreamStats>, tcp_streams: &HashMap<String, TcpStreamStats>, ptp_domains: &HashMap<u8, PtpStats>, requires_valid_ptp: bool, logger: &mut Logger, health: &NetworkHealth) {
     let now = Local::now();
-    let header = format!("{} | AVStreamLens report  ({} active streams)", now.format("%Y-%m-%d %H:%M:%S"), streams.len());
+    let header = format!("{} | AVStreamLens report  ({} RTP, {} TCP streams) | Health: {:.0}%", 
+        now.format("%Y-%m-%d %H:%M:%S"), streams.len(), tcp_streams.len(), health.network_score);
     logger.log(&format!("\n{}", header));
+    
+    // Health score color
+    let _health_color = if health.network_score >= 80.0 {
+        "\x1b[32m"  // Green
+    } else if health.network_score >= 60.0 {
+        "\x1b[33m"  // Yellow
+    } else {
+        "\x1b[31m"  // Red
+    };
+    
     println!("\n\x1b[36m╔══════════════════════════════════════════════════════╗\x1b[0m");
     println!("\x1b[36m║  {}\x1b[0m", header);
     println!("\x1b[36m╚══════════════════════════════════════════════════════╝\x1b[0m");
+    
+    // Network summary
+    let net_summary = format!("\n📊 Network Load: {:.1} Mbps  |  Multicast: {} pkts  |  Unicast: {} pkts  |  Duplicates: {}",
+        (health.total_bytes * 8) as f64 / 1_000_000.0, health.multicast_packets, health.unicast_packets, health.detected_duplicates);
+    logger.log(&net_summary);
+    println!("{}", net_summary);
 
-    let mut group_order = vec!["AES67", "AVB", "Dante", "NDI", "ST"];
+    let group_order = vec!["AES67", "AVB", "Dante", "NDI", "ST"];
     let mut keys: Vec<&String> = streams.keys().collect();
     keys.sort_by(|a, b| {
         let a_group = group_order.iter().position(|g| a.starts_with(g)).unwrap_or(group_order.len());
@@ -967,15 +1338,24 @@ fn print_report(streams: &HashMap<String, StreamStats>, ptp_domains: &HashMap<u8
 
         let name_str  = s.sdp_name.as_deref().map(|n| format!("  \"{}\"", n)).unwrap_or_default();
         let codec_str = s.sdp_rtpmap.as_deref().map(|c| format!("  [{}]", c)).unwrap_or_default();
+        let mc_str = if s.is_multicast { " [MC]" } else { " [UC]" };
+        let media_str = if s.media_type != "unknown" { format!("  ({})", s.media_type) } else { String::new() };
 
-        let stream_line = format!("\n  ▸ [{}] {}{}{}", s.protocol, key, name_str, codec_str);
+        let stream_line = format!("\n  ▸ [{}] {}{}{}{}{}", s.protocol, key, name_str, codec_str, mc_str, media_str);
         logger.log(&stream_line);
         println!("{}", stream_line);
 
-        let status_line = format!("    packets: {}  |  losses: {} ({:.1}%)  |  jitter: {:.2} ms",
-            s.packets, s.lost_packets, s.loss_pct(), s.jitter_ms());
+        let status_line = format!("    packets: {}  |  losses: {} ({:.1}%)  |  jitter: {:.2} ms  |  rate: {:.1} Mbps",
+            s.packets, s.lost_packets, s.loss_pct(), s.jitter_ms(), (s.bitrate_bps as f64) / 1_000_000.0);
         logger.log(&status_line);
         println!("{}", status_line);
+
+        // Timestamp discontinuity warning for AES67
+        if s.ts_discontinuities > 0 {
+            let ts_alert = format!("    ⚠  Timestamp discontinuities: {} detected", s.ts_discontinuities);
+            logger.log(&ts_alert);
+            println!("\x1b[33m{}\x1b[0m", ts_alert);
+        }
 
         if s.loss_pct() > 0.0 {
             let alert = "    ⚠  Packet loss";
@@ -996,6 +1376,36 @@ fn print_report(streams: &HashMap<String, StreamStats>, ptp_domains: &HashMap<u8
             let alert = "    ⚠  Dante subscription or clock mismatch detected";
             logger.log(alert);
             println!("\x1b[33m{}\x1b[0m", alert);
+        }
+    }
+
+    // ── TCP Streams (NDI, etc) ───────────────────────────
+    if !tcp_streams.is_empty() {
+        logger.log("\nTCP Streams:");
+        println!("\n\x1b[34m🔌 TCP Streams:\x1b[0m");
+        for tcp_stat in tcp_streams.values() {
+            let quality_icon = match tcp_stat.stream_quality {
+                StreamQuality::Healthy => "✓",
+                StreamQuality::Degrading => "⚠",
+                StreamQuality::Critical => "⚠⚠",
+                StreamQuality::Terminated => "✗",
+            };
+            let tcp_line = format!("  {} {}: {} packets, {} bytes, {} Mbps, retransmissions: {}",
+                quality_icon, tcp_stat.key, tcp_stat.packets, tcp_stat.bytes, 
+                (tcp_stat.bitrate_bps as f64) / 1_000_000.0, tcp_stat.retransmissions);
+            logger.log(&tcp_line);
+            println!("{}", tcp_line);
+            
+            if tcp_stat.rst_packets > 0 {
+                let alert = format!("    ⚠  RST flags: {} (connection reset)", tcp_stat.rst_packets);
+                logger.log(&alert);
+                println!("\x1b[31m{}\x1b[0m", alert);
+            }
+            if tcp_stat.retransmissions > 5 {
+                let alert = format!("    ⚠  High retransmission rate detected");
+                logger.log(&alert);
+                println!("\x1b[33m{}\x1b[0m", alert);
+            }
         }
     }
 
