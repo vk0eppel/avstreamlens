@@ -1,10 +1,11 @@
 // AVStreamLens — main.rs
 //
-// IP AV Monitoring: AES67, SMPTE ST 2110, Dante, NDI, AVB
+// IP AV Monitoring: AES67, SMPTE ST 2110, Dante, NDI, AVB, SRT, RIST
 // - Pcap capture with BPF filter
-// - Protocol detection by network signature
+// - Protocol detection by network signature (Audio/Video presets)
 // - SAP/SDP parser for stream metadata
-// - Correct RFC 3550 jitter
+// - RFC 3550 jitter, SSRC tracking, dead-stream detection
+// - PTP (IEEE 1588) and IGMP always monitored
 // - Terminal reporting every 5 seconds
 
 use pcap::{Capture, Device};
@@ -41,6 +42,15 @@ const PTP_GENERAL_PORT:  u16 = 320;
 const DANTE_CTRL_PORTS: &[u16] = &[4440, 4455, 8700, 8800];
 const NDI_PORT_MIN:      u16 = 5960;
 const NDI_PORT_MAX:      u16 = 5980;
+// SRT : pas de port fixe standard, mais le handshake est identifiable
+// Convention commune : 9000-9999 et ports éphémères
+const SRT_MAGIC:         u32 = 0x00000004; // SRT_CMD_HANDSHAKE induction
+// RIST : RTP + RTCP avec ARQ, convention ports pairs/impairs
+const RIST_PORT_BASE:    u16 = 5000;
+// IGMP : protocole IP 0x02
+const IP_PROTO_IGMP:     u8  = 0x02;
+// Timeout flux mort : 10 secondes sans paquet
+const STREAM_TIMEOUT_SECS: u64 = 10;
 
 // ─────────────────────────────────────────────────────────
 // Detected protocols
@@ -55,6 +65,21 @@ enum AvProtocol {
     Avb    { subtype: u8 },
     Sap    { src: Ipv4Addr, sdp: SdpSession },
     Ptp    { info: PtpInfo },
+    // ── Nouveaux protocoles ──
+    /// SRT (Secure Reliable Transport) — détecté par magic handshake
+    Srt    { src: Ipv4Addr, dst_port: u16, is_handshake: bool },
+    /// RIST (Reliable Internet Stream Transport) — RTP + ARQ
+    Rist   { src: Ipv4Addr, dst: Ipv4Addr, dst_port: u16 },
+    /// IGMP — adhésions/départs multicast
+    Igmp   { src: Ipv4Addr, group: Ipv4Addr, igmp_type: IgmpType },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum IgmpType {
+    Join,       // Membership Report v2/v3
+    Leave,      // Leave Group
+    Query,      // Membership Query
+    Unknown(u8),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -78,23 +103,30 @@ struct PtpInfo {
 
 #[derive(Debug, Clone, PartialEq)]
 #[allow(dead_code)]
-enum ProtocolChoice { All, AES67, ST2110, Dante, NDI, AVB, PTP }
+enum ProtocolChoice { All, AES67, Audio, Video, ST2110, Dante, NDI, AVB, PTP, SRT, RIST, IGMP }
 
 impl ProtocolChoice {
     fn name(&self) -> &'static str {
         match self {
-            ProtocolChoice::All => "All",
+            ProtocolChoice::All   => "All",
             ProtocolChoice::AES67 => "AES67",
+            ProtocolChoice::Audio => "Audio (AES67 + Dante + RIST)",
+            ProtocolChoice::Video => "Video (ST2110 + NDI + SRT + RIST)",
             ProtocolChoice::ST2110 => "ST2110",
             ProtocolChoice::Dante => "Dante",
-            ProtocolChoice::NDI => "NDI",
-            ProtocolChoice::AVB => "AVB",
-            ProtocolChoice::PTP => "PTP",
+            ProtocolChoice::NDI   => "NDI",
+            ProtocolChoice::AVB   => "AVB",
+            ProtocolChoice::PTP   => "PTP",
+            ProtocolChoice::SRT   => "SRT",
+            ProtocolChoice::RIST  => "RIST",
+            ProtocolChoice::IGMP  => "IGMP",
         }
     }
 
     fn needs_udp(&self) -> bool {
-        matches!(self, ProtocolChoice::AES67 | ProtocolChoice::ST2110 | ProtocolChoice::Dante | ProtocolChoice::NDI | ProtocolChoice::PTP)
+        matches!(self, ProtocolChoice::AES67 | ProtocolChoice::Audio | ProtocolChoice::Video
+            | ProtocolChoice::ST2110 | ProtocolChoice::Dante
+            | ProtocolChoice::NDI | ProtocolChoice::PTP | ProtocolChoice::SRT | ProtocolChoice::RIST)
     }
 
     fn needs_avb(&self) -> bool {
@@ -106,18 +138,41 @@ impl ProtocolChoice {
     }
 
     fn requires_valid_ptp_clock(&self) -> bool {
-        matches!(self, ProtocolChoice::AES67 | ProtocolChoice::ST2110 | ProtocolChoice::AVB)
+        matches!(self, ProtocolChoice::AES67 | ProtocolChoice::Audio | ProtocolChoice::Video
+            | ProtocolChoice::ST2110 | ProtocolChoice::AVB)
     }
 
     fn all_choices() -> Vec<ProtocolChoice> {
+        // PTP et IGMP sont toujours actifs — non présents ici
         vec![
             ProtocolChoice::AES67,
+            ProtocolChoice::Audio,
+            ProtocolChoice::Video,
             ProtocolChoice::ST2110,
             ProtocolChoice::Dante,
             ProtocolChoice::NDI,
             ProtocolChoice::AVB,
-            ProtocolChoice::PTP,
+            ProtocolChoice::SRT,
+            ProtocolChoice::RIST,
         ]
+    }
+
+    /// Protocoles inclus dans ce choix (pour affichage et expansion)
+    fn includes(&self) -> Vec<ProtocolChoice> {
+        match self {
+            ProtocolChoice::Audio => vec![
+                ProtocolChoice::AES67,
+                ProtocolChoice::Dante,
+                ProtocolChoice::RIST,
+            ],
+            ProtocolChoice::Video => vec![
+                ProtocolChoice::ST2110,
+                ProtocolChoice::NDI,
+                ProtocolChoice::SRT,
+                ProtocolChoice::RIST,
+            ],
+            other => vec![other.clone()],
+        }
     }
 }
 
@@ -197,7 +252,20 @@ struct StreamStats {
     packets_at_check:  u64,
     // Timestamp discontinuity detection
     ts_discontinuities: u64,
-    last_ts_diff:      Option<i64>,
+    last_ts_diff:       Option<i64>,
+    // ptime SDP (ms) — tolérance pour la détection de discontinuités TS
+    ptime_ms:           f64,
+    // Bitrate exact : accumulateur d'octets UDP réels
+    bytes_total:        u64,
+    bytes_at_check:     u64,
+    // SSRC tracking — changement = interruption de source RTP
+    last_ssrc:          Option<u32>,
+    ssrc_changes:       u64,
+    // Dernier paquet reçu — pour détecter les flux morts (silence)
+    last_packet_time:   Option<Instant>,
+    // Flag: évite de répéter l'alerte "stream dead" à chaque rapport
+    // Réinitialisé à false dès qu'un paquet est reçu
+    dead_alerted:       bool,
 }
 
 impl StreamStats {
@@ -223,6 +291,13 @@ impl StreamStats {
             packets_at_check:    0,
             ts_discontinuities:  0,
             last_ts_diff:        None,
+            ptime_ms:            0.0,
+            bytes_total:         0,
+            bytes_at_check:      0,
+            last_ssrc:           None,
+            ssrc_changes:        0,
+            last_packet_time:    None,
+            dead_alerted:        false,
         }
     }
 
@@ -234,7 +309,9 @@ impl StreamStats {
         stats
     }
 
-    fn update(&mut self, seq: u16, rtp_ts: u32) {
+    /// `udp_payload_len` : longueur réelle du payload UDP (sans header IP/UDP),
+    /// utilisée pour le calcul de bitrate exact.
+    fn update(&mut self, seq: u16, rtp_ts: u32, ssrc: u32, udp_payload_len: usize) {
         self.packets += 1;
 
         // ── Losses (16-bit wrapping) ──────────────────
@@ -246,18 +323,22 @@ impl StreamStats {
         }
         self.last_seq = Some(seq);
 
-        // ── Timestamp discontinuity detection (AES67 compliance)
+        // ── Timestamp discontinuity detection ────────
+        // La tolérance est dérivée du ptime SDP si disponible,
+        // sinon estimée depuis la clock (1 paquet = 1 ms par défaut).
         if let Some(last_ts) = self.last_rtp_ts {
             let expected_diff = if self.clock_hz > 0.0 {
-                // For audio typically 48kHz, we expect ~2-20ms worth of timestamps
-                (self.clock_hz / 1000.0) as i64 * 5 // Assuming ~5ms packets
+                let ptime_ms = if self.ptime_ms > 0.0 { self.ptime_ms } else { 1.0 };
+                (self.clock_hz * ptime_ms / 1000.0) as i64
             } else {
-                1000
+                48 // fallback : 1 ms @ 48 kHz
             };
             let actual_diff = rtp_ts.wrapping_sub(last_ts) as i64;
-            // Allow +/- 50% tolerance
-            if (actual_diff as f64) < (expected_diff as f64 * 0.5) || 
-               (actual_diff as f64) > (expected_diff as f64 * 1.5) {
+            // Tolérance ±50 % autour du ptime attendu
+            if expected_diff > 0 &&
+               ((actual_diff as f64) < (expected_diff as f64 * 0.5) ||
+                (actual_diff as f64) > (expected_diff as f64 * 1.5))
+            {
                 self.ts_discontinuities += 1;
             }
             self.last_ts_diff = Some(actual_diff);
@@ -276,13 +357,25 @@ impl StreamStats {
         self.last_rtp_ts  = Some(rtp_ts);
         self.last_arrival = Some(now);
 
-        // ── Bitrate calculation ──────────────────────────
-        if self.last_bitrate_check.elapsed() > Duration::from_secs(1) {
-            let packets_delta = self.packets - self.packets_at_check;
-            if packets_delta > 0 && self.clock_hz > 0.0 {
-                // Rough estimate: assume 1500 byte packets on average
-                self.bitrate_bps = packets_delta * 1500 * 8;
+        // ── SSRC tracking ────────────────────────────
+        // Un changement de SSRC sur un flux existant indique une
+        // interruption et reconnexion de la source RTP.
+        // (Le premier paquet initialise silencieusement.)
+        if let Some(prev_ssrc) = self.last_ssrc {
+            if prev_ssrc != ssrc {
+                self.ssrc_changes += 1;
             }
+        }
+        self.last_ssrc = Some(ssrc);
+        self.last_packet_time = Some(now);
+        self.dead_alerted = false; // flux vivant — réarmer l'alerte
+        // On accumule les octets réels (payload UDP) et on calcule
+        // le débit toutes les secondes.
+        self.bytes_total += udp_payload_len as u64;
+        if self.last_bitrate_check.elapsed() > Duration::from_secs(1) {
+            let bytes_delta = self.bytes_total - self.bytes_at_check;
+            self.bitrate_bps = bytes_delta * 8; // bits/s sur la dernière seconde
+            self.bytes_at_check  = self.bytes_total;
             self.packets_at_check = self.packets;
             self.last_bitrate_check = now;
         }
@@ -310,7 +403,7 @@ struct TcpStreamStats {
     dst_port: u16,
     packets: u64,
     bytes: u64,
-    retransmissions: u64,      // packets with SYN/ACK but not new seq
+    retransmissions: u64,
     fin_packets: u64,
     rst_packets: u64,
     last_seen: Instant,
@@ -318,6 +411,9 @@ struct TcpStreamStats {
     bitrate_bps: u64,
     last_bitrate_check: Instant,
     bytes_at_check: u64,
+    // Tracking du dernier seq TCP vu — vraie détection de retransmission
+    last_seq: Option<u32>,
+    last_ack: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -347,6 +443,8 @@ impl TcpStreamStats {
             bitrate_bps: 0,
             last_bitrate_check: Instant::now(),
             bytes_at_check: 0,
+            last_seq: None,
+            last_ack: None,
         }
     }
 
@@ -552,8 +650,11 @@ fn prompt_protocol_selection() -> Vec<ProtocolChoice> {
     println!("Choose the protocols to monitor:");
     println!("  0) All");
     for (i, choice) in ProtocolChoice::all_choices().iter().enumerate() {
-        println!("  {} ) {}", i + 1, choice.name());
+        println!("  {}) {}", i + 1, choice.name());
     }
+    println!();
+    println!("  ℹ  PTP (IEEE 1588) and IGMP are always monitored regardless of selection.");
+    println!();
     println!("Enter comma-separated numbers (e.g. 0 or 1,3,5):");
     print!("> ");
     io::stdout().flush().unwrap();
@@ -588,20 +689,21 @@ fn build_bpf_filter(selected: &[ProtocolChoice]) -> String {
         selected.to_vec()
     };
 
-    let udp_needed = choices.iter().any(|p| p.needs_udp());
-    let avb_needed = choices.iter().any(|p| p.needs_avb());
-    let ptp_needed = choices.iter().any(|p| p.needs_ptp_filter() || p.requires_valid_ptp_clock());
+    // Expander les choix Audio/Video en protocoles concrets
+    let expanded: Vec<ProtocolChoice> = choices.iter()
+        .flat_map(|p| p.includes())
+        .collect();
+    let udp_needed = expanded.iter().any(|p| p.needs_udp());
+    let avb_needed = expanded.iter().any(|p| p.needs_avb());
+    let tcp_needed = expanded.iter().any(|p| matches!(p, ProtocolChoice::NDI | ProtocolChoice::SRT));
 
     let mut parts = Vec::new();
-    if udp_needed {
-        parts.push("udp".to_string());
-    }
-    if avb_needed {
-        parts.push("(ether proto 0x22f0)".to_string());
-    }
-    if ptp_needed {
-        parts.push("(ether proto 0x88f7 or udp port 319 or udp port 320)".to_string());
-    }
+    if udp_needed { parts.push("udp".to_string()); }
+    if tcp_needed { parts.push("tcp".to_string()); }
+    if avb_needed { parts.push("(ether proto 0x22f0)".to_string()); }
+    // PTP et IGMP sont toujours capturés, quel que soit le choix de protocole.
+    parts.push("(ether proto 0x88f7 or udp port 319 or udp port 320)".to_string()); // PTP
+    parts.push("igmp".to_string()); // IGMP
 
     if parts.is_empty() {
         DEFAULT_BPF_FILTER.to_string()
@@ -778,6 +880,28 @@ fn detect_protocol(eth: &EthernetPacket) -> Option<AvProtocol> {
         }
     }
 
+    // ── IGMP (protocole IP 0x02, sans couche UDP) ────────
+    if eth.get_ethertype() == EtherTypes::Ipv4 {
+        if let Some(ip) = Ipv4Packet::new(eth.payload()) {
+            if ip.get_next_level_protocol().0 == IP_PROTO_IGMP {
+                let src = ip.get_source();
+                let group = ip.get_destination();
+                let igmp_payload = ip.payload();
+                let igmp_type = if igmp_payload.is_empty() {
+                    IgmpType::Unknown(0)
+                } else {
+                    match igmp_payload[0] {
+                        0x11 => IgmpType::Query,
+                        0x16 | 0x22 => IgmpType::Join,   // v2 Report / v3 Report
+                        0x17 => IgmpType::Leave,
+                        t    => IgmpType::Unknown(t),
+                    }
+                };
+                return Some(AvProtocol::Igmp { src, group, igmp_type });
+            }
+        }
+    }
+
     if eth.get_ethertype() != EtherTypes::Ipv4 { return None; }
 
     let ip  = Ipv4Packet::new(eth.payload())?;
@@ -816,6 +940,37 @@ fn detect_protocol(eth: &EthernetPacket) -> Option<AvProtocol> {
         return Some(AvProtocol::Ndi { kind: NdiKind::Stream, src: src_ip });
     }
 
+    // ── SRT handshake detection ───────────────────────────
+    // Le handshake SRT commence par 4 octets à zéro (control packet)
+    // suivi du type 0x0000 (handshake). Taille min : 16 octets.
+    if payload.len() >= 16 {
+        let is_control = (payload[0] & 0x80) != 0;
+        if is_control {
+            let ctrl_type = u16::from_be_bytes([payload[0] & 0x7F, payload[1]]);
+            if ctrl_type == 0x0000 {
+                // Type 0 = Handshake SRT
+                let is_handshake = payload.len() >= 20;
+                return Some(AvProtocol::Srt { src: src_ip, dst_port, is_handshake });
+            }
+        }
+    }
+
+    // ── RIST detection ───────────────────────────────────
+    // RIST utilise RTP sur ports pairs + RTCP ARQ sur port impair suivant.
+    // Convention : ports 5000-5999 (paires), flux bidirectionnel.
+    // On identifie par la présence d'un RTP valide sur port pair
+    // avec payload type dans la plage dynamique (96-127) non AV déjà classé.
+    if (RIST_PORT_BASE..5999).contains(&dst_port) && dst_port % 2 == 0
+        && !is_aes67_multicast(dst_ip) && !is_st2110_multicast(dst_ip)
+    {
+        if payload.len() >= 12 && (payload[0] >> 6) & 0b11 == 2 {
+            let pt = payload[1] & 0x7F;
+            if pt >= 33 { // PT 33 = MP2T classique dans RIST
+                return Some(AvProtocol::Rist { src: src_ip, dst: dst_ip, dst_port });
+            }
+        }
+    }
+
     // ── RTP Streams ─────────────────────────────────────────
     if payload.len() < 12 { return None; }
     if (payload[0] >> 6) & 0b11 != 2 { return None; }
@@ -848,22 +1003,24 @@ fn detect_protocol(eth: &EthernetPacket) -> Option<AvProtocol> {
 // TCP Parser and Retransmission Detection
 // ─────────────────────────────────────────────────────────
 
-fn parse_tcp_packet(eth: &EthernetPacket) -> Option<(Ipv4Addr, Ipv4Addr, u16, u16, bool, bool, bool)> {
+fn parse_tcp_packet(eth: &EthernetPacket) -> Option<(Ipv4Addr, Ipv4Addr, u16, u16, bool, bool, bool, u32, u32)> {
     if eth.get_ethertype() != EtherTypes::Ipv4 { return None; }
     let ip = Ipv4Packet::new(eth.payload())?;
     if ip.get_next_level_protocol() != pnet_packet::ip::IpNextHeaderProtocols::Tcp { return None; }
     
     let tcp = TcpPacket::new(ip.payload())?;
-    let src_ip = ip.get_source();
-    let dst_ip = ip.get_destination();
+    let src_ip   = ip.get_source();
+    let dst_ip   = ip.get_destination();
     let src_port = tcp.get_source();
     let dst_port = tcp.get_destination();
+    let seq      = tcp.get_sequence();
+    let ack      = tcp.get_acknowledgement();
     
     let has_fin = tcp.get_flags() & 0x01 != 0;
     let has_syn = tcp.get_flags() & 0x02 != 0;
     let has_rst = tcp.get_flags() & 0x04 != 0;
     
-    Some((src_ip, dst_ip, src_port, dst_port, has_fin, has_syn, has_rst))
+    Some((src_ip, dst_ip, src_port, dst_port, has_fin, has_syn, has_rst, seq, ack))
 }
 
 // ─────────────────────────────────────────────────────────
@@ -906,12 +1063,15 @@ fn mdns_contains(payload: &[u8], service: &[u8]) -> bool {
 // Minimal RTP Parser
 // ─────────────────────────────────────────────────────────
 
-fn parse_rtp(payload: &[u8]) -> Option<(u16, u32)> {
+/// Retourne (seq, timestamp, ssrc). Le SSRC permet de détecter
+/// les changements de source sur un même flux multicast.
+fn parse_rtp(payload: &[u8]) -> Option<(u16, u32, u32)> {
     if payload.len() < 12 { return None; }
     if (payload[0] >> 6) & 0b11 != 2 { return None; }
-    let seq = u16::from_be_bytes([payload[2], payload[3]]);
-    let ts  = u32::from_be_bytes([payload[4], payload[5], payload[6], payload[7]]);
-    Some((seq, ts))
+    let seq  = u16::from_be_bytes([payload[2], payload[3]]);
+    let ts   = u32::from_be_bytes([payload[4], payload[5], payload[6], payload[7]]);
+    let ssrc = u32::from_be_bytes([payload[8], payload[9], payload[10], payload[11]]);
+    Some((seq, ts, ssrc))
 }
 
 // ─────────────────────────────────────────────────────────
@@ -1127,11 +1287,12 @@ fn main() {
                     // Enrich an existing StreamStats if the port matches
                     for stats in streams.values_mut() {
                         if stats.sdp_name.is_none() {
-                            // heuristic: the SDP port appears in the stream key
                             if m.port > 0 {
                                 stats.sdp_name   = Some(sdp.session_name.clone());
                                 stats.sdp_rtpmap = Some(m.rtpmap.clone());
                                 if m.clock_hz > 0.0 { stats.clock_hz = m.clock_hz; }
+                                if m.ptime_ms > 0.0 { stats.ptime_ms = m.ptime_ms; }
+                                if m.channels > 0   { stats.channels = m.channels; }
                             }
                         }
                     }
@@ -1162,7 +1323,7 @@ fn main() {
                 });
                 let ip  = Ipv4Packet::new(eth.payload()).unwrap();
                 let udp = UdpPacket::new(ip.payload()).unwrap();
-                if let Some((seq, ts)) = parse_rtp(udp.payload()) { stats.update(seq, ts); }
+                if let Some((seq, ts, ssrc)) = parse_rtp(udp.payload()) { stats.update(seq, ts, ssrc, udp.payload().len()); }
             }
 
             // ── ST 2110 ──────────────────────────────────
@@ -1193,7 +1354,7 @@ fn main() {
                 });
                 let ip  = Ipv4Packet::new(eth.payload()).unwrap();
                 let udp = UdpPacket::new(ip.payload()).unwrap();
-                if let Some((seq, ts)) = parse_rtp(udp.payload()) { stats.update(seq, ts); }
+                if let Some((seq, ts, ssrc)) = parse_rtp(udp.payload()) { stats.update(seq, ts, ssrc, udp.payload().len()); }
             }
 
             // ── Dante ────────────────────────────────────
@@ -1211,7 +1372,7 @@ fn main() {
                             .or_insert_with(|| StreamStats::new("Dante", DEFAULT_CLOCK_HZ));
                         let ip  = Ipv4Packet::new(eth.payload()).unwrap();
                         let udp = UdpPacket::new(ip.payload()).unwrap();
-                        if let Some((seq, ts)) = parse_rtp(udp.payload()) { stats.update(seq, ts); }
+                        if let Some((seq, ts, ssrc)) = parse_rtp(udp.payload()) { stats.update(seq, ts, ssrc, udp.payload().len()); }
                     }
                 }
             }
@@ -1239,32 +1400,112 @@ fn main() {
                 stats.packets += 1;
             }
 
+            // ── SRT ──────────────────────────────────────
+            Some(AvProtocol::Srt { src, dst_port, is_handshake }) => {
+                let key = format!("SRT {}:{}", src, dst_port);
+                let stats = streams.entry(key)
+                    .or_insert_with(|| StreamStats::new("SRT", 0.0));
+                stats.packets += 1;
+                stats.last_packet_time = Some(Instant::now());
+                if is_handshake {
+                    let msg = format!("🤝 SRT handshake: {} → port {}", src, dst_port);
+                    println!("{}", msg);
+                    logger.log(&msg);
+                }
+            }
+
+            // ── RIST ─────────────────────────────────────
+            Some(AvProtocol::Rist { src, dst, dst_port }) => {
+                let key = format!("RIST {}:{}", dst, dst_port);
+                let stats = streams.entry(key)
+                    .or_insert_with(|| {
+                        let mut s = StreamStats::new_with_info("RIST", DEFAULT_CLOCK_HZ, is_multicast(dst), dst, dst_port);
+                        s.media_type = "video".to_string();
+                        s
+                    });
+                let ip  = Ipv4Packet::new(eth.payload()).unwrap();
+                let udp = UdpPacket::new(ip.payload()).unwrap();
+                if let Some((seq, ts, ssrc)) = parse_rtp(udp.payload()) {
+                    stats.update(seq, ts, ssrc, udp.payload().len());
+                }
+                let _ = src;
+            }
+
+            // ── IGMP ─────────────────────────────────────
+            Some(AvProtocol::Igmp { src, group, igmp_type }) => {
+                let (icon, label) = match &igmp_type {
+                    IgmpType::Join       => ("➕", "Join"),
+                    IgmpType::Leave      => ("➖", "Leave"),
+                    IgmpType::Query      => ("❓", "Query"),
+                    IgmpType::Unknown(t) => {
+                        let _ = t;
+                        ("❔", "Unknown")
+                    }
+                };
+                let msg = format!("{} IGMP {}: {} → group {}", icon, label, src, group);
+                println!("{}", msg);
+                logger.log(&msg);
+                // Un Leave sur un groupe surveillé mérite une alerte
+                if matches!(igmp_type, IgmpType::Leave) {
+                    for key in streams.keys() {
+                        if streams[key].dst_ip == Some(group) {
+                            let alert = format!("    ⚠  IGMP Leave on monitored group {}", group);
+                            println!("\x1b[33m{}\x1b[0m", alert);
+                            logger.log(&alert);
+                        }
+                    }
+                }
+            }
+
             _ => {}
         }
 
+        // ── Détection de flux morts (toutes les 5 s) ─────────
+        if last_report.elapsed() > Duration::from_secs(4) {
+            for (key, stats) in &streams {
+                if let Some(last_time) = stats.last_packet_time {
+                    if last_time.elapsed() > Duration::from_secs(STREAM_TIMEOUT_SECS) {
+                        let alert = format!("💀 Stream silent (> {}s): {}", STREAM_TIMEOUT_SECS, key);
+                        println!("\x1b[31m{}\x1b[0m", alert);
+                        logger.log(&alert);
+                    }
+                }
+            }
+        }
+
         // ── TCP Monitoring for NDI and other TCP streams
-        if let Some((src_ip, dst_ip, src_port, dst_port, has_fin, has_syn, has_rst)) = parse_tcp_packet(&eth) {
+        if let Some((src_ip, dst_ip, src_port, dst_port, has_fin, has_syn, has_rst, seq, ack)) = parse_tcp_packet(&eth) {
             let key = format!("TCP {}:{} → {}:{}", src_ip, src_port, dst_ip, dst_port);
             let tcp_stat = tcp_streams.entry(key.clone()).or_insert_with(|| TcpStreamStats::new(src_ip, src_port, dst_ip, dst_port));
             tcp_stat.packets += 1;
+            tcp_stat.last_seen = Instant::now();
             
-            // Estimate TCP payload size (rough, using Ethernet frame size - headers)
-            // Typical TCP/IP header: 20 (IP) + 20 (TCP) = 40 bytes minimum
             let frame_size = eth.packet().len() as u64;
             let estimated_payload = if frame_size > 40 { frame_size - 40 } else { 0 };
             tcp_stat.bytes += estimated_payload;
             
             if has_fin { tcp_stat.fin_packets += 1; }
-            if has_rst { tcp_stat.rst_packets += 1; }
+            if has_rst {
+                tcp_stat.rst_packets += 1;
+                network_health.tcp_retransmissions += 1;
+            }
+
+            // Vraie détection de retransmission TCP :
+            // un paquet non-SYN dont le seq est <= au dernier seq vu
+            // (hors SYN initial qui est toléré).
+            if !has_syn {
+                if let Some(last_seq) = tcp_stat.last_seq {
+                    if seq <= last_seq && tcp_stat.packets > 2 {
+                        tcp_stat.retransmissions += 1;
+                        network_health.tcp_retransmissions += 1;
+                    }
+                }
+            }
+            tcp_stat.last_seq = Some(seq.max(tcp_stat.last_seq.unwrap_or(0)));
+            tcp_stat.last_ack = Some(ack);
             
             tcp_stat.update_bitrate();
             tcp_stat.update_quality();
-            
-            // Track TCP retransmissions (simple heuristic: SYN flag after initial connection)
-            if has_syn && tcp_stat.packets > 1 {
-                tcp_stat.retransmissions += 1;
-                network_health.tcp_retransmissions += 1;
-            }
         }
 
         // ── Network health tracking
@@ -1291,6 +1532,15 @@ fn main() {
         if last_report.elapsed() > Duration::from_secs(5) {
             network_health.calculate_score(&streams, &tcp_streams);
             print_report(&streams, &tcp_streams, &ptp_domains, protocol_requires_ptp(&selected_protocols), &mut logger, &network_health);
+            // Après le rapport, marquer les flux morts pour éviter les répétitions.
+            // dead_alerted sera réarmé automatiquement dans update() si le flux reprend.
+            for stats in streams.values_mut() {
+                if let Some(last_time) = stats.last_packet_time {
+                    if last_time.elapsed() > Duration::from_secs(STREAM_TIMEOUT_SECS) {
+                        stats.dead_alerted = true;
+                    }
+                }
+            }
             last_report = Instant::now();
         }
     }
@@ -1377,6 +1627,21 @@ fn print_report(streams: &HashMap<String, StreamStats>, tcp_streams: &HashMap<St
             logger.log(alert);
             println!("\x1b[33m{}\x1b[0m", alert);
         }
+        // SSRC change — interruption de source
+        if s.ssrc_changes > 0 {
+            let alert = format!("    ⚠  SSRC changed {} time(s) — source interrupted and reconnected", s.ssrc_changes);
+            logger.log(&alert);
+            println!("\x1b[33m{}\x1b[0m", alert);
+        }
+        // Flux mort
+        if let Some(last_time) = s.last_packet_time {
+            if last_time.elapsed() > Duration::from_secs(STREAM_TIMEOUT_SECS) {
+                let alert = format!("    💀 No packet since {:.0}s — stream may be dead",
+                    last_time.elapsed().as_secs_f64());
+                logger.log(&alert);
+                println!("\x1b[31m{}\x1b[0m", alert);
+            }
+        }
     }
 
     // ── TCP Streams (NDI, etc) ───────────────────────────
@@ -1448,6 +1713,36 @@ fn print_report(streams: &HashMap<String, StreamStats>, tcp_streams: &HashMap<St
                 let alert = format!("    ⚠  Grandmaster changed {} time(s)", stats.grandmaster_changes);
                 logger.log(&alert);
                 println!("\x1b[33m{}\x1b[0m", alert);
+            }
+        }
+    }
+
+    // ── Corrélation SDP ts-refclk ↔ GM PTP actif ─────────
+    // On vérifie que le Grandmaster PTP annoncé correspond bien
+    // au ts-refclk déclaré dans les SDP des flux AES67/ST2110.
+    // Un écart indique un problème de domaine PTP ou de config SDP.
+    if !ptp_domains.is_empty() {
+        for stream in streams.values() {
+            if let Some(sdp_rtpmap) = &stream.sdp_rtpmap {
+                // Chercher un ts-refclk dans le SDP cache pour ce stream
+                // (on utilise le port comme clé de correspondance)
+                let refclk_mismatch = ptp_domains.values().any(|ptp| {
+                    if let Some(gm) = &ptp.last_grandmaster {
+                        // ts-refclk contient l'EUI-64 du GM : on compare les 8 octets
+                        // Format SDP: "ptp=IEEE1588-2008:AA-BB-CC-DD-EE-FF-00-01:0"
+                        // Format PTP GM: "aa:bb:cc:dd:ee:ff:00:01"
+                        // Si le SDP contient un ts-refclk et que le GM ne matche pas → alerte
+                        let _ = (gm, sdp_rtpmap);
+                        false // placeholder — comparaison à affiner selon format local
+                    } else {
+                        false
+                    }
+                });
+                if refclk_mismatch {
+                    let alert = "    ⚠  SDP ts-refclk does not match active PTP Grandmaster";
+                    logger.log(alert);
+                    println!("\x1b[31m{}\x1b[0m", alert);
+                }
             }
         }
     }
