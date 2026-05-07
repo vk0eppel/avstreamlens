@@ -1,31 +1,41 @@
 // AVStreamLens — src/protocols.rs
-// Contains all network protocol definitions, enums, and constants.
+// Network protocol definitions, enums, and constants
 
 use std::net::Ipv4Addr;
 
-// ═══════════════════════════════════════════════════════════
-// SECTION 1 — TYPES AND CONSTANTS
-// ═══════════════════════════════════════════════════════════
+// ════ Network Constants ════
 
-// Ports and network ranges
-pub const SAP_PORT:          u16 = 9875;
-pub const MDNS_PORT:         u16 = 5353;
-pub const ETHERTYPE_AVTP:    u16 = 0x22F0;
-pub const ETHERTYPE_PTP:     u16 = 0x88F7;
-pub const PTP_EVENT_PORT:    u16 = 319;
-pub const PTP_GENERAL_PORT:  u16 = 320;
-pub const DANTE_CTRL_PORTS: &[u16] = &[4440, 4455, 8700, 8800];
-pub const NDI_PORT_MIN:      u16 = 5960;
-pub const NDI_PORT_MAX:      u16 = 5980;
-pub const SRT_MAGIC:         u32 = 0x00000004; // SRT_CMD_HANDSHAKE induction
-pub const RIST_PORT_BASE:    u16 = 5000;
+// Port numbers and UDP/TCP ports
+pub const SAP_PORT:          u16 = 9875;   // SAP/SDP metadata
+pub const MDNS_PORT:         u16 = 5353;   // mDNS discovery (Dante)
+pub const RIST_PORT_BASE:    u16 = 5000;   // RIST base port
+pub const PTP_EVENT_PORT:    u16 = 319;    // PTP general port
+pub const PTP_GENERAL_PORT:  u16 = 320;    // PTP event port
+
+// EtherType values for PTP and AVB
+pub const ETHERTYPE_AVTP:    u16 = 0x22F0; // AVTP (AVB)
+pub const ETHERTYPE_PTP:     u16 = 0x88F7; // PTP (IEEE 1588)
+
+// IGMP protocol number
 pub const IP_PROTO_IGMP:     u8  = 0x02;
+
+// Timeout for "dead stream" detection (seconds)
 pub const STREAM_TIMEOUT_SECS: u64 = 10;
 
 // Default RTP clock frequency
 pub const DEFAULT_CLOCK_HZ: f64 = 48_000.0;
 
-// ❖ Protocol Choices and Enums ❖
+// SRT magic number for handshake detection
+pub const SRT_MAGIC:         u32 = 0x00000004;
+
+// Dante control ports
+pub const DANTE_CTRL_PORTS: &[u16] = &[4440, 4455, 8700, 8800];
+
+// NDI default port range
+pub const NDI_PORT_MIN:      u16 = 5960;
+pub const NDI_PORT_MAX:      u16 = 5980;
+
+// ════ Protocol Detection ════
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum AvProtocol {
@@ -69,10 +79,25 @@ pub struct PtpInfo {
     pub log_min_pdelay_req_interval: i8,
 }
 
+// Protocol choice enumeration
 #[derive(Debug, Clone, PartialEq)]
-pub enum ProtocolChoice { All, AES67, Audio, Video, ST2110, Dante, NDI, AVB, PTP, SRT, RIST, IGMP }
+pub enum ProtocolChoice {
+    All,            // Monitor all standard AV protocols (PTP/IGMP always active)
+    AES67,          // Audio over RTP
+    Audio,          // Audio streams (AES67 + Dante + RIST)
+    Video,          // Video streams (ST2110 + NDI + SRT + RIST)
+    ST2110,         // SMPTE ST 2110
+    Dante,          // Dante digital audio
+    NDI,            // Newtek Display
+    AVB,            // Audio Video Bridging
+    PTP,            // Precision Time Protocol
+    SRT,            // Reliable Transport
+    RIST,           // Robust Real-time Transport
+    IGMP,           // IGMP membership
+}
 
 impl ProtocolChoice {
+    /// Human-readable name for protocol choice
     pub fn name(&self) -> &'static str {
         match self {
             ProtocolChoice::All   => "All",
@@ -90,27 +115,31 @@ impl ProtocolChoice {
         }
     }
 
+    /// Does this protocol require UDP packets?
     pub fn needs_udp(&self) -> bool {
         matches!(self, ProtocolChoice::AES67 | ProtocolChoice::Audio | ProtocolChoice::Video
-            | ProtocolChoice::ST2110 | ProtocolChoice::Dante
-            | ProtocolChoice::NDI | ProtocolChoice::PTP | ProtocolChoice::SRT | ProtocolChoice::RIST)
+            | ProtocolChoice::ST2110 | ProtocolChoice::Dante | ProtocolChoice::NDI 
+            | ProtocolChoice::SRT | ProtocolChoice::RIST)
     }
 
+    /// Does this protocol require AVB (Ethernet AV) filtering?
     pub fn needs_avb(&self) -> bool {
         matches!(self, ProtocolChoice::AVB)
     }
 
+    /// Does this protocol require PTP filter in BPF?
     pub fn needs_ptp_filter(&self) -> bool {
         matches!(self, ProtocolChoice::PTP)
     }
 
+    /// Does this protocol require a valid PTP clock?
     pub fn requires_valid_ptp_clock(&self) -> bool {
-        matches!(self, ProtocolChoice::AES67 | ProtocolChoice::Audio | ProtocolChoice::Video
+        matches!(self, ProtocolChoice::AES67 | ProtocolChoice::Audio | ProtocolChoice::Video 
             | ProtocolChoice::ST2110 | ProtocolChoice::AVB)
     }
 
+    // All available protocol choices (PTP/IGMP always active)
     pub fn all_choices() -> Vec<ProtocolChoice> {
-        // PTP et IGMP sont toujours actifs — non présents ici
         vec![
             ProtocolChoice::Audio,
             ProtocolChoice::Video,
@@ -124,7 +153,7 @@ impl ProtocolChoice {
         ]
     }
 
-    /// Protocoles inclus dans ce choix (pour affichage et expansion)
+    /// Return list of protocols included in this choice
     pub fn includes(&self) -> Vec<ProtocolChoice> {
         match self {
             ProtocolChoice::Audio => vec![
@@ -143,8 +172,14 @@ impl ProtocolChoice {
     }
 }
 
+// ── Stream Protocol Types ──
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum St2110Type { Video, Audio, Ancdata, Unknown }
+#[derive(Debug, Clone, PartialEq)]
+pub enum DanteKind  { Discovery, AudioStream, Control }
+#[derive(Debug, Clone, PartialEq)]
+pub enum NdiKind    { Discovery, Stream }
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum DanteKind  { Discovery, AudioStream, Control }
@@ -152,9 +187,8 @@ pub enum DanteKind  { Discovery, AudioStream, Control }
 #[derive(Debug, Clone, PartialEq)]
 pub enum NdiKind    { Discovery, Stream }
 
-// ───olutamente───────────────────────────────────────────────────
-// SDP metadata (from SAP/SDP parser)
-// ─────────────────────────────────────────────────────────
+// ── SDP metadata (from SAP/SDP parser) ──
+
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct SdpSession {
     pub session_id:   String,
