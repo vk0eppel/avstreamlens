@@ -140,16 +140,16 @@ impl StreamStats {
         self.last_ssrc = Some(ssrc);
         self.last_packet_time = Some(now);
         self.dead_alerted = false; // flux vivant — réarmer l'alerte
-        // On accumule les octets réels (payload UDP) et on calcule
-        // le débit toutes les secondes.
-        self.bytes_total += udp_payload_len as u64;
-        if self.last_bitrate_check.elapsed() > Duration::from_secs(1) {
-            let bytes_delta = self.bytes_total - self.bytes_at_check;
-            self.bitrate_bps = bytes_delta * 8; // bits/s sur la dernière seconde
-            self.bytes_at_check  = self.bytes_total;
-            self.packets_at_check = self.packets;
-            self.last_bitrate_check = now;
-        }
+            // On accumule les octets réels (payload UDP) et on calcule
+            // le débit toutes les secondes.
+            self.bytes_total += udp_payload_len as u64;
+            if self.last_bitrate_check.elapsed() > Duration::from_secs(1) {
+                let bytes_delta = self.bytes_total.saturating_sub(self.bytes_at_check);
+                self.bitrate_bps = bytes_delta * 8; // bits/s sur la dernière seconde
+                self.bytes_at_check  = self.bytes_total;
+                self.packets_at_check = self.packets;
+                self.last_bitrate_check = now;
+            }
     }
 
     pub fn loss_pct(&self) -> f64 {
@@ -362,6 +362,7 @@ impl PtpStats {
         self.packets += 1;
         self.last_seen = Instant::now();
 
+        // Track master clocks from clock_id or grandmaster_id
         if let Some(clock_id) = info.clock_id.as_deref().or(info.grandmaster_id.as_deref()) {
             self.masters.insert(clock_id.to_string());
         }

@@ -162,22 +162,21 @@ pub fn parse_sdp(sdp: &str) -> SdpSession {
                             media.ptime_ms = fc as f64 / media.clock_hz * 1000.0;
                         }
                     }
-
                 } else if let Some(rest) = value.strip_prefix("ts-refclk:") {
                     // a=ts-refclk:ptp=IEEE1588-2008:<eui64>:<domain>
                     media.ts_refclk = rest.to_string();
-
                 } else if let Some(rest) = value.strip_prefix("mediaclk:") {
                     // a=mediaclk:direct=0  /  a=mediaclk:sender
                     media.mediaclk = rest.to_string();
                 }
             }
 
-            _ => {}
+            _ => {
+                // Ignore unrecognized field
+            }
         }
     }
 
-    if let Some(m) = cur_media.take() { session.media.push(m); }
     session
 }
 
@@ -290,6 +289,8 @@ pub fn detect_protocol(eth: &EthernetPacket) -> Option<AvProtocol> {
     // ── RTP Streams ─────────────────────────────────────────
     if payload.len() < 12 { return None; }
     if (payload[0] >> 6) & 0b11 != 2 { return None; }
+
+    // Note: timestamp diff validation will be added when needed
     let payload_type = payload[1] & 0x7F;
 
     if is_aes67_multicast(dst_ip) {
@@ -314,7 +315,6 @@ pub fn detect_protocol(eth: &EthernetPacket) -> Option<AvProtocol> {
 
     None
 }
-
 
 // ═════════════════════════════════════════════════════════════════
 // SECTION 4 — TCP PARSING
@@ -412,9 +412,7 @@ pub fn parse_ptp(payload: &[u8]) -> Option<PtpInfo> {
 
     // Parse origin timestamp (for Sync and Delay_Req)
     let origin_timestamp_ns = if payload.len() >= 48 {
-        let seconds = u64::from_be_bytes([
-            0, payload[34], payload[35], payload[36], payload[37], payload[38], payload[39], payload[40],
-        ]);
+        let seconds = u64::from_be_bytes(payload[34..42].try_into().ok()?);
         let nanos = u32::from_be_bytes([payload[41], payload[42], payload[43], payload[44]]);
         Some(seconds * 1_000_000_000 + nanos as u64)
     } else {
