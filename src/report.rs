@@ -171,17 +171,21 @@ pub fn print_report(
     health: &NetworkHealth,
 ) {
     let now = Local::now();
-    let header = format!(
-        "{} | AVStreamLens report  ({} RTP, {} TCP streams) | Health: {:.0}%",
-        now.format("%Y-%m-%d %H:%M:%S"),
-        streams.len(),
-        tcp_streams.len(),
-        health.network_score
-    );
-    logger.log(&format!("\n{}", header));
-
+    let timestamp = now.format("%Y-%m-%d %H:%M:%S").to_string();
+    let stream_count = streams.len();
+    let tcp_count = tcp_streams.len();
+    let score = format!("{:.0}%", health.network_score);
+    
+    let header_line = format!("{} | AVStreamLens report", timestamp);
+    let details = format!("  ({} RTP, {} TCP streams) | Health: {}", stream_count, tcp_count, score);
+    
+    let full_header = format!("{}\n{}", header_line, details);
+    
+    logger.log(&full_header);
+    
     println!("\n\x1b[36m╔══════════════════════════════════════════════════════╗\x1b[0m");
-    println!("\x1b[36m║  {}\x1b[0m", header);
+    println!("\x1b[36m║  {}\x1b[0m", header_line);
+    println!("\x1b[36m║    {}\x1b[0m", details);
     println!("\x1b[36m╚══════════════════════════════════════════════════════╝\x1b[0m");
 
     let net_summary = format!(

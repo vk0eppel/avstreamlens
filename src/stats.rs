@@ -32,17 +32,17 @@ pub struct StreamStats {
     // Timestamp discontinuity detection
     pub ts_discontinuities: u64,
     pub last_ts_diff:       Option<i64>,
-    // ptime SDP (ms) — tolérance pour la détection de discontinuités TS
+    // ptime SDP (ms) — tolerance for TS discontinuity detection
     pub ptime_ms:           f64,
-    // Bitrate exact : accumulateur d'octets UDP réels
+    // Exact bitrate: accumulator of actual UDP bytes
     pub bytes_total:        u64,
     pub bytes_at_check:     u64,
-    // SSRC tracking — changement = interruption de source RTP
+    // SSRC tracking — change = RTP source interruption
     pub last_ssrc:          Option<u32>,
     pub ssrc_changes:       u64,
-    // Dernier paquet reçu — pour détecter les flux morts (silence)
+    // Last packet received — to detect dead streams (silence)
     pub last_packet_time:   Option<Instant>,
-    // Flag: évite de répéter l'alerte "stream dead" à chaque rapport
+    // Flag: avoids repeating the "stream dead" alert in each report
     pub dead_alerted:       bool,
 }
 
@@ -78,7 +78,7 @@ impl StreamStats {
             dead_alerted:        false,
         }
     }
-
+    // Constructor with enhanced info — useful when SDP is available at stream start
     pub fn new_with_info(protocol: &str, clock_hz: f64, is_multicast: bool, dst_ip: Ipv4Addr, dst_port: u16) -> Self {
         let mut stats = Self::new(protocol, clock_hz);
         stats.is_multicast = is_multicast;
@@ -87,8 +87,8 @@ impl StreamStats {
         stats
     }
 
-    /// `udp_payload_len` : longueur réelle du payload UDP (sans header IP/UDP),
-    /// utilisée pour le calcul de bitrate exact.
+    /// `udp_payload_len`: actual length of UDP payload (without IP/UDP header),
+    /// used for exact bitrate calculation.
     pub fn update(&mut self, seq: u16, rtp_ts: u32, ssrc: u32, udp_payload_len: usize) {
         self.packets += 1;
 
@@ -110,7 +110,7 @@ impl StreamStats {
                 48 // fallback : 1 ms @ 48 kHz
             };
             let actual_diff = rtp_ts.wrapping_sub(last_ts) as i64;
-            // Tolérance ±50 % autour du ptime attendu
+            // Tolerance ±50% around expected ptime
             if expected_diff > 0 &&
                ((actual_diff as f64) < (expected_diff as f64 * 0.5) ||
                 (actual_diff as f64) > (expected_diff as f64 * 1.5))
@@ -139,13 +139,13 @@ impl StreamStats {
         }
         self.last_ssrc = Some(ssrc);
         self.last_packet_time = Some(now);
-        self.dead_alerted = false; // flux vivant — réarmer l'alerte
-            // On accumule les octets réels (payload UDP) et on calcule
-            // le débit toutes les secondes.
+        self.dead_alerted = false; // Stream alive — reset alert flag
+            // Accumulate actual bytes (UDP payload) and calculate
+            // throughput every second.
             self.bytes_total += udp_payload_len as u64;
             if self.last_bitrate_check.elapsed() > Duration::from_secs(1) {
                 let bytes_delta = self.bytes_total.saturating_sub(self.bytes_at_check);
-                self.bitrate_bps = bytes_delta * 8; // bits/s sur la dernière seconde
+                self.bitrate_bps = bytes_delta * 8; // bits/s in the last second
                 self.bytes_at_check  = self.bytes_total;
                 self.packets_at_check = self.packets;
                 self.last_bitrate_check = now;
@@ -181,7 +181,7 @@ pub struct TcpStreamStats {
     pub bitrate_bps: u64,
     pub last_bitrate_check: Instant,
     pub bytes_at_check: u64,
-    // Tracking du dernier seq TCP vu — vraie détection de retransmission
+    // Tracking of last TCP seq seen — true retransmission detection
     pub last_seq: Option<u32>,
     pub last_ack: Option<u32>,
 }

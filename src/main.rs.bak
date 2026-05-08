@@ -16,23 +16,130 @@ mod report;
 use pcap::{Capture, Device};
 use pnet_packet::ethernet::EthernetPacket;
 use pnet_packet::Packet;
-use chrono::{Datelike, Local, Timelike};
-use std::collections::HashMap;
-use std::fs::File;
-use std::io::{self, Write};
-use std::net::Ipv4Addr;
 use std::time::{Duration, Instant};
+use std::io::{self, Write};
+use std::collections::HashMap;
+use std::net::Ipv4Addr;
 
 // Import types from modules
-use crate::protocols::{AvProtocol, ProtocolChoice, SdpSession, DanteKind, NdiKind, St2110Type, IgmpType};
-use crate::stats::{StreamStats, TcpStreamStats, NetworkHealth, PtpStats, StreamQuality};
-use crate::parser::{detect_protocol, parse_tcp_packet, parse_rtp, is_multicast, is_aes67_multicast, is_st2110_multicast};
+use protocols::{AvProtocol, ProtocolChoice, SdpSession, DanteKind, NdiKind, St2110Type, IgmpType};
+use stats::{StreamStats, TcpStreamStats, NetworkHealth, PtpStats};
+use parser::{detect_protocol, parse_tcp_packet, parse_rtp, is_multicast, is_aes67_multicast, is_st2110_multicast};
+use chrono::{Datelike, Local, Timelike};
+
+// Re-import create_logger and print_report
 use crate::report::{create_logger, print_report};
 
 // Constants from protocols module
 use protocols::{
     DEFAULT_CLOCK_HZ, STREAM_TIMEOUT_SECS,
 };
+
+
+
+// ═══════════════════════════════════════════════════════════
+// Utility Functions — main.rs-specific
+// ═══════════════════════════════════════════════════════════
+
+fn prompt_protocol_selection() -> Vec<ProtocolChoice> {
+    println!("Choose the protocols to monitor:");
+    println!("  0) All");
+    for (i, choice) in ProtocolChoice::all_choices().iter().enumerate() {
+        println!("  {}) {}", i + 1, choice.name());
+    }
+    println!("  [Separate by commas, e.g. '1,2,3' or enter for all]");
+    print!("> ");
+    io::stdout().flush().unwrap();
+
+    let mut input = String::new();
+    io::stdin().read_line(&mut input).unwrap();
+
+    if input.trim().is_empty() {
+        return vec![ProtocolChoice::All];
+    }
+
+    if input.trim() == "0" {
+        return vec![ProtocolChoice::All];
+    }
+
+    let mut selected = Vec::new();
+    for part in input.split(',') {
+        if let Ok(idx) = part.trim().parse::<usize>() {
+            if idx == 0 {
+                return vec![ProtocolChoice::All];
+            }
+            if let Some(choice) = ProtocolChoice::all_choices().get(idx.saturating_sub(1)) {
+                selected.push(choice.clone());
+            }
+        }
+    }
+
+    if selected.is_empty() {
+        vec![ProtocolChoice::All]
+    } else {
+        selected
+    }
+}
+
+fn build_bpf_filter(selected: &[ProtocolChoice]) -> String {
+    // Expand Audio/Video choices
+    let mut expanded = Vec::new();
+    for choice in selected {
+        expanded.extend(choice.includes());
+    }
+
+    if expanded.is_empty() || expanded.iter().any(|c| matches!(c, ProtocolChoice::All)) {
+        return "udp or (ether proto 0x22f0) or (ether proto 0x88f7)".to_string();
+    }
+
+    let needs_udp = expanded.iter().any(|c| c.needs_udp());
+    let needs_avb = expanded.iter().any(|c| c.needs_avb());
+    let needs_ptp = expanded.iter().any(|c| c.needs_ptp_filter()) || 
+                    expanded.iter().any(|c| c.requires_valid_ptp_clock());
+
+    let mut filters = Vec::new();
+    
+    if needs_udp {
+        filters.push("udp".to_string());
+    }
+    if needs_avb {
+        filters.push("(ether proto 0x22f0)".to_string());
+    }
+    if needs_ptp {
+        filters.push("(ether proto 0x88f7)".to_string());
+    }
+
+    if filters.is_empty() {
+        "udp or (ether proto 0x22f0) or (ether proto 0x88f7)".to_string()
+    } else {
+        filters.join(" or ")
+    }
+}
+
+fn selected_protocol_names(selected: &[ProtocolChoice]) -> String {
+    if selected.iter().any(|c| matches!(c, ProtocolChoice::All)) {
+        "all".to_string()
+    } else {
+        selected.iter()
+            .map(|c| c.name().replace(" (", "_").replace(")", ""))
+            .collect::<Vec<_>>()
+            .join("_")
+    }
+}
+
+fn protocol_requires_ptp(selected: &[ProtocolChoice]) -> bool {
+    // Expand Audio/Video
+    let mut expanded = Vec::new();
+    for choice in selected {
+        expanded.extend(choice.includes());
+    }
+
+    if expanded.is_empty() || expanded.iter().any(|c| matches!(c, ProtocolChoice::All)) {
+        return true;
+    }
+
+    expanded.iter().any(|c| c.requires_valid_ptp_clock())
+}
 
 // ═══════════════════════════════════════════════════════════
 // MAIN
@@ -60,39 +167,22 @@ fn main() {
         println!("  {}: {}", i, d.name);
     }
 
-    // ── Interface selection loop ──
     println!("\n👉 Choose the interface index:");
-    let mut index: usize = loop {
-        print!("> ");
-         io::stdout().flush().unwrap();
-    
-         let mut input = String::new();
-         io::stdin().read_line(&mut input).unwrap();
-    
-        let parsed = input.trim().parse::<usize>();
-        match parsed {
-            Ok(n) => {
-                // Validate range
-                if n >= filtered.len() {
-                    println!("❌ Invalid selection. Must be between 0 and {}.", filtered.len() - 1);
-                    continue;
-                }
-                break n;
-            }
-            Err(_) => {
-                println!("❌ Invalid input. Please enter a number.");
-                continue;
-            }
-        }
+    print!("> ");
+    io::stdout().flush().unwrap();
+
+    let mut input = String::new();
+    io::stdin().read_line(&mut input).unwrap();
+    let index: usize = input.trim().parse().expect("Invalid number");
+
+    let device = match filtered.get(index) {
+        Some(d) => d.clone(),
+        _    => { eprintln!("❌ Invalid selection."); return; }
     };
 
-    let device = filtered.get(index)
-        .expect("Invalid selection");
-
-    let selected_protocols = report::prompt_protocol_selection(&[]);
-    let protocol_names = report::selected_protocol_names(&selected_protocols);
-    let bpf_filter  = report::build_bpf_filter(&selected_protocols);
-    let mut logger = create_logger(&protocol_names).expect("Unable to create log file");
+    let selected_protocols = prompt_protocol_selection();
+    let protocol_names = selected_protocol_names(&selected_protocols);
+    let bpf_filter = build_bpf_filter(&selected_protocols);
 
     println!("Selected protocols: {}", protocol_names);
     logger.log(&format!("Selected protocols: {}", protocol_names));
@@ -100,7 +190,7 @@ fn main() {
     logger.log(&format!("\n📡 Listening on {}  (BPF filter: \"{}\")\n", device.name, bpf_filter));
 
     // ── Opening capture with BPF filter ───────────────
-    let mut cap = Capture::from_device(device.name.as_str())
+    let mut cap = Capture::from_device(device)
         .unwrap()
         .promisc(true)
         .immediate_mode(true)
@@ -111,12 +201,14 @@ fn main() {
         .expect("BPF filter failure — run as root/sudo");
 
     // ── Global state ──────────────────────────────────────
+    // Use report module's Logger
+    let mut logger = create_logger(&selected_protocol_names(&selected_protocols)).expect("Unable to create log file");
     let mut streams:       HashMap<String, StreamStats> = HashMap::new();
     let mut tcp_streams:   HashMap<String, TcpStreamStats> = HashMap::new();
     let mut sdp_cache:     HashMap<String, SdpSession> = HashMap::new();
     let mut ptp_domains:   HashMap<u8, PtpStats> = HashMap::new();
     let mut network_health: NetworkHealth = NetworkHealth::new();
-    let mut multicast_seen: HashMap<(Ipv4Addr, u16), u64> = HashMap::new();
+    let mut multicast_seen: HashMap<(Iv4Addr, u16), u64> = HashMap::new();
     let mut last_report = Instant::now();
 
     // ── Capture loop ────────────────────────────────
@@ -386,8 +478,7 @@ fn main() {
         // ── Report every 5 seconds ────────────────
         if last_report.elapsed() > Duration::from_secs(5) {
             network_health.calculate_score(&streams, &tcp_streams);
-            let requires_valid_ptp = report::protocol_requires_ptp(&selected_protocols);
-            print_report(&streams, &tcp_streams, &ptp_domains, requires_valid_ptp, &mut logger, &network_health);
+            print_report(&streams, &tcp_streams, &ptp_domains, protocol_requires_ptp(&selected_protocols), &mut logger, &network_health);
             for stats in streams.values_mut() {
                 if let Some(last_time) = stats.last_packet_time {
                     if last_time.elapsed() > Duration::from_secs(STREAM_TIMEOUT_SECS) {

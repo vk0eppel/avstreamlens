@@ -181,12 +181,6 @@ pub enum DanteKind  { Discovery, AudioStream, Control }
 #[derive(Debug, Clone, PartialEq)]
 pub enum NdiKind    { Discovery, Stream }
 
-#[derive(Debug, Clone, PartialEq)]
-pub enum DanteKind  { Discovery, AudioStream, Control }
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum NdiKind    { Discovery, Stream }
-
 // ── SDP metadata (from SAP/SDP parser) ──
 
 #[derive(Debug, Clone, PartialEq, Default)]

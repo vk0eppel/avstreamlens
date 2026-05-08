@@ -2,6 +2,10 @@
 // Contains all functions responsible for detecting the type of network traffic
 // and parsing the metadata packets (SDP, PTP, RTP, TCP, etc.).
 
+/// AVStreamLens — parser.rs
+/// Functions for network traffic detection and protocol parsing
+/// (SDP, PTP, RTP, TCP, etc.)
+
 use pnet_packet::{
     ethernet::{EthernetPacket, EtherTypes},
     ipv4::Ipv4Packet,
@@ -10,29 +14,25 @@ use pnet_packet::{
     Packet,
 };
 
-// Import modules
 use crate::protocols::{AvProtocol, St2110Type, DanteKind, NdiKind, SdpSession, SdpMedia, PtpInfo, DEFAULT_CLOCK_HZ};
 use std::net::Ipv4Addr;
 
-// ═════════════════════════════════════════════════════════════════
-// SECTION 1 — NETWORK HELPERS & CONSTANTS
-// ════════════════════════════════════════════════════════════════
-
-const DEFAULT_BPF_FILTER: &str = "udp or (ether proto 0x22f0) or (ether proto 0x88f7)";
-
-// ─────────────────────────────────────────────────────────
-// Network Helpers - Multicast and Unicast Detection
-// ─────────────────────────────────────────────────────────
-
-pub fn is_aes67_multicast(ip: Ipv4Addr) -> bool {
-    let o = ip.octets(); o[0] == 239 && o[1] == 69
-}
-pub fn is_st2110_multicast(ip: Ipv4Addr) -> bool {
-    let o = ip.octets(); o[0] == 239 && o[1] != 69
-}
+// Constants for network filtering and detection
+// BPF filter string for default monitoring
+// Multicast detection for AV/PTP streams
+// BPF filter string for default monitoring
+pub const DEFAULT_BPF_FILTER: &str = "udp or (ether proto 0x22F0) or (ether proto 0x88F7)";
+// Class D: 224.0.0.0 to 239.255.255.255
 pub fn is_multicast(ip: Ipv4Addr) -> bool {
-    // Class D: 224.0.0.0 to 239.255.255.255
     ip.octets()[0] >= 224 && ip.octets()[0] <= 239
+}
+// Detect AES67 (first octet: 239.69.*)
+pub fn is_aes67_multicast(ip: Ipv4Addr) -> bool {
+    let octets = ip.octets(); octets[0] == 239 && octets[1] == 69
+}
+// Detect ST2110 multicast (first octet: 239.x.x.x where x ≠ 69)
+pub fn is_st2110_multicast(ip: Ipv4Addr) -> bool {
+    let octets = ip.octets(); octets[0] == 239 && octets[1] != 69
 }
 pub fn classify_st2110(pt: u8, port: u16) -> St2110Type {
     match port % 10 {
@@ -47,11 +47,13 @@ pub fn classify_st2110(pt: u8, port: u16) -> St2110Type {
         }
     }
 }
+// Detect if a stream is likely Dante audio based on port and payload type patterns
 pub fn is_likely_dante_audio(src: u16, dst: u16, pt: u8) -> bool {
     let port_ok = ((5000..=6000).contains(&dst) && dst % 2 == 0)
                || ((5000..=6000).contains(&src) && src % 2 == 0);
     (pt == 0 || pt == 8 || pt >= 96) && port_ok
 }
+// Check if mDNS payload contains a specific service string (e.g., "_netaudio._udp" or "_ndi._tcp")
 pub fn mdns_contains(payload: &[u8], service: &[u8]) -> bool {
     payload.windows(service.len()).any(|w| w == service)
 }
@@ -292,7 +294,7 @@ pub fn detect_protocol(eth: &EthernetPacket) -> Option<AvProtocol> {
 
     // Note: timestamp diff validation will be added when needed
     let payload_type = payload[1] & 0x7F;
-
+    // Check for AES67/ST2110 multicast patterns first (overlapping with RIST)
     if is_aes67_multicast(dst_ip) {
         return Some(AvProtocol::Aes67 { src: src_ip, dst: dst_ip, dst_port, payload_type });
     }
@@ -302,6 +304,7 @@ pub fn detect_protocol(eth: &EthernetPacket) -> Option<AvProtocol> {
             stream_type: classify_st2110(payload_type, dst_port),
         });
     }
+    // Dante audio streams have specific port and payload type patterns, even if unicast
     if is_likely_dante_audio(src_port, dst_port, payload_type) {
         return Some(AvProtocol::Dante { kind: DanteKind::AudioStream, src: src_ip, dst_port });
     }
