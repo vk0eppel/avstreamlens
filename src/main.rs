@@ -16,16 +16,14 @@ mod report;
 use pcap::{Capture, Device};
 use pnet_packet::ethernet::EthernetPacket;
 use pnet_packet::Packet;
-use chrono::{Datelike, Local, Timelike};
 use std::collections::HashMap;
-use std::fs::File;
 use std::io::{self, Write};
 use std::net::Ipv4Addr;
 use std::time::{Duration, Instant};
 
 // Import types from modules
-use crate::protocols::{AvProtocol, ProtocolChoice, SdpSession, DanteKind, NdiKind, St2110Type, IgmpType};
-use crate::stats::{StreamStats, TcpStreamStats, NetworkHealth, PtpStats, StreamQuality};
+use crate::protocols::{AvProtocol, SdpSession, DanteKind, NdiKind, St2110Type, IgmpType};
+use crate::stats::{StreamStats, TcpStreamStats, NetworkHealth, PtpStats};
 use crate::parser::{detect_protocol, parse_tcp_packet, parse_rtp, is_multicast, is_aes67_multicast, is_st2110_multicast};
 use crate::report::{create_logger, print_report};
 
@@ -143,14 +141,15 @@ fn main() {
                     if !m.mediaclk.is_empty() {
                         logger.log(&format!("   mediaclk: {}", m.mediaclk));
                     }
-                    // Enrich existing StreamStats if port matches
+                    // Enrich stream SDP metadata by port (break on first match)
                     for stats in streams.values_mut() {
-                        if stats.sdp_name.is_none() && m.port > 0 {
+                        if stats.dst_port == m.port && stats.sdp_name.is_none() {
                             stats.sdp_name   = Some(sdp.session_name.clone());
                             stats.sdp_rtpmap = Some(m.rtpmap.clone());
                             if m.clock_hz > 0.0 { stats.clock_hz = m.clock_hz; }
                             if m.ptime_ms > 0.0 { stats.ptime_ms = m.ptime_ms; }
                             if m.channels > 0   { stats.channels = m.channels; }
+                            break; // O(1) after first match
                         }
                     }
                 }
@@ -320,7 +319,7 @@ fn main() {
         }
 
         // ── Dead stream detection ─────────────────────────────
-        if last_report.elapsed() > Duration::from_secs(4) {
+        if last_report.elapsed() > Duration::from_secs(STREAM_TIMEOUT_SECS) {
             for (key, stats) in &streams {
                 if let Some(last_time) = stats.last_packet_time {
                     if last_time.elapsed() > Duration::from_secs(STREAM_TIMEOUT_SECS) {
@@ -388,13 +387,6 @@ fn main() {
             network_health.calculate_score(&streams, &tcp_streams);
             let requires_valid_ptp = report::protocol_requires_ptp(&selected_protocols);
             print_report(&streams, &tcp_streams, &ptp_domains, requires_valid_ptp, &mut logger, &network_health);
-            for stats in streams.values_mut() {
-                if let Some(last_time) = stats.last_packet_time {
-                    if last_time.elapsed() > Duration::from_secs(STREAM_TIMEOUT_SECS) {
-                        stats.dead_alerted = true;
-                    }
-                }
-            }
             last_report = Instant::now();
         }
     }

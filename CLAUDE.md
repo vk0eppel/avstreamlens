@@ -1,15 +1,12 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
-
-## Code Architecture
-
-AVStreamLens is structured around protocol-specific modules (AES67, AVB, Dante, NDI, ST2110) with a central stream processing engine. Key components:
-- `src/main.rs`: Entry point and protocol integration
-- `src/protocols/`: Implementation for each supported AV protocol
-- `src/analytics/`: Stream analysis algorithms
-- `src/debug/`: Diagnostic tools and visualization
-- `Cargo.toml`: Configuration for build and dependencies
+AVStreamLens processes audio/visual streaming over network protocols. Key components:
+- `src/main.rs`: Entry point, CLI handling, protocol dispatcher
+- `src/parser.rs`: Data parsing and deserialization for protocol-specific formats
+- `src/protocols.rs`: Protocol interface and abstraction layer
+- `src/stats.rs`: Stream statistics collection and reporting
+- `src/report.rs`: Report generation and output formatting
+- `Cargo.toml`: Dependencies and build configuration
 
 ## Common Commands
 
@@ -20,7 +17,7 @@ Lint: `cargo clippy -- -D warnings`
 
 ## Development Notes
 
-- Protocol implementations live in `src/protocols/protocol_name.rs`
-- Add new analyzers in `src/analytics/` with corresponding unit tests
-- Use `cargo doc` to generate API documentation
-- The AGENTS.md file contains integration instructions for external systems
+- Protocol implementations reside under `src/protocols.rs` (centralized)
+- All modules follow the same pattern: parsing, analysis, reporting
+- Use `cargo doc --open` to generate and view API documentation
+- Check `src/main.rs` for CLI argument parsing and feature flags

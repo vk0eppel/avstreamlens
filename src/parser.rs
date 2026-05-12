@@ -319,7 +319,7 @@ pub fn detect_protocol(eth: &EthernetPacket) -> Option<AvProtocol> {
     None
 }
 
-// ═════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════
 // SECTION 4 — TCP PARSING
 // ══════════════════════════════════════════════════════════
 // ══════════════════════════════════════════════════════════════════
@@ -363,7 +363,7 @@ pub fn parse_rtp(payload: &[u8]) -> Option<(u16, u32, u32)> {
 
 /// Parses a PTP message payload against defined RFC standards (RFC 6188).
 pub fn parse_ptp(payload: &[u8]) -> Option<PtpInfo> {
-    if payload.len() < 34 { return None; } // PTP header is 34 bytes
+    if payload.len() < 64 { return None; } // PTP Announce (v1/v2) message is 64 bytes
 
     // PTP message types
     let message_type = payload[0] & 0x0F;
@@ -423,18 +423,19 @@ pub fn parse_ptp(payload: &[u8]) -> Option<PtpInfo> {
     };
 
     // Parse grandmaster info (Announce messages)
-    let grandmaster_id = if message_type == 0x0B && payload.len() >= 62 {
+    // PTPv1 (RFC 6188): version=0, clock_class at offset 48
+    let grandmaster_id = if message_type == 0x0B {
         Some(format!("{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-            payload[52], payload[53], payload[54], payload[55],
-            payload[56], payload[57], payload[58], payload[59]))
+            payload[53], payload[54], payload[55], payload[56],
+            payload[57], payload[58], payload[59], payload[60]))
     } else {
         None
     };
 
-    let clock_quality = if message_type == 0x0B && payload.len() >= 51 {
-        let clock_class = payload[47];
-        let clock_accuracy = payload[48];
-        let log_var = u16::from_be_bytes([payload[49], payload[50]]);
+    let clock_quality = if message_type == 0x0B {
+        let clock_class = payload[48];
+        let clock_accuracy = payload[49];
+        let log_var = u16::from_be_bytes([payload[50], payload[51]]);
         Some(format!("class={} acc={} var={}", clock_class, clock_accuracy, log_var))
     } else {
         None

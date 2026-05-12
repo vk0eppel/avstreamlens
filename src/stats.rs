@@ -333,10 +333,13 @@ pub struct PtpStats {
     pub domain:            u8,
     pub version:           u8,
     pub packets:           u64,
-    pub masters:           std::collections::HashSet<String>, // clock IDs of masters
+    pub masters:           std::collections::HashSet<String>,
     pub last_seen:         Instant,
     pub last_grandmaster:  Option<String>,
     pub grandmaster_changes: u64,
+    pub clock_valid:       bool,              // Clock is currently present and valid
+    pub clock_presence_duration: Duration,    // Time since last valid clock activity
+    pub timeout_secs:      u64,               // Configurable timeout (default: 5s)
     pub last_quality:      Option<String>,
     pub last_offset_ns:    Option<i64>,
     pub last_path_delay_ns: Option<i64>,
@@ -352,6 +355,9 @@ impl PtpStats {
             last_seen: Instant::now(),
             last_grandmaster: None,
             grandmaster_changes: 0,
+            clock_valid: false,
+            clock_presence_duration: Duration::ZERO,
+            timeout_secs: 5,
             last_quality: None,
             last_offset_ns: None,
             last_path_delay_ns: None,
@@ -367,23 +373,63 @@ impl PtpStats {
             self.masters.insert(clock_id.to_string());
         }
 
+        // ── Announce message: Detect new grandmaster ───
         if info.message_type == 0x0B {
             if let Some(gm) = &info.grandmaster_id {
+                // Check for grandmaster change
                 if let Some(current) = &self.last_grandmaster {
                     if current != gm {
                         self.grandmaster_changes += 1;
+                        println!(
+                            "\x1b[33m⚠️  GRANDMASTER CHANGED (Domain {}): {} → {}\x1b[0m",
+                            self.domain, current, gm
+                        );
+                        self.last_grandmaster = Some(gm.clone());
                     }
+                } else {
+                    // First time seeing this grandmaster
+                    println!(
+                        "\x1b[32m✓️  GRANDMASTER DETECTED (Domain {}): {}",
+                        self.domain, gm
+                    );
+                    self.last_grandmaster = Some(gm.clone());
                 }
-                self.last_grandmaster = Some(gm.clone());
+
+                // Mark clock as valid and reset timer
+                self.clock_valid = true;
+                self.clock_presence_duration = Duration::ZERO;
             }
             if let Some(q) = &info.clock_quality {
                 self.last_quality = Some(q.clone());
             }
         }
 
+        // ── Sync/Follow_Up: Clock still present ────────
         if info.message_type == 0x00 || info.message_type == 0x08 {
+            // Clock is still active
+            self.clock_presence_duration = Instant::now().duration_since(self.last_seen);
+            if self.clock_valid {
+                println!(
+                    "\x1b[92m✔️  PTP Clock Present (Domain {})\x1b[0m",
+                    self.domain
+                );
+            }
             self.last_offset_ns = info.correction_ns;
         }
+
+        // ── Check timeout ────────────────────────
+        if !self.clock_valid {
+            let timeout = Duration::from_secs(self.timeout_secs as u64);
+            if self.clock_presence_duration > timeout {
+                println!(
+                    "\x1b[31m❌ PTP Clock LOST (Domain {})\x1b[0m",
+                    self.domain
+                );
+                self.clock_valid = false;
+                self.clock_presence_duration = Duration::ZERO;
+            }
+        }
+
         if info.message_type == 0x09 {
             self.last_path_delay_ns = info.path_delay_ns;
         }
