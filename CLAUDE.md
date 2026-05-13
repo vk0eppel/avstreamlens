@@ -1,5 +1,10 @@
 # CLAUDE.md
 
+## Conventions
+- Langage : Rust
+- Framework : CLI
+- Style : Default Rust Style
+
 AVStreamLens processes audio/visual streaming over network protocols. Key components:
 - `src/main.rs`: Entry point, CLI handling, protocol dispatcher
 - `src/parser.rs`: Data parsing and deserialization for protocol-specific formats
@@ -11,7 +16,6 @@ AVStreamLens processes audio/visual streaming over network protocols. Key compon
 ## Common Commands
 
 Build: `cargo build --release`
-Test: `cargo test -- --test-threads=1`
 Format: `cargo fmt`
 Lint: `cargo clippy -- -D warnings`
 
@@ -21,3 +25,7 @@ Lint: `cargo clippy -- -D warnings`
 - All modules follow the same pattern: parsing, analysis, reporting
 - Use `cargo doc --open` to generate and view API documentation
 - Check `src/main.rs` for CLI argument parsing and feature flags
+- There is no test harness. Any new functionality added must be verified manually or by adding tests.
+- Loopback and virtual interfaces (utun, awdl, docker, etc.) are filtered out of the interface list.
+- Logging : timestamped `.log` files written on every run.
+
