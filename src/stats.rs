@@ -373,7 +373,7 @@ impl PtpStats {
             self.masters.insert(clock_id.to_string());
         }
 
-        // ── Announce message: Detect new grandmaster ───
+        // ── Announce message: Clock presence confirmed ────────
         if info.message_type == 0x0B {
             if let Some(gm) = &info.grandmaster_id {
                 // Check for grandmaster change
@@ -397,23 +397,23 @@ impl PtpStats {
 
                 // Mark clock as valid and reset timer
                 self.clock_valid = true;
-                self.clock_presence_duration = Duration::ZERO;
+                self.last_seen = Instant::now(); // Reset last_seen for timeout calculation
             }
             if let Some(q) = &info.clock_quality {
                 self.last_quality = Some(q.clone());
             }
         }
 
-        // ── Sync/Follow_Up: Clock still present ────────
+        // ── Sync/Follow_Up: Clock presence maintained ─────────
         if info.message_type == 0x00 || info.message_type == 0x08 {
-            // Clock is still active
-            self.clock_presence_duration = Instant::now().duration_since(self.last_seen);
+            // Clock is still active - maintain validity
             if self.clock_valid {
                 println!(
                     "\x1b[92m✔️  PTP Clock Present (Domain {})\x1b[0m",
                     self.domain
                 );
             }
+            self.last_seen = Instant::now(); // Update last_seen on Sync messages
             self.last_offset_ns = info.correction_ns;
         }
 
@@ -427,6 +427,11 @@ impl PtpStats {
                 );
                 self.clock_valid = false;
                 self.clock_presence_duration = Duration::ZERO;
+            }
+        } else {
+            // Clock is valid - update presence duration only on Announce/Sync
+            if info.message_type == 0x0B || info.message_type == 0x00 {
+                self.clock_presence_duration = Instant::now().duration_since(self.last_seen);
             }
         }
 

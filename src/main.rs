@@ -59,7 +59,7 @@ fn main() {
     }
 
     // ── Interface selection loop ──
-    println!("\n👉 Choose the interface index:");
+    println!("\n👉 Choose an interface by its number:");
     let mut index: usize = loop {
         print!("> ");
          io::stdout().flush().unwrap();

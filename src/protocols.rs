@@ -134,7 +134,7 @@ impl ProtocolChoice {
 
     /// Does this protocol require a valid PTP clock?
     pub fn requires_valid_ptp_clock(&self) -> bool {
-        matches!(self, ProtocolChoice::AES67 | ProtocolChoice::Audio | ProtocolChoice::Video 
+        matches!(self, ProtocolChoice::AES67 | ProtocolChoice::Audio | ProtocolChoice::Video
             | ProtocolChoice::ST2110 | ProtocolChoice::AVB)
     }
 

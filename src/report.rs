@@ -402,10 +402,10 @@ pub fn print_report(
 
     // ── PTP Validation ──────────────────────────────────────────────────────
     if requires_valid_ptp {
-        let ptp_valid = ptp_domains
-            .values()
-            .any(|stats| !stats.masters.is_empty());
-        if !ptp_valid {
+        // Check if any domain has a currently valid clock
+        let has_valid_clock = ptp_domains.values().any(|stats| stats.clock_valid);
+
+        if !has_valid_clock {
             let alert = "⚠  No valid PTP clock detected for the selected protocols.";
             logger.log(&format!("\n{}", alert));
             println!("\x1b[31m{}\x1b[0m", alert);
