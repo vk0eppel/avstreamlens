@@ -328,21 +328,27 @@ impl NetworkHealth {
 // SECTION 5 — PTP DOMAIN STATISTICS
 // ═════════════════════──══════════════════──═════════════════════════
 
+/// PTP stats for a specific (domain, version, protocol_kind) combination
+/// Note: masters set is removed - use clock_id/grandmaster_id directly from PtpInfo
 #[derive(Debug, Clone)]
 pub struct PtpStats {
     pub domain:            u8,
     pub version:           u8,
     pub packets:           u64,
-    pub masters:           std::collections::HashSet<String>,
+    pub protocol_kind:     Option<String>,           // Parent AV protocol (AES67, ST2110, Dante, AVB)
     pub last_seen:         Instant,
     pub last_grandmaster:  Option<String>,
     pub grandmaster_changes: u64,
-    pub clock_valid:       bool,              // Clock is currently present and valid
-    pub clock_presence_duration: Duration,    // Time since last valid clock activity
-    pub timeout_secs:      u64,               // Configurable timeout (default: 5s)
+    pub clock_valid:       bool,                     // Clock is currently present and valid
+    pub clock_presence_duration: Duration,           // Time since last valid clock activity
+    pub timeout_secs:      u64,                      // Configurable timeout (default: 5s)
     pub last_quality:      Option<String>,
     pub last_offset_ns:    Option<i64>,
     pub last_path_delay_ns: Option<i64>,
+    // Protocol-specific tracking
+    pub protocol_grandmaster_detected: bool,         // Was grandmaster detected for this protocol
+    pub protocol_clock_lost:           bool,          // Was clock lost for this protocol
+    pub protocol_changes_count:        u64,           // Grandmaster changes for this protocol
 }
 
 impl PtpStats {
@@ -351,7 +357,7 @@ impl PtpStats {
             domain,
             version,
             packets: 0,
-            masters: std::collections::HashSet::new(),
+            protocol_kind: None,
             last_seen: Instant::now(),
             last_grandmaster: None,
             grandmaster_changes: 0,
@@ -361,17 +367,18 @@ impl PtpStats {
             last_quality: None,
             last_offset_ns: None,
             last_path_delay_ns: None,
+            protocol_grandmaster_detected: false,
+            protocol_clock_lost: false,
+            protocol_changes_count: 0,
         }
     }
 
-    pub fn update(&mut self, info: &crate::protocols::PtpInfo) {
+    pub fn update(&mut self, info: &crate::protocols::PtpInfo, protocol_kind: &Option<String>) {
         self.packets += 1;
         self.last_seen = Instant::now();
+        self.protocol_kind = protocol_kind.as_ref().map(|s| s.to_string());
 
-        // Track master clocks from clock_id or grandmaster_id
-        if let Some(clock_id) = info.clock_id.as_deref().or(info.grandmaster_id.as_deref()) {
-            self.masters.insert(clock_id.to_string());
-        }
+        // Note: masters tracking removed - use clock_id/grandmaster_id directly from PtpInfo
 
         // ── Announce message: Clock presence confirmed ────────
         if info.message_type == 0x0B {
@@ -380,19 +387,22 @@ impl PtpStats {
                 if let Some(current) = &self.last_grandmaster {
                     if current != gm {
                         self.grandmaster_changes += 1;
+                        self.protocol_changes_count += 1;
                         println!(
-                            "\x1b[33m⚠️  GRANDMASTER CHANGED (Domain {}): {} → {}\x1b[0m",
-                            self.domain, current, gm
+                            "\x1b[33m⚠️  GRANDMASTER CHANGED (Domain {} v{}): {} → {}\x1b[0m",
+                            self.domain, self.version, current, gm
                         );
                         self.last_grandmaster = Some(gm.clone());
+                        self.protocol_grandmaster_detected = true;
                     }
                 } else {
                     // First time seeing this grandmaster
                     println!(
-                        "\x1b[32m✓️  GRANDMASTER DETECTED (Domain {}): {}",
-                        self.domain, gm
+                        "\x1b[32m✓️  GRANDMASTER DETECTED (Domain {} v{}): {}",
+                        self.domain, self.version, gm
                     );
                     self.last_grandmaster = Some(gm.clone());
+                    self.protocol_grandmaster_detected = true;
                 }
 
                 // Mark clock as valid and reset timer
@@ -409,8 +419,8 @@ impl PtpStats {
             // Clock is still active - maintain validity
             if self.clock_valid {
                 println!(
-                    "\x1b[92m✔️  PTP Clock Present (Domain {})\x1b[0m",
-                    self.domain
+                    "\x1b[92m✔️  PTP Clock Present (Domain {} v{})\x1b[0m",
+                    self.domain, self.version
                 );
             }
             self.last_seen = Instant::now(); // Update last_seen on Sync messages
@@ -422,9 +432,10 @@ impl PtpStats {
             let timeout = Duration::from_secs(self.timeout_secs as u64);
             if self.clock_presence_duration > timeout {
                 println!(
-                    "\x1b[31m❌ PTP Clock LOST (Domain {})\x1b[0m",
-                    self.domain
+                    "\x1b[31m❌ PTP Clock LOST (Domain {} v{})\x1b[0m",
+                    self.domain, self.version
                 );
+                self.protocol_clock_lost = true;
                 self.clock_valid = false;
                 self.clock_presence_duration = Duration::ZERO;
             }

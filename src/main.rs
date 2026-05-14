@@ -60,7 +60,7 @@ fn main() {
 
     // ── Interface selection loop ──
     println!("\n👉 Choose an interface by its number:");
-    let mut index: usize = loop {
+    let index: usize = loop {
         print!("> ");
          io::stdout().flush().unwrap();
     
@@ -112,6 +112,7 @@ fn main() {
     let mut streams:       HashMap<String, StreamStats> = HashMap::new();
     let mut tcp_streams:   HashMap<String, TcpStreamStats> = HashMap::new();
     let mut sdp_cache:     HashMap<String, SdpSession> = HashMap::new();
+    // PTP stats keyed by domain (u8)
     let mut ptp_domains:   HashMap<u8, PtpStats> = HashMap::new();
     let mut network_health: NetworkHealth = NetworkHealth::new();
     let mut multicast_seen: HashMap<(Ipv4Addr, u16), u64> = HashMap::new();
@@ -158,8 +159,10 @@ fn main() {
 
             // ── PTP ───────────────────────────────────────
             Some(AvProtocol::Ptp { info }) => {
+                // PTP stats keyed by domain only (u8)
+                // All protocol-specific tracking is per (domain, version, protocol_kind) within the same stats
                 let stats = ptp_domains.entry(info.domain).or_insert_with(|| PtpStats::new(info.domain, info.version));
-                stats.update(&info);
+                stats.update(&info, &info.protocol_kind);
             }
 
             // ── AES67 ────────────────────────────────────

@@ -353,49 +353,48 @@ pub fn print_report(
     if !ptp_domains.is_empty() {
         logger.log("\nPTP Domains:");
         println!("\n\x1b[35m📡 PTP Domains:\x1b[0m");
-        for (domain, stats) in ptp_domains {
+
+        for (domain, stats) in ptp_domains.iter() {
+            let gm_icon = if stats.clock_valid { "✓" } else if stats.last_grandmaster.is_some() { "✓" } else { "❌" };
+
+            let version_str = format!(" v{}", stats.version);
+            let protocol_str = if let Some(ref pk) = stats.protocol_kind {
+                format!(" [{}]", pk)
+            } else {
+                String::new()
+            };
+
             let domain_line = format!(
-                "  Domain {} (v{}): {} packets, {} masters",
-                domain, stats.version, stats.packets, stats.masters.len()
+                "  {}: Domain {}{}{}",
+                gm_icon, domain, version_str, protocol_str
             );
             logger.log(&domain_line);
             println!("{}", domain_line);
 
-            if let Some(gm) = &stats.last_grandmaster {
-                let gm_line = format!("    Grandmaster: {}", gm);
-                logger.log(&gm_line);
-                println!("{}", gm_line);
+            if let Some(ref gm) = stats.last_grandmaster {
+                println!("    {} Grandmaster clock: {}", gm_icon, gm);
+                logger.log(&format!("    {} Grandmaster clock: {}", gm_icon, gm));
             }
-            if let Some(q) = &stats.last_quality {
-                let qual_line = format!("    Lock quality: {}", q);
-                logger.log(&qual_line);
-                println!("{}", qual_line);
+
+            if let Some(ref q) = stats.last_quality {
+                println!("    {} Lock quality: {}", "✔", q);
+                logger.log(&format!("    {} Lock quality: {}", "✔", q));
             }
-            if let Some(offset) = stats.last_offset_ns {
-                let off_line = format!("    Last offset correction: {} ns", offset);
-                logger.log(&off_line);
-                println!("{}", off_line);
+
+            if stats.protocol_clock_lost {
+                println!("    {} ⚠  Clock LOST (protocol grandmaster disappeared)", "✘");
+                logger.log(&format!("    {} ⚠  Clock LOST (protocol grandmaster disappeared)", "✘"));
             }
-            if let Some(delay) = stats.last_path_delay_ns {
-                let delay_line = format!("    Last path delay: {} ns", delay);
-                logger.log(&delay_line);
-                println!("{}", delay_line);
-            }
-            if stats.masters.len() > 1 {
-                let alert = format!(
-                    "    ⚠  Multiple masters detected in domain {}",
-                    domain
+
+            if stats.protocol_changes_count > 0 {
+                println!(
+                    "    {} ⚠  Grandmaster changed {} time(s) for {}",
+                    "✙", stats.protocol_changes_count, stats.protocol_kind.as_ref().unwrap_or(&"unknown".to_string())
                 );
-                logger.log(&alert);
-                println!("\x1b[31m{}\x1b[0m", alert);
-            }
-            if stats.grandmaster_changes > 0 {
-                let alert = format!(
-                    "    ⚠  Grandmaster changed {} time(s)",
-                    stats.grandmaster_changes
-                );
-                logger.log(&alert);
-                println!("\x1b[33m{}\x1b[0m", alert);
+                logger.log(&format!(
+                    "    {} ⚠  Grandmaster changed {} time(s) for {}",
+                    "✙", stats.protocol_changes_count, stats.protocol_kind.as_ref().unwrap_or(&"unknown".to_string())
+                ));
             }
         }
     }

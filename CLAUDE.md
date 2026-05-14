@@ -27,5 +27,14 @@ Lint: `cargo clippy -- -D warnings`
 - Check `src/main.rs` for CLI argument parsing and feature flags
 - There is no test harness. Any new functionality added must be verified manually or by adding tests.
 - Loopback and virtual interfaces (utun, awdl, docker, etc.) are filtered out of the interface list.
-- Logging : timestamped `.log` files written on every run.
+- Logging: timestamped `.log` files written on every run
+- BPF filter is built dynamically from selected protocols
+- RTP analysis: RFC 3550 jitter, sequence loss (16-bit wrapping), SSRC change detection, timestamp discontinuity detection
+- PTP grandmaster detection tracks clock presence per protocol
+- AES67/ST2110: Monitors PTPv2 (RFC 6188) grandmaster
+- Dante: Monitors PTPv1 grandmaster
+- AVB (gPTP): Monitors PTPv2 grandmaster
+- Alerts show: GRANDMASTER DETECTED/CHANGED/LOST per protocol
+- Protocol association via multicast IP (239.69.*=AES67, other 239.x.x.x=ST2110)
+- PTP and IGMP are always monitored regardless of user protocol selection
 

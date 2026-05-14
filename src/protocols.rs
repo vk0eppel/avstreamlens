@@ -25,6 +25,11 @@ pub const STREAM_TIMEOUT_SECS: u64 = 10;
 // Default RTP clock frequency
 pub const DEFAULT_CLOCK_HZ: f64 = 48_000.0;
 
+// PTP versions (RFC 6188)
+// Note: Both PTPv1 and PTPv2 are valid; we use the version field in the message
+pub const PTP_VERSION_V1: u8 = 0;
+pub const PTP_VERSION_V2: u8 = 1;
+
 // SRT magic number for handshake detection
 pub const SRT_MAGIC:         u32 = 0x00000004;
 
@@ -62,21 +67,24 @@ pub enum IgmpType {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct PtpInfo {
-    pub version: u8,
-    pub message_type: u8,
-    pub domain: u8,
-    pub clock_id: Option<String>,
-    pub grandmaster_id: Option<String>,
-    pub clock_quality: Option<String>,
-    pub correction_ns: Option<i64>,
-    pub path_delay_ns: Option<i64>,
+    pub version:           u8,                      // PTPv1=0, PTPv2=1
+    pub message_type:      u8,
+    pub domain:            u8,
+    pub clock_id:          Option<String>,
+    pub grandmaster_id:    Option<String>,
+    pub clock_quality:     Option<String>,
+    pub correction_ns:     Option<i64>,
+    pub path_delay_ns:     Option<i64>,
     pub origin_timestamp_ns: Option<u64>,
     // PTP message parsing improvements
-    pub message_name: String,        // "Sync", "Follow_Up", "Delay_Req", "Delay_Resp", etc.
-    pub port_id: Option<u16>,
-    pub sequence_id: u16,
+    pub message_name:      String,                  // "Sync", "Follow_Up", "Delay_Req", "Delay_Resp", etc.
+    pub port_id:           Option<u16>,
+    pub sequence_id:       u16,
     pub log_sync_interval: i8,
     pub log_min_pdelay_req_interval: i8,
+    // Protocol association
+    pub protocol_version:  u8,                       // PTP version (PTPv1=0, PTPv2=1)
+    pub protocol_kind:     Option<String>,           // Parent AV protocol name (AES67, ST2110, Dante, AVB)
 }
 
 // Protocol choice enumeration

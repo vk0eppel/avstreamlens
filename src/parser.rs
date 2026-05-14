@@ -196,10 +196,32 @@ pub fn detect_protocol(eth: &EthernetPacket) -> Option<AvProtocol> {
     }
 
     // ── PTP : L2 (EtherType 0x88F7) ──────────────────────
+    // PTP can be direct or associated with parent AV protocol (AES67/ST2110/Dante/AVB)
+    // PTPv2 with RTP = AES67 or ST2110 or gPTP
     if raw_et == crate::protocols::ETHERTYPE_PTP {
-        if let Some(info) = parse_ptp(eth.payload()) {
-            return Some(AvProtocol::Ptp { info });
-        }
+        let ip: Option<pnet_packet::ipv4::Ipv4Packet> = pnet_packet::ipv4::Ipv4Packet::new(eth.payload());
+        if ip.is_none() { return None; }
+        let ip  = ip.unwrap();
+        let dst_ip = ip.get_destination();
+        let udp: Option<pnet_packet::udp::UdpPacket> = pnet_packet::udp::UdpPacket::new(ip.payload());
+        if udp.is_none() { return None; }
+        let _udp = udp.unwrap();
+
+        // Check multicast ranges: AES67=239.69.*, ST2110=239.x.x.x where x≠69
+        let octets = dst_ip.octets();
+        let protocol_kind = if octets[0] == 239 && octets[1] == 69 {
+            Some("AES67".to_string())
+        } else {
+            // Default to ST2110 for other patterns (including gPTP)
+            Some("ST2110".to_string())
+        };
+
+        let mut info = parse_ptp(eth.payload()).expect("PTP parse failed");
+        // Set protocol version from payload (PTPv1=0, PTPv2=1)
+        info.protocol_version = info.version;
+        // Set protocol kind based on multicast IP
+        info.protocol_kind = protocol_kind;
+        return Some(AvProtocol::Ptp { info });
     }
 
     // ── IGMP (protocole IP 0x02, sans couche UDP) ────────
@@ -382,6 +404,14 @@ pub fn parse_ptp(payload: &[u8]) -> Option<PtpInfo> {
     };
 
     let version_ptp = (payload[1] >> 4) & 0x0F;
+
+    // Protocol version from PTP payload (PTPv1=0, PTPv2=1)
+    let protocol_version = if version_ptp == 0 || version_ptp == 1 {
+        version_ptp
+    } else {
+        // Default to PTPv2 for unknown versions (most modern)
+        crate::protocols::PTP_VERSION_V2
+    };
     let domain = payload[4];
 
     let correction_field = i64::from_be_bytes([
@@ -457,7 +487,7 @@ pub fn parse_ptp(payload: &[u8]) -> Option<PtpInfo> {
     };
 
     Some(PtpInfo {
-        version: version_ptp,
+        version:           version_ptp,
         message_type,
         domain,
         clock_id,
@@ -471,5 +501,7 @@ pub fn parse_ptp(payload: &[u8]) -> Option<PtpInfo> {
         sequence_id,
         log_sync_interval,
         log_min_pdelay_req_interval,
+        protocol_version:  protocol_version,
+        protocol_kind:     None,  // Set by caller when passing to PtpStats
     })
 }
