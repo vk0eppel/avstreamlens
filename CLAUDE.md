@@ -40,7 +40,26 @@ Lint: `cargo clippy -- -D warnings`
 - Grandmaster detection fires on any PtpInfo with grandmaster_id set (PTPv2: Announce, PTPv1: Sync)
 - Alerts show: GRANDMASTER DETECTED/CHANGED/LOST per protocol
 - Clock loss detected via `PtpStats::check_timeout()` called from the 5-second report loop — NOT inside `update()`, which only runs on packet arrival and cannot detect silence
-- Detection order: L2 AVB/gPTP → IGMP → SAP → mDNS → Dante control → NDI → UDP PTP → SRT → RIST → RTP gate → AES67 → ST2110 → Dante audio; UDP PTP must precede the RTP gate
+- Detection order: L2 AVB/gPTP → IGMP → SAP → mDNS → Dante control → UDP PTP → SRT → RIST → RTP gate → AES67 → ST2110 → Dante audio; UDP PTP must precede the RTP gate
 - Protocol association via multicast IP (239.69.*=AES67, other 239.x.x.x=ST2110)
 - PTP and IGMP are always monitored regardless of user protocol selection
+- BPF filter includes `tcp` for NDI (only protocol using TCP); `all_protocols_filter` also includes `tcp`
+
+## NDI Detection
+- NDI uses dynamically assigned TCP ports — port-range matching is unreliable
+- `ndi_sources: HashSet<Ipv4Addr>` in `main.rs` is populated from mDNS `_ndi._tcp` discovery packets
+- IP-based stream tracking: any TCP packet from/to a known NDI source IP is counted as NDI
+- SRT and RIST match arms guard against both src AND dst being in `ndi_sources` — prevents NDI receiver→sender traffic from being misclassified (check both directions, not just src)
+- `detect_protocol` does NOT contain NDI TCP port-range detection — that path caused double-counting
+
+## False Positive Prevention
+- **Dante audio**: `is_likely_dante_audio` requires BOTH src AND dst ports in 5000–6000 (even); OR logic caused false positives when any app used a Dante-range source port with a high ephemeral destination
+- **RIST**: payload type must be exactly 33 (MPEG-TS); `pt >= 33` was too broad and matched NDI auxiliary traffic
+- **SRT/RIST**: match arms in `main.rs` check `!ndi_sources.contains(&src) && !ndi_sources.contains(&dst)` — NDI receiver→sender UDP packets can accidentally match SRT (control bit pattern) or RIST (port + PT check)
+
+## Network Health
+- Health score factors: stream packet loss, jitter, timestamp discontinuities, TCP quality, QoS/DSCP (AES67/ST2110 should be DSCP EF=46), ECN congestion marks, IGMP querier presence (>130s silence = -10 pts)
+- `calculate_score()` also populates `packet_loss_streams`, `high_jitter_streams`, `aes67_discontinuities` (these were previously defined but never set)
+- IGMP querier absence penalizes score only when active multicast streams exist
+- `detected_duplicates` counter was removed — the original implementation counted every subsequent packet to a multicast group as a duplicate (broken)
 
