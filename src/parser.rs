@@ -275,6 +275,7 @@ pub fn detect_protocol(eth: &EthernetPacket) -> Option<AvProtocol> {
             } else {
                 "PTPv2".to_string()
             });
+            info.src_ip = Some(src_ip);
             return Some(AvProtocol::Ptp { info });
         }
     }
@@ -384,34 +385,44 @@ fn map_ptpv1_subdomain(s: &[u8]) -> u8 {
 
 /// Parse a PTPv1 (IEEE 1588-2002) UDP payload.
 ///
-/// Header layout (40 bytes, from ptpd HEADER_LENGTH):
-///   [0]     versionPTP = 1
-///   [1]     versionNetwork = 1 (UDP/IP)
-///   [2-17]  subdomain (16 bytes ASCII, null-padded)
-///   [18]    (messageType<<4) | sourceCommunicationTechnology
-///   [19]    reserved
-///   [20-25] sourceUuid (6-byte MAC-based identifier)
-///   [26-27] sourcePortId
-///   [28-29] sequenceId
-///   [30]    control: 0=Sync 1=Delay_Req 2=Follow_Up 3=Delay_Resp 4=Management
-///   [31]    logMessagePeriod
-///   [32-39] (reserved, completing 40-byte header)
+/// Two wire encodings exist, distinguished by `hdr_shift`:
 ///
-/// Sync body (bytes 40-123):
-///   [40-41] originTimestamp.epoch   [42-45] .seconds   [46-49] .nanoseconds
-///   [50-53] epochNumber / currentUTCOffset
+/// Separate-byte (hdr_shift=0, e.g. ptpd):
+///   [0]     versionPTP = 0x01
+///   [1]     versionNetwork = 0x01
+///   [2-17]  subdomain (16 bytes)
+///   [20-25] sourceUuid   [26-27] sourcePortId   [28-29] sequenceId
+///   [30]    control      [31]    logMessagePeriod
+///
+/// Nibble-packed (hdr_shift=2, byte[0]=0x11):
+///   [0]     (versionPTP=1)<<4 | versionNetwork=1  = 0x11
+///   [1]     (messageType)<<4  | sourceCT          = 0x11 for Sync/UDP
+///   [2-3]   flags
+///   [4-19]  subdomain (16 bytes)
+///   [22-27] sourceUuid   [28-29] sourcePortId   [30-31] sequenceId
+///   [32]    control      [33]    logMessagePeriod
+///
+/// Sync body (bytes 40-123, same absolute offsets for both encodings):
+///   [40-49] originTimestamp   [50-53] epochNumber/UTC offset
 ///   [54]    padding   [55] grandmasterCommunicationTechnology
 ///   [56-61] grandmasterClockUuid (6 bytes)
-///   [62-65] grandmasterPortId / grandmasterSequenceId
-///   [66]    padding   [67] grandmasterClockStratum
+///   [62-67] grandmasterPortId / sequenceId / padding
+///   [67]    grandmasterClockStratum
 ///   [68-71] grandmasterClockIdentifier (4 bytes ASCII, e.g. "ATOM", "GPS ")
-fn parse_ptp_v1(payload: &[u8]) -> Option<PtpInfo> {
+fn parse_ptp_v1(payload: &[u8], hdr_shift: usize) -> Option<PtpInfo> {
     if payload.len() < 40 { return None; }
 
-    let domain   = map_ptpv1_subdomain(&payload[2..18]);
-    let control  = payload[30];
-    let sequence_id = u16::from_be_bytes([payload[28], payload[29]]);
-    let log_sync_interval = payload[31] as i8;
+    let sd = 2 + hdr_shift;   // subdomain start
+    let uu = 20 + hdr_shift;  // sourceUuid start
+    let po = 26 + hdr_shift;  // sourcePortId offset
+    let sq = 28 + hdr_shift;  // sequenceId offset
+    let ct = 30 + hdr_shift;  // control byte
+    let lp = 31 + hdr_shift;  // logMessagePeriod
+
+    let domain      = map_ptpv1_subdomain(&payload[sd..sd + 16]);
+    let control     = payload[ct];
+    let sequence_id = u16::from_be_bytes([payload[sq], payload[sq + 1]]);
+    let log_sync_interval = payload[lp] as i8;
 
     let (message_type, message_name) = match control {
         0x00 => (0x00u8, "Sync"),
@@ -424,50 +435,53 @@ fn parse_ptp_v1(payload: &[u8]) -> Option<PtpInfo> {
 
     let clock_id = Some(format!(
         "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-        payload[20], payload[21], payload[22], payload[23], payload[24], payload[25]
+        payload[uu], payload[uu+1], payload[uu+2],
+        payload[uu+3], payload[uu+4], payload[uu+5]
     ));
 
-    let port_id = Some(u16::from_be_bytes([payload[26], payload[27]]));
+    let port_id = Some(u16::from_be_bytes([payload[po], payload[po + 1]]));
 
-    // Grandmaster fields live in the Sync body starting at offset 55.
-    // Only populate for Sync messages with enough bytes.
-    let (grandmaster_id, clock_quality) = if message_type == 0x00 && payload.len() >= 72 {
-        let uuid = &payload[56..62];
-        // Skip all-zero UUIDs (device not yet configured)
+    // Grandmaster fields in the Sync body (body starts at byte 34, same for both encodings):
+    //   [34-35] epoch  [36-39] seconds  [40-43] nanoseconds  [44-45] epochNumber
+    //   [46-47] utcOffset  [48] pad  [49] gmCommunicationTechnology
+    //   [50-55] grandmasterClockUuid   [56-57] gmPortId   [58-59] gmSequenceId
+    //   [60] pad  [61] gmClockStratum  [62-65] gmClockIdentifier (4-char ASCII)
+    let (grandmaster_id, clock_quality) = if message_type == 0x00 && payload.len() >= 66 {
+        let uuid = &payload[50..56];
         if uuid.iter().all(|&b| b == 0) {
-            (None, None)
+            (None, None)  // not yet configured
         } else {
             let gm = format!(
                 "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
                 uuid[0], uuid[1], uuid[2], uuid[3], uuid[4], uuid[5]
             );
-            let stratum = payload[67];
-            let ident = std::str::from_utf8(&payload[68..72])
+            let stratum = payload[61];
+            let ident   = std::str::from_utf8(&payload[62..66])
                 .unwrap_or("????")
                 .trim_end_matches('\0');
-            let quality = format!("stratum={} ident={}", stratum, ident);
-            (Some(gm), Some(quality))
+            (Some(gm), Some(format!("stratum={} ident={}", stratum, ident)))
         }
     } else {
         (None, None)
     };
 
     Some(PtpInfo {
-        version:                  PTP_VERSION_V1,
+        version:                     PTP_VERSION_V1,
         message_type,
         domain,
         clock_id,
         grandmaster_id,
         clock_quality,
-        correction_ns:            None,
-        path_delay_ns:            None,
-        origin_timestamp_ns:      None,
-        message_name:             message_name.to_string(),
+        correction_ns:               None,
+        path_delay_ns:               None,
+        origin_timestamp_ns:         None,
+        message_name:                message_name.to_string(),
         port_id,
         sequence_id,
         log_sync_interval,
         log_min_pdelay_req_interval: 0,
-        protocol_kind:            None,
+        protocol_kind:               None,
+        src_ip:                      None, // set by caller
     })
 }
 
@@ -475,10 +489,17 @@ fn parse_ptp_v1(payload: &[u8]) -> Option<PtpInfo> {
 pub fn parse_ptp(payload: &[u8]) -> Option<PtpInfo> {
     if payload.len() < 2 { return None; }
 
-    // PTPv1: byte[0]=versionPTP=1, byte[1]=versionNetwork=1
-    // Must be checked before the PTPv2 64-byte minimum to avoid discarding v1 packets.
-    if payload[0] == PTP_VERSION_V1 && payload[1] == 1 {
-        return parse_ptp_v1(payload);
+    // PTPv2 has one reliable wire marker: versionPTP = 2 in the low nibble of byte 1.
+    // Anything that doesn't match is PTPv1 (we are already in a PTP context: port 319/320
+    // or EtherType 0x88F7, so non-PTP traffic is not a concern here).
+    if payload[1] & 0x0F != PTP_VERSION_V2 {
+        // Auto-detect PTPv1 layout by checking the subdomain start:
+        //   nibble-packed (byte[0]=0x11): subdomain at byte 4  → hdr_shift = 2
+        //   separate-byte (byte[0]=0x01): subdomain at byte 2  → hdr_shift = 0
+        // All standard PTPv1 subdomains begin with '_' (0x5F), making payload[4]=='_'
+        // a reliable indicator of the nibble-packed layout.
+        let hdr_shift = if payload.len() >= 5 && payload[4] == b'_' { 2 } else { 0 };
+        return parse_ptp_v1(payload, hdr_shift);
     }
 
     // PTPv2 — Announce is 64 bytes; shorter messages (Sync=44) are not yet parsed.
@@ -590,6 +611,7 @@ pub fn parse_ptp(payload: &[u8]) -> Option<PtpInfo> {
         sequence_id,
         log_sync_interval,
         log_min_pdelay_req_interval,
-        protocol_kind:     None,  // Set by caller
+        protocol_kind:     None,  // set by caller
+        src_ip:            None,  // set by caller
     })
 }

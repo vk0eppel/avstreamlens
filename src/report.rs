@@ -263,8 +263,12 @@ pub fn print_report(
             println!("{}", domain_line);
 
             if let Some(ref gm) = stats.last_grandmaster {
-                println!("    {} Grandmaster clock: {}", gm_icon, gm);
-                logger.log(&format!("    {} Grandmaster clock: {}", gm_icon, gm));
+                let ip_str = stats.last_src_ip
+                    .map(|ip| format!("  ({})", ip))
+                    .unwrap_or_default();
+                let line = format!("    {} Grandmaster clock: {}{}", gm_icon, gm, ip_str);
+                println!("{}", line);
+                logger.log(&line);
             }
 
             if let Some(ref q) = stats.last_quality {

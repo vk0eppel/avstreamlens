@@ -53,6 +53,7 @@ fn main() {
         .unwrap()
         .promisc(true)
         .immediate_mode(true)
+        .timeout(1000)  // unblocks the loop so the 5-second report fires even on quiet networks
         .open()
         .unwrap();
 
@@ -338,6 +339,19 @@ fn main() {
 
         // ── Report every 5 seconds ────────────────
         if last_report.elapsed() > Duration::from_secs(5) {
+            // Check for lost PTP clocks before printing the report.
+            // Must run here — update() is only called on packet arrival so it
+            // cannot detect loss when the grandmaster has gone silent.
+            for stats in ptp_domains.values_mut() {
+                if stats.check_timeout() {
+                    logger.log(&format!(
+                        "❌ PTP Clock LOST (Domain {} v{}) [{}]",
+                        stats.domain,
+                        stats.version,
+                        stats.protocol_kind.as_deref().unwrap_or("?")
+                    ));
+                }
+            }
             network_health.calculate_score(&streams, &tcp_streams);
             let requires_valid_ptp = cli::protocol_requires_ptp(&selected_protocols);
             print_report(&streams, &tcp_streams, &ptp_domains, requires_valid_ptp, &mut logger, &network_health);

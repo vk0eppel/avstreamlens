@@ -349,6 +349,7 @@ pub struct PtpStats {
     pub protocol_grandmaster_detected: bool,         // Was grandmaster detected for this protocol
     pub protocol_clock_lost:           bool,          // Was clock lost for this protocol
     pub protocol_changes_count:        u64,           // Grandmaster changes for this protocol
+    pub last_src_ip:                   Option<std::net::Ipv4Addr>, // Source IP of last PTP packet
 }
 
 impl PtpStats {
@@ -370,6 +371,7 @@ impl PtpStats {
             protocol_grandmaster_detected: false,
             protocol_clock_lost: false,
             protocol_changes_count: 0,
+            last_src_ip: None,
         }
     }
 
@@ -377,6 +379,7 @@ impl PtpStats {
         self.packets += 1;
         self.last_seen = Instant::now();
         self.protocol_kind = protocol_kind.as_ref().map(|s| s.to_string());
+        if let Some(ip) = info.src_ip { self.last_src_ip = Some(ip); }
 
         // Note: masters tracking removed - use clock_id/grandmaster_id directly from PtpInfo
 
@@ -413,40 +416,32 @@ impl PtpStats {
             }
         }
 
-        // ── Sync/Follow_Up: Clock presence maintained ─────────
+        // ── Sync/Follow_Up: update last_seen and offset for timeout/reporting ────
         if info.message_type == 0x00 || info.message_type == 0x08 {
-            // Clock is still active - maintain validity
-            if self.clock_valid {
-                println!(
-                    "\x1b[92m✔️  PTP Clock Present (Domain {} v{})\x1b[0m",
-                    self.domain, self.version
-                );
-            }
-            self.last_seen = Instant::now(); // Update last_seen on Sync messages
+            self.last_seen = Instant::now();
             self.last_offset_ns = info.correction_ns;
-        }
-
-        // ── Check timeout ────────────────────────
-        if !self.clock_valid {
-            let timeout = Duration::from_secs(self.timeout_secs as u64);
-            if self.clock_presence_duration > timeout {
-                println!(
-                    "\x1b[31m❌ PTP Clock LOST (Domain {} v{})\x1b[0m",
-                    self.domain, self.version
-                );
-                self.protocol_clock_lost = true;
-                self.clock_valid = false;
-                self.clock_presence_duration = Duration::ZERO;
-            }
-        } else {
-            // Clock is valid - update presence duration only on Announce/Sync
-            if info.message_type == 0x0B || info.message_type == 0x00 {
-                self.clock_presence_duration = Instant::now().duration_since(self.last_seen);
-            }
         }
 
         if info.message_type == 0x09 {
             self.last_path_delay_ns = info.path_delay_ns;
         }
+    }
+
+    /// Call from the periodic report cycle (not from packet handlers).
+    /// Returns true if the clock just transitioned to LOST this call.
+    pub fn check_timeout(&mut self) -> bool {
+        if self.clock_valid && self.last_seen.elapsed() > Duration::from_secs(self.timeout_secs) {
+            println!(
+                "\x1b[31m❌ PTP Clock LOST (Domain {} v{}) [{}]\x1b[0m",
+                self.domain,
+                self.version,
+                self.protocol_kind.as_deref().unwrap_or("?")
+            );
+            self.clock_valid = false;
+            self.protocol_clock_lost = true;
+            self.last_grandmaster = None; // reset so re-detection fires DETECTED again
+            return true;
+        }
+        false
     }
 }

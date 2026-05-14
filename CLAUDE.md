@@ -33,12 +33,13 @@ Lint: `cargo clippy -- -D warnings`
 - RTP analysis: RFC 3550 jitter, sequence loss (16-bit wrapping), SSRC change detection, timestamp discontinuity detection
 - PTP grandmaster detection tracks clock presence per protocol
 - AES67/ST2110: Monitors PTPv2 (IEEE 1588-2008) grandmaster via UDP ports 319/320, multicast 224.0.1.129–132
-- Dante: Monitors PTPv1 (IEEE 1588-2002) grandmaster via UDP ports 319/320; grandmaster detected from Sync body (bytes 56–61 grandmasterClockUuid, byte 67 stratum)
+- Dante: Monitors PTPv1 (IEEE 1588-2002) grandmaster via UDP ports 319/320; grandmaster detected from Sync body (bytes 50–55 grandmasterClockUuid, byte 61 stratum, bytes 62–65 identifier); PTPv1 layout auto-detected: if payload[4]=='_' → nibble-packed (hdr_shift=2), else separate-byte (hdr_shift=0)
 - AVB (gPTP): Monitors gPTP grandmaster via EtherType 0x88F7 (L2, no IP layer)
 - PTPv1 subdomain mapped to domain number: _DFLT→0, _ALT1→1, _ALT2→2, _ALT3→3
 - PTP domains tracked per (domain, version) tuple — separates Dante PTPv1 from AES67/ST2110 PTPv2 on the same domain number
 - Grandmaster detection fires on any PtpInfo with grandmaster_id set (PTPv2: Announce, PTPv1: Sync)
 - Alerts show: GRANDMASTER DETECTED/CHANGED/LOST per protocol
+- Clock loss detected via `PtpStats::check_timeout()` called from the 5-second report loop — NOT inside `update()`, which only runs on packet arrival and cannot detect silence
 - Detection order: L2 AVB/gPTP → IGMP → SAP → mDNS → Dante control → NDI → UDP PTP → SRT → RIST → RTP gate → AES67 → ST2110 → Dante audio; UDP PTP must precede the RTP gate
 - Protocol association via multicast IP (239.69.*=AES67, other 239.x.x.x=ST2110)
 - PTP and IGMP are always monitored regardless of user protocol selection

@@ -84,6 +84,7 @@ pub struct PtpInfo {
     pub log_min_pdelay_req_interval: i8,
     // Protocol association
     pub protocol_kind:     Option<String>,           // Parent AV protocol name (AES67, ST2110, Dante, AVB)
+    pub src_ip:            Option<std::net::Ipv4Addr>, // Source IP (UDP PTP); None for L2 gPTP
 }
 
 // Protocol choice enumeration
