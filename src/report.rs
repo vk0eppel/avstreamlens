@@ -4,10 +4,9 @@
 use chrono::{Datelike, Timelike, Local};
 use std::collections::HashMap;
 use std::time::Duration;
-use std::io::{self, Write};
 
 use crate::stats::{StreamStats, TcpStreamStats, PtpStats, NetworkHealth, StreamQuality};
-use crate::protocols::{ProtocolChoice, STREAM_TIMEOUT_SECS};
+use crate::protocols::STREAM_TIMEOUT_SECS;
 
 /// Logger for writing timestamped messages to both file and console.
 #[derive(Debug)]
@@ -42,114 +41,6 @@ impl Logger {
     }
 }
 
-/// Prompt user for protocol selection
-pub fn prompt_protocol_selection(selected: &[ProtocolChoice]) -> Vec<ProtocolChoice> {
-    println!("Choose the protocols to monitor:");
-    println!("  0) All");
-    for (i, choice) in ProtocolChoice::all_choices().iter().enumerate() {
-        println!("  {}) {}", i + 1, choice.name());
-    }
-    println!("  [Separate by commas, e.g. '1,2,3' or enter for all]");
-    print!("> ");
-    io::stdout().flush().unwrap();
-
-    let mut input = String::new();
-    io::stdin().read_line(&mut input).unwrap();
-
-    if input.trim().is_empty() {
-        return vec![ProtocolChoice::All];
-    }
-
-    if input.trim() == "0" {
-        return vec![ProtocolChoice::All];
-    }
-
-    let mut selected = Vec::new();
-    for part in input.split(',') {
-        if let Ok(idx) = part.trim().parse::<usize>() {
-            if idx == 0 {
-                return vec![ProtocolChoice::All];
-            }
-            if let Some(choice) = ProtocolChoice::all_choices().get(idx.saturating_sub(1)) {
-                selected.push(choice.clone());
-            }
-        }
-    }
-
-    if selected.is_empty() {
-        vec![ProtocolChoice::All]
-    } else {
-        selected
-    }
-}
-
-/// Build BPF filter from selected protocols
-pub fn build_bpf_filter(selected: &[ProtocolChoice]) -> String {
-    // Expand Audio/Video choices
-    let mut expanded = Vec::new();
-    for choice in selected {
-        expanded.extend(choice.includes());
-    }
-
-    if expanded.is_empty() || expanded.iter().any(|c| matches!(c, ProtocolChoice::All)) {
-        return filter_with_igmp();
-    }
-
-    let needs_udp = expanded.iter().any(|c| c.needs_udp());
-    let needs_avb = expanded.iter().any(|c| c.needs_avb());
-    let needs_ptp = expanded.iter().any(|c| c.needs_ptp_filter()) || 
-                    expanded.iter().any(|c| c.requires_valid_ptp_clock());
-
-    let mut filters = Vec::new();
-    
-    if needs_udp {
-        filters.push("udp".to_string());
-    }
-    if needs_avb {
-        filters.push("(ether proto 0x22f0)".to_string());
-    }
-    if needs_ptp {
-        filters.push("(ether proto 0x88f7)".to_string());
-    }
-
-    if filters.is_empty() {
-        filter_with_igmp()
-    } else {
-        // Add IGMP filter for protocol 2 (no port concept)
-        filters.insert(0, "igmp".to_string());
-        filters.join(" or ")
-    }
-}
-
-/// Helper function for default filter with IGMP
-pub fn filter_with_igmp() -> String {
-    "igmp or udp or (ether proto 0x22f0) or (ether proto 0x88f7)".to_string()
-}
-
-/// Format selected protocol names
-pub fn selected_protocol_names(selected: &[ProtocolChoice]) -> String {
-    if selected.iter().any(|c| matches!(c, ProtocolChoice::All)) {
-        "all".to_string()
-    } else {
-        selected.iter()
-            .map(|c| c.name().replace(" (", "_").replace(")", ""))
-            .collect::<Vec<_>>()
-            .join("_")
-    }
-}
-
-/// Check if selected protocols require PTP
-pub fn protocol_requires_ptp(selected: &[ProtocolChoice]) -> bool {
-    // Expand Audio/Video
-    let expanded: Vec<_> = selected.iter().flat_map(|c| c.includes()).collect();
-
-    if expanded.is_empty() || expanded.iter().any(|c| matches!(c, ProtocolChoice::All)) {
-        return true;
-    }
-
-    expanded.iter().any(|c| c.requires_valid_ptp_clock())
-}
-
 /// Create a new logger
 pub fn create_logger(prefix: &str) -> std::io::Result<Logger> {
     Logger::new(prefix)
@@ -165,7 +56,7 @@ pub fn create_logger(prefix: &str) -> std::io::Result<Logger> {
 pub fn print_report(
     streams: &HashMap<String, StreamStats>,
     tcp_streams: &HashMap<String, TcpStreamStats>,
-    ptp_domains: &HashMap<u8, PtpStats>,
+    ptp_domains: &HashMap<(u8, u8), PtpStats>,
     requires_valid_ptp: bool,
     logger: &mut Logger,
     health: &NetworkHealth,
@@ -354,7 +245,7 @@ pub fn print_report(
         logger.log("\nPTP Domains:");
         println!("\n\x1b[35m📡 PTP Domains:\x1b[0m");
 
-        for (domain, stats) in ptp_domains.iter() {
+        for ((domain, _version), stats) in ptp_domains.iter() {
             let gm_icon = if stats.clock_valid { "✓" } else if stats.last_grandmaster.is_some() { "✓" } else { "❌" };
 
             let version_str = format!(" v{}", stats.version);

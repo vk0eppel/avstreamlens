@@ -8,16 +8,16 @@
 // - PTP (IEEE 1588) and IGMP always monitored
 // - Terminal reporting every 5 seconds
 
+mod cli;
 mod parser;
 mod protocols;
 mod stats;
 mod report;
 
-use pcap::{Capture, Device};
+use pcap::Capture;
 use pnet_packet::ethernet::EthernetPacket;
 use pnet_packet::Packet;
 use std::collections::HashMap;
-use std::io::{self, Write};
 use std::net::Ipv4Addr;
 use std::time::{Duration, Instant};
 
@@ -37,59 +37,10 @@ use protocols::{
 // ═══════════════════════════════════════════════════════════
 
 fn main() {
-    // ── Interface listing ───────────────────────────
-    let devices = Device::list().expect("Unable to list interfaces");
-    let filtered: Vec<Device> = devices
-        .into_iter()
-        .filter(|d| {
-            let n = d.name.as_str();
-            if n == "lo" || n == "lo0" { return false; }
-            let skip = ["utun", "awdl", "llw", "bridge", "vpn", "docker", "veth", "virbr"];
-            !skip.iter().any(|k| n.contains(k))
-        })
-        .collect();
-
-    if filtered.is_empty() {
-        eprintln!("❌ No active network interfaces found."); return;
-    }
-
-    println!("📡 Available interfaces:\n");
-    for (i, d) in filtered.iter().enumerate() {
-        println!("  {}: {}", i, d.name);
-    }
-
-    // ── Interface selection loop ──
-    println!("\n👉 Choose an interface by its number:");
-    let index: usize = loop {
-        print!("> ");
-         io::stdout().flush().unwrap();
-    
-         let mut input = String::new();
-         io::stdin().read_line(&mut input).unwrap();
-    
-        let parsed = input.trim().parse::<usize>();
-        match parsed {
-            Ok(n) => {
-                // Validate range
-                if n >= filtered.len() {
-                    println!("❌ Invalid selection. Must be between 0 and {}.", filtered.len() - 1);
-                    continue;
-                }
-                break n;
-            }
-            Err(_) => {
-                println!("❌ Invalid input. Please enter a number.");
-                continue;
-            }
-        }
-    };
-
-    let device = filtered.get(index)
-        .expect("Invalid selection");
-
-    let selected_protocols = report::prompt_protocol_selection(&[]);
-    let protocol_names = report::selected_protocol_names(&selected_protocols);
-    let bpf_filter  = report::build_bpf_filter(&selected_protocols);
+    let device = cli::select_interface();
+    let selected_protocols = cli::prompt_protocol_selection();
+    let protocol_names = cli::selected_protocol_names(&selected_protocols);
+    let bpf_filter = cli::build_bpf_filter(&selected_protocols);
     let mut logger = create_logger(&protocol_names).expect("Unable to create log file");
 
     println!("Selected protocols: {}", protocol_names);
@@ -112,8 +63,8 @@ fn main() {
     let mut streams:       HashMap<String, StreamStats> = HashMap::new();
     let mut tcp_streams:   HashMap<String, TcpStreamStats> = HashMap::new();
     let mut sdp_cache:     HashMap<String, SdpSession> = HashMap::new();
-    // PTP stats keyed by domain (u8)
-    let mut ptp_domains:   HashMap<u8, PtpStats> = HashMap::new();
+    // PTP stats keyed by (domain, version) to separate Dante PTPv1 from AES67/ST2110 PTPv2
+    let mut ptp_domains:   HashMap<(u8, u8), PtpStats> = HashMap::new();
     let mut network_health: NetworkHealth = NetworkHealth::new();
     let mut multicast_seen: HashMap<(Ipv4Addr, u16), u64> = HashMap::new();
     let mut last_report = Instant::now();
@@ -159,9 +110,9 @@ fn main() {
 
             // ── PTP ───────────────────────────────────────
             Some(AvProtocol::Ptp { info }) => {
-                // PTP stats keyed by domain only (u8)
-                // All protocol-specific tracking is per (domain, version, protocol_kind) within the same stats
-                let stats = ptp_domains.entry(info.domain).or_insert_with(|| PtpStats::new(info.domain, info.version));
+                let stats = ptp_domains
+                    .entry((info.domain, info.version))
+                    .or_insert_with(|| PtpStats::new(info.domain, info.version));
                 stats.update(&info, &info.protocol_kind);
             }
 
@@ -388,7 +339,7 @@ fn main() {
         // ── Report every 5 seconds ────────────────
         if last_report.elapsed() > Duration::from_secs(5) {
             network_health.calculate_score(&streams, &tcp_streams);
-            let requires_valid_ptp = report::protocol_requires_ptp(&selected_protocols);
+            let requires_valid_ptp = cli::protocol_requires_ptp(&selected_protocols);
             print_report(&streams, &tcp_streams, &ptp_domains, requires_valid_ptp, &mut logger, &network_health);
             last_report = Instant::now();
         }

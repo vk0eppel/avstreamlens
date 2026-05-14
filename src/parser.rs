@@ -195,33 +195,14 @@ pub fn detect_protocol(eth: &EthernetPacket) -> Option<AvProtocol> {
         return Some(AvProtocol::Avb { subtype });
     }
 
-    // ── PTP : L2 (EtherType 0x88F7) ──────────────────────
-    // PTP can be direct or associated with parent AV protocol (AES67/ST2110/Dante/AVB)
-    // PTPv2 with RTP = AES67 or ST2110 or gPTP
+    // ── gPTP / AVB : L2 (EtherType 0x88F7) ──────────────────────
+    // L2 PTP frames carry the PTP payload directly after the Ethernet header — no IP layer.
     if raw_et == crate::protocols::ETHERTYPE_PTP {
-        let ip: Option<pnet_packet::ipv4::Ipv4Packet> = pnet_packet::ipv4::Ipv4Packet::new(eth.payload());
-        if ip.is_none() { return None; }
-        let ip  = ip.unwrap();
-        let dst_ip = ip.get_destination();
-        let udp: Option<pnet_packet::udp::UdpPacket> = pnet_packet::udp::UdpPacket::new(ip.payload());
-        if udp.is_none() { return None; }
-        let _udp = udp.unwrap();
-
-        // Check multicast ranges: AES67=239.69.*, ST2110=239.x.x.x where x≠69
-        let octets = dst_ip.octets();
-        let protocol_kind = if octets[0] == 239 && octets[1] == 69 {
-            Some("AES67".to_string())
-        } else {
-            // Default to ST2110 for other patterns (including gPTP)
-            Some("ST2110".to_string())
-        };
-
-        let mut info = parse_ptp(eth.payload()).expect("PTP parse failed");
-        // Set protocol version from payload (PTPv1=0, PTPv2=1)
-        info.protocol_version = info.version;
-        // Set protocol kind based on multicast IP
-        info.protocol_kind = protocol_kind;
-        return Some(AvProtocol::Ptp { info });
+        if let Some(mut info) = parse_ptp(eth.payload()) {
+            info.protocol_kind = Some("AVB".to_string());
+            return Some(AvProtocol::Ptp { info });
+        }
+        return None;
     }
 
     // ── IGMP (protocole IP 0x02, sans couche UDP) ────────
@@ -333,7 +314,13 @@ pub fn detect_protocol(eth: &EthernetPacket) -> Option<AvProtocol> {
 
     // ── PTP over UDP ─────────────────────────────────────
     if dst_port == crate::protocols::PTP_EVENT_PORT || dst_port == crate::protocols::PTP_GENERAL_PORT || src_port == crate::protocols::PTP_EVENT_PORT || src_port == crate::protocols::PTP_GENERAL_PORT {
-        if let Some(info) = parse_ptp(payload) {
+        if let Some(mut info) = parse_ptp(payload) {
+            // PTPv1 (Dante) vs PTPv2 (AES67/ST2110 — indistinguishable at the PTP layer)
+            info.protocol_kind = Some(if info.version == crate::protocols::PTP_VERSION_V1 {
+                "Dante".to_string()
+            } else {
+                "PTPv2".to_string()
+            });
             return Some(AvProtocol::Ptp { info });
         }
     }
@@ -403,13 +390,13 @@ pub fn parse_ptp(payload: &[u8]) -> Option<PtpInfo> {
         _ => format!("Unknown(0x{:X})", message_type),
     };
 
-    let version_ptp = (payload[1] >> 4) & 0x0F;
-
-    // Protocol version from PTP payload (PTPv1=0, PTPv2=1)
-    let protocol_version = if version_ptp == 0 || version_ptp == 1 {
-        version_ptp
+    // PTPv2 (IEEE 1588-2008): version = low nibble of byte 1 (= 2)
+    // PTPv1 (IEEE 1588-2002): version = high nibble of byte 0 (= 1)
+    let version_ptp = if payload[1] & 0x0F == crate::protocols::PTP_VERSION_V2 {
+        crate::protocols::PTP_VERSION_V2
+    } else if (payload[0] >> 4) & 0x0F == crate::protocols::PTP_VERSION_V1 {
+        crate::protocols::PTP_VERSION_V1
     } else {
-        // Default to PTPv2 for unknown versions (most modern)
         crate::protocols::PTP_VERSION_V2
     };
     let domain = payload[4];
@@ -501,7 +488,6 @@ pub fn parse_ptp(payload: &[u8]) -> Option<PtpInfo> {
         sequence_id,
         log_sync_interval,
         log_min_pdelay_req_interval,
-        protocol_version:  protocol_version,
-        protocol_kind:     None,  // Set by caller when passing to PtpStats
+        protocol_kind:     None,  // Set by caller
     })
 }

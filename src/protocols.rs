@@ -9,8 +9,8 @@ use std::net::Ipv4Addr;
 pub const SAP_PORT:          u16 = 9875;   // SAP/SDP metadata
 pub const MDNS_PORT:         u16 = 5353;   // mDNS discovery (Dante)
 pub const RIST_PORT_BASE:    u16 = 5000;   // RIST base port
-pub const PTP_EVENT_PORT:    u16 = 319;    // PTP general port
-pub const PTP_GENERAL_PORT:  u16 = 320;    // PTP event port
+pub const PTP_EVENT_PORT:    u16 = 319;    // PTP event port (Sync, Delay_Req, P_Delay_Req)
+pub const PTP_GENERAL_PORT:  u16 = 320;    // PTP general port (Announce, Follow_Up, Management)
 
 // EtherType values for PTP and AVB
 pub const ETHERTYPE_AVTP:    u16 = 0x22F0; // AVTP (AVB)
@@ -27,8 +27,8 @@ pub const DEFAULT_CLOCK_HZ: f64 = 48_000.0;
 
 // PTP versions (RFC 6188)
 // Note: Both PTPv1 and PTPv2 are valid; we use the version field in the message
-pub const PTP_VERSION_V1: u8 = 0;
-pub const PTP_VERSION_V2: u8 = 1;
+pub const PTP_VERSION_V1: u8 = 1;  // IEEE 1588-2002 wire value (high nibble of byte 0)
+pub const PTP_VERSION_V2: u8 = 2;  // IEEE 1588-2008 wire value (low nibble of byte 1)
 
 // SRT magic number for handshake detection
 pub const SRT_MAGIC:         u32 = 0x00000004;
@@ -83,7 +83,6 @@ pub struct PtpInfo {
     pub log_sync_interval: i8,
     pub log_min_pdelay_req_interval: i8,
     // Protocol association
-    pub protocol_version:  u8,                       // PTP version (PTPv1=0, PTPv2=1)
     pub protocol_kind:     Option<String>,           // Parent AV protocol name (AES67, ST2110, Dante, AVB)
 }
 

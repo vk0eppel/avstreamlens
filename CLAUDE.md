@@ -33,7 +33,8 @@ Lint: `cargo clippy -- -D warnings`
 - PTP grandmaster detection tracks clock presence per protocol
 - AES67/ST2110: Monitors PTPv2 (RFC 6188) grandmaster
 - Dante: Monitors PTPv1 grandmaster
-- AVB (gPTP): Monitors PTPv2 grandmaster
+- AVB (gPTP): Monitors gPTP grandmaster via EtherType 0x88F7 (L2, no IP layer)
+- PTP domains tracked per (domain, version) tuple — separates Dante PTPv1 from AES67/ST2110 PTPv2 on the same domain number
 - Alerts show: GRANDMASTER DETECTED/CHANGED/LOST per protocol
 - Protocol association via multicast IP (239.69.*=AES67, other 239.x.x.x=ST2110)
 - PTP and IGMP are always monitored regardless of user protocol selection
