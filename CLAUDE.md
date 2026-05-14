@@ -42,15 +42,22 @@ Lint: `cargo clippy -- -D warnings`
 - Clock loss detected via `PtpStats::check_timeout()` called from the 5-second report loop — NOT inside `update()`, which only runs on packet arrival and cannot detect silence
 - Detection order: L2 AVB/gPTP → IGMP → SAP → mDNS → Dante control → UDP PTP → SRT → RIST → RTP gate → AES67 → ST2110 → Dante audio; UDP PTP must precede the RTP gate
 - Protocol association via multicast IP (239.69.*=AES67, other 239.x.x.x=ST2110)
-- PTP and IGMP are always monitored regardless of user protocol selection
+- PTP, IGMP, and SAP are always processed regardless of user protocol selection; all other protocols are gated by `AvProtocol::is_selected()` in `protocols.rs`
 - BPF filter includes `tcp` for NDI (only protocol using TCP); `all_protocols_filter` also includes `tcp`
+- Protocol selection is pre-expanded once before the capture loop (`expanded_protocols: Vec<ProtocolChoice>`) and passed to `is_selected()` on each detected packet
+- SAP produces no console or log output — it silently enriches stream stats (clock_hz, ptime_ms, channels, sdp_name) and populates `sdp_cache` for the ts-refclk cross-check
+- ts-refclk cross-check: every 5s, for each active SDP session, `parse_ts_refclk()` (parser.rs) extracts the claimed PTP grandmaster EUI-64 and domain, then compares against `ptp_domains`; alerts on missing PTP traffic or grandmaster mismatch
+- `parse_ts_refclk(s)` handles `ptp=IEEE1588-2008:<eui64>:<domain>` (PTPv2) and `ptp=IEEE1588-2002:<uuid>:<domain>` (PTPv1); normalizes to lowercase colon-separated bytes matching `PtpStats::last_grandmaster`
+- Loopback (`lo`/`lo0`) is filtered from the interface list — macOS loopback uses DLT_NULL link-layer (4-byte BSD null header, no Ethernet frame), which is incompatible with the Ethernet-based packet parser; mDNS multicast also does not flow over loopback, so NDI discovery would never fire
 
 ## NDI Detection
 - NDI uses dynamically assigned TCP ports — port-range matching is unreliable
 - `ndi_sources: HashSet<Ipv4Addr>` in `main.rs` is populated from mDNS `_ndi._tcp` discovery packets
 - IP-based stream tracking: any TCP packet from/to a known NDI source IP is counted as NDI
+- NDI TCP detection block is gated on `ndi_selected` (computed from `expanded_protocols`) — skipped entirely if NDI not in selection
 - SRT and RIST match arms guard against both src AND dst being in `ndi_sources` — prevents NDI receiver→sender traffic from being misclassified (check both directions, not just src)
 - `detect_protocol` does NOT contain NDI TCP port-range detection — that path caused double-counting
+- NDI on loopback does not work: DLT_NULL parser incompatibility + no mDNS multicast on lo0
 
 ## False Positive Prevention
 - **Dante audio**: `is_likely_dante_audio` requires BOTH src AND dst ports in 5000–6000 (even); OR logic caused false positives when any app used a Dante-range source port with a high ephemeral destination

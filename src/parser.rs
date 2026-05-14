@@ -176,11 +176,13 @@ pub fn parse_sdp(sdp: &str) -> SdpSession {
                 }
             }
 
-            _ => {
-                // Ignore unrecognized field
-            }
+            _ => {}
         }
     }
+
+    // Push the last media section — the loop only pushes on the next 'm=' line,
+    // so the final block is still in cur_media when the loop ends.
+    if let Some(m) = cur_media { session.media.push(m); }
 
     session
 }
@@ -374,6 +376,37 @@ pub fn parse_rtp(payload: &[u8]) -> Option<(u16, u32, u32)> {
     Some((seq, ts, ssrc))
 }
 
+/// Parse a `ts-refclk` SDP attribute value into `(normalized_grandmaster_id, domain)`.
+///
+/// Handles:
+/// - `ptp=IEEE1588-2008:<eui64>:<domain>` — PTPv2, 8-byte EUI-64 (dashes or colons)
+/// - `ptp=IEEE1588-2002:<uuid>:<domain>`  — PTPv1, 6-byte MAC
+///
+/// Returns `None` for non-PTP types (`localmac=...`, etc.).
+/// The returned ID uses lowercase colon-separated bytes, matching `PtpStats::last_grandmaster`.
+pub fn parse_ts_refclk(s: &str) -> Option<(String, u8)> {
+    let rest = if let Some(r) = s.strip_prefix("ptp=IEEE1588-2008:") {
+        r
+    } else if let Some(r) = s.strip_prefix("ptp=IEEE1588-2002:") {
+        r
+    } else {
+        return None;
+    };
+
+    // The last colon-separated token is the domain number; everything before is the clock ID.
+    // EUI-64 example: "00-1d-c1-ff-fe-12-34-56:0"  or  "00:1d:c1:ff:fe:12:34:56:0"
+    // Split on the final ':' to separate ID from domain.
+    let last_colon = rest.rfind(':')?;
+    let id_part    = &rest[..last_colon];
+    let domain_str = &rest[last_colon + 1..];
+    let domain: u8 = domain_str.trim().parse().ok()?;
+
+    // Normalize: replace '-' with ':', lowercase
+    let normalized = id_part.replace('-', ":").to_lowercase();
+
+    Some((normalized, domain))
+}
+
 // ─── PTPv1 subdomain → domain number mapping ────────────────────────────────
 // IEEE 1588-2002 uses 16-byte ASCII subdomain names instead of a numeric domain.
 // The four well-known names map to 0–3; anything else maps to 0 (unknown = default).
@@ -523,8 +556,7 @@ pub fn parse_ptp(payload: &[u8]) -> Option<PtpInfo> {
         _ => format!("Unknown(0x{:X})", message_type),
     };
 
-    // PTPv2: version in low nibble of byte 1 (= 2); default to v2 for unknown.
-    let version_ptp = if payload[1] & 0x0F == PTP_VERSION_V2 { PTP_VERSION_V2 } else { PTP_VERSION_V2 };
+    let version_ptp = PTP_VERSION_V2;
     let domain = payload[4];
 
     let correction_field = i64::from_be_bytes([

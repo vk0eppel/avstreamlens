@@ -143,10 +143,11 @@ impl StreamStats {
             // Accumulate actual bytes (UDP payload) and calculate
             // throughput every second.
             self.bytes_total += udp_payload_len as u64;
-            if self.last_bitrate_check.elapsed() > Duration::from_secs(1) {
+            let elapsed = self.last_bitrate_check.elapsed();
+            if elapsed > Duration::from_secs(1) {
                 let bytes_delta = self.bytes_total.saturating_sub(self.bytes_at_check);
-                self.bitrate_bps = bytes_delta * 8; // bits/s in the last second
-                self.bytes_at_check  = self.bytes_total;
+                self.bitrate_bps = (bytes_delta as f64 * 8.0 / elapsed.as_secs_f64()) as u64;
+                self.bytes_at_check   = self.bytes_total;
                 self.packets_at_check = self.packets;
                 self.last_bitrate_check = now;
             }
@@ -219,9 +220,10 @@ impl TcpStreamStats {
     }
 
     pub fn update_bitrate(&mut self) {
-        if self.last_bitrate_check.elapsed() > Duration::from_secs(1) {
-            let bytes_delta = self.bytes - self.bytes_at_check;
-            self.bitrate_bps = bytes_delta * 8;
+        let elapsed = self.last_bitrate_check.elapsed();
+        if elapsed > Duration::from_secs(1) {
+            let bytes_delta = self.bytes.saturating_sub(self.bytes_at_check);
+            self.bitrate_bps = (bytes_delta as f64 * 8.0 / elapsed.as_secs_f64()) as u64;
             self.bytes_at_check = self.bytes;
             self.last_bitrate_check = Instant::now();
         }
@@ -247,7 +249,6 @@ impl TcpStreamStats {
 #[derive(Debug, Clone)]
 pub struct NetworkHealth {
     pub total_packets: u64,
-    pub total_bytes: u64,
     pub multicast_packets: u64,
     pub unicast_packets: u64,
     pub packet_loss_streams: u64,
@@ -255,7 +256,6 @@ pub struct NetworkHealth {
     pub aes67_discontinuities: u64,
     pub timestamp_errors: u64,
     pub tcp_retransmissions: u64,
-    pub detected_duplicates: u64,
     pub congestion_events: u64,
     pub saturation_warnings: u64,
     pub network_score: f64,
@@ -270,10 +270,15 @@ pub struct NetworkHealth {
 }
 
 impl NetworkHealth {
+    pub fn track_dscp(&mut self, ip: &pnet_packet::ipv4::Ipv4Packet) {
+        self.dscp_total += 1;
+        if ip.get_dscp() != 46 { self.dscp_violations += 1; }
+        if ip.get_ecn() == 3   { self.ecn_congestion_marks += 1; }
+    }
+
     pub fn new() -> Self {
         Self {
             total_packets: 0,
-            total_bytes: 0,
             multicast_packets: 0,
             unicast_packets: 0,
             packet_loss_streams: 0,
@@ -281,7 +286,6 @@ impl NetworkHealth {
             aes67_discontinuities: 0,
             timestamp_errors: 0,
             tcp_retransmissions: 0,
-            detected_duplicates: 0,
             congestion_events: 0,
             saturation_warnings: 0,
             network_score: 100.0,
@@ -300,8 +304,12 @@ impl NetworkHealth {
         self.packet_loss_streams = 0;
         self.high_jitter_streams = 0;
         self.aes67_discontinuities = 0;
+        let mut has_active_multicast = false;
 
         for stats in streams.values() {
+            if stats.is_multicast && stats.packets > 0 {
+                has_active_multicast = true;
+            }
             if stats.loss_pct() > 0.0 {
                 self.packet_loss_streams += 1;
                 score -= stats.loss_pct().min(10.0);
@@ -333,7 +341,6 @@ impl NetworkHealth {
         score -= (self.tcp_retransmissions as f64 * 0.5).min(10.0);
 
         // ── QoS / DSCP ───────────────────────────────────────────────────────
-        // AES67 and ST2110 require DSCP EF (46). Deduct proportionally to violation rate.
         if self.dscp_total > 0 {
             let violation_pct = self.dscp_violations as f64 / self.dscp_total as f64;
             if violation_pct > 0.5 {
@@ -348,13 +355,11 @@ impl NetworkHealth {
         // ── Congestion (ECN Congestion Experienced marks) ─────────────────────
         // ECN=CE is set by routers when they are experiencing congestion mid-path.
         score -= (self.ecn_congestion_marks as f64 * 2.0).min(20.0);
-        score -= (self.detected_duplicates as f64).min(10.0);
 
         // ── IGMP / Snooping ───────────────────────────────────────────────────
         // Multicast snooping requires a live IGMP Querier. If multicast streams are
         // active but no Query has been seen in >130 s (slightly above RFC 3376 default
         // 125 s query interval), managed switches may start flooding multicast.
-        let has_active_multicast = streams.values().any(|s| s.is_multicast && s.packets > 0);
         if has_active_multicast {
             match self.last_igmp_query {
                 None => score -= 10.0,

@@ -60,68 +60,56 @@ pub fn print_report(
     requires_valid_ptp: bool,
     logger: &mut Logger,
     health: &NetworkHealth,
+    bytes_this_window: u64,
 ) {
     let now = Local::now();
     let timestamp = now.format("%Y-%m-%d %H:%M:%S").to_string();
-    let stream_count = streams.len();
-    let tcp_count = tcp_streams.len();
     let score = format!("{:.0}%", health.network_score);
     
-    let header_line = format!("{} | AVStreamLens report", timestamp);
-    let details = format!("  ({} RTP, {} TCP streams) | Health: {}", stream_count, tcp_count, score);
-    
-    let full_header = format!("{}\n{}", header_line, details);
-    
-    logger.log(&full_header);
-    
-    println!("\n\x1b[36m╔══════════════════════════════════════════════════════╗\x1b[0m");
+    let header_line = format!("{} | AVStreamLens report  |  Health: {}", timestamp, score);
+
+    logger.log(&header_line);
+
+    println!("\n\x1b[36m╔═════════════════════════════════════════════════════════════════╗\x1b[0m");
     println!("\x1b[36m║  {}\x1b[0m", header_line);
-    println!("\x1b[36m║    {}\x1b[0m", details);
-    println!("\x1b[36m╚══════════════════════════════════════════════════════╝\x1b[0m");
+    println!("\x1b[36m╚═════════════════════════════════════════════════════════════════╝\x1b[0m");
+
+    let mbps = bytes_this_window as f64 * 8.0 / 5_000_000.0;
+
+    let protocol_groups: &[(&str, fn(&str) -> bool)] = &[
+        ("AES67",  |p| p == "AES67"),
+        ("ST2110", |p| p.starts_with("2110-")),
+        ("Dante",  |p| p == "Dante"),
+        ("NDI",    |p| p == "NDI"),
+        ("AVB",    |p| p == "AVB"),
+        ("SRT",    |p| p == "SRT"),
+        ("RIST",   |p| p == "RIST"),
+    ];
+
+    let mut proto_parts: Vec<String> = protocol_groups.iter()
+        .filter_map(|(label, matches)| {
+            let n = streams.values().filter(|s| matches(&s.protocol)).count();
+            if n > 0 { Some(format!("{}: {}", label, n)) } else { None }
+        })
+        .collect();
+
+    let tcp_count = tcp_streams.len();
+    if tcp_count > 0 {
+        proto_parts.push(format!("TCP: {}", tcp_count));
+    }
+
+    let streams_str = if proto_parts.is_empty() {
+        "no streams".to_string()
+    } else {
+        proto_parts.join("  |  ")
+    };
 
     let net_summary = format!(
-        "\n📊 Network Load: {:.1} Mbps  |  Multicast: {} pkts  |  Unicast: {} pkts  |  Duplicates: {}",
-        (health.total_bytes * 8) as f64 / 1_000_000.0,
-        health.multicast_packets,
-        health.unicast_packets,
-        health.detected_duplicates
+        "\n📊 Bandwidth: {:.1} Mbps (last 5s)  |  {}",
+        mbps, streams_str
     );
     logger.log(&net_summary);
     println!("{}", net_summary);
-
-    // ── Health breakdown ────────────────────────────────────────────────────
-    let qos_str = if health.dscp_total == 0 {
-        "QoS: – (no AV streams)".to_string()
-    } else {
-        let pct = health.dscp_violations * 100 / health.dscp_total;
-        if health.dscp_violations == 0 {
-            format!("QoS: ✓ DSCP EF ({} pkts)", health.dscp_total)
-        } else {
-            format!("QoS: ⚠ {}% untagged ({}/{})", pct, health.dscp_violations, health.dscp_total)
-        }
-    };
-
-    let igmp_str = if health.ecn_congestion_marks == 0 {
-        "Congestion: ✓ none".to_string()
-    } else {
-        format!("Congestion: ⚠ {} ECN marks", health.ecn_congestion_marks)
-    };
-
-    let querier_str = match health.last_igmp_query {
-        None => "IGMP: – (no query seen)".to_string(),
-        Some(t) => {
-            let secs = t.elapsed().as_secs();
-            if secs > 130 {
-                format!("IGMP: ⚠ querier silent {}s", secs)
-            } else {
-                format!("IGMP: ✓ querier {}s ago", secs)
-            }
-        }
-    };
-
-    let breakdown = format!("   {}  |  {}  |  {}", qos_str, igmp_str, querier_str);
-    logger.log(&breakdown);
-    println!("{}", breakdown);
 
     // ── RTP Streams Report ──────────────────────────────────────────────────
     let group_order = vec!["AES67", "AVB", "Dante", "NDI", "ST"];
@@ -280,7 +268,7 @@ pub fn print_report(
         println!("\n\x1b[35m📡 PTP Domains:\x1b[0m");
 
         for ((domain, _version), stats) in ptp_domains.iter() {
-            let gm_icon = if stats.clock_valid { "✓" } else if stats.last_grandmaster.is_some() { "✓" } else { "❌" };
+            let gm_icon = if stats.clock_valid { "✓" } else if stats.last_grandmaster.is_some() { "⚠" } else { "❌" };
 
             let version_str = format!(" v{}", stats.version);
             let protocol_str = if let Some(ref pk) = stats.protocol_kind {
@@ -290,8 +278,8 @@ pub fn print_report(
             };
 
             let domain_line = format!(
-                "  {}: Domain {}{}{}",
-                gm_icon, domain, version_str, protocol_str
+                "  {}: Domain {} PTP{}",
+                gm_icon, domain, version_str
             );
             logger.log(&domain_line);
             println!("{}", domain_line);
@@ -339,6 +327,39 @@ pub fn print_report(
             println!("\x1b[31m{}\x1b[0m", alert);
         }
     }
+
+    // ── Health breakdown ────────────────────────────────────────────────────
+    let qos_str = if health.dscp_total == 0 {
+        "QoS: – (no AV streams)".to_string()
+    } else if health.dscp_violations == 0 {
+        format!("QoS: ✓ DSCP EF ({} pkts)", health.dscp_total)
+    } else {
+        let pct = health.dscp_violations * 100 / health.dscp_total;
+        let pct_str = if pct == 0 { "<1".to_string() } else { pct.to_string() };
+        format!("QoS: ⚠ {}% untagged ({}/{})", pct_str, health.dscp_violations, health.dscp_total)
+    };
+
+    let congestion_str = if health.ecn_congestion_marks == 0 {
+        "Congestion: ✓ none".to_string()
+    } else {
+        format!("Congestion: ⚠ {} ECN marks", health.ecn_congestion_marks)
+    };
+
+    let querier_str = match health.last_igmp_query {
+        None => "IGMP: – (no query seen)".to_string(),
+        Some(t) => {
+            let secs = t.elapsed().as_secs();
+            if secs > 130 {
+                format!("IGMP: ⚠ querier silent {}s", secs)
+            } else {
+                format!("IGMP: ✓ querier {}s ago", secs)
+            }
+        }
+    };
+
+    let breakdown = format!("\n   {}  |  {}  |  {}", qos_str, congestion_str, querier_str);
+    logger.log(&breakdown);
+    println!("{}", breakdown);
 
     logger.log("");
 }

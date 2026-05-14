@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 // Import types from modules
 use crate::protocols::{AvProtocol, SdpSession, DanteKind, NdiKind, St2110Type, IgmpType};
 use crate::stats::{StreamStats, TcpStreamStats, NetworkHealth, PtpStats};
-use crate::parser::{detect_protocol, parse_tcp_packet, parse_rtp, is_multicast, is_aes67_multicast, is_st2110_multicast};
+use crate::parser::{detect_protocol, parse_tcp_packet, parse_rtp, parse_ts_refclk, is_multicast, is_aes67_multicast, is_st2110_multicast};
 use crate::report::{create_logger, print_report};
 
 // Constants from protocols module
@@ -41,12 +41,15 @@ fn main() {
     let selected_protocols = cli::prompt_protocol_selection();
     let protocol_names = cli::selected_protocol_names(&selected_protocols);
     let bpf_filter = cli::build_bpf_filter(&selected_protocols);
+    let expanded_protocols: Vec<protocols::ProtocolChoice> = selected_protocols.iter()
+        .flat_map(|c| c.includes())
+        .collect();
     let mut logger = create_logger(&protocol_names).expect("Unable to create log file");
 
     println!("Selected protocols: {}", protocol_names);
     logger.log(&format!("Selected protocols: {}", protocol_names));
-    println!("\n📡 Listening on {}  (BPF filter: \"{}\")\n", device.name, bpf_filter);
-    logger.log(&format!("\n📡 Listening on {}  (BPF filter: \"{}\")\n", device.name, bpf_filter));
+    println!("📡 Listening on {}", device.name);
+    logger.log(&format!("📡 Listening on {}", device.name));
 
     // ── Opening capture with BPF filter ───────────────
     let mut cap = Capture::from_device(device.name.as_str())
@@ -67,266 +70,257 @@ fn main() {
     // PTP stats keyed by (domain, version) to separate Dante PTPv1 from AES67/ST2110 PTPv2
     let mut ptp_domains:   HashMap<(u8, u8), PtpStats> = HashMap::new();
     let mut network_health: NetworkHealth = NetworkHealth::new();
-    let mut multicast_seen: HashMap<(Ipv4Addr, u16), u64> = HashMap::new();
     // NDI sender IPs learned from mDNS — used for IP-based stream detection
     // (official NDI SDK assigns ports dynamically, port-range matching is unreliable)
     let mut ndi_sources: std::collections::HashSet<Ipv4Addr> = std::collections::HashSet::new();
+    let mut bytes_this_window: u64 = 0;
     let mut last_report = Instant::now();
 
     // ── Capture loop ────────────────────────────────
     loop {
         let packet = match cap.next_packet() { Ok(p) => p, Err(_) => continue };
         let eth    = match EthernetPacket::new(packet.data) { Some(e) => e, _ => continue };
+        let now    = Instant::now();
 
-        match detect_protocol(&eth) {
+        if let Some(proto) = detect_protocol(&eth) {
+            let should_process = match &proto {
+                AvProtocol::Ptp { .. } | AvProtocol::Igmp { .. } | AvProtocol::Sap { .. } => true,
+                _ => proto.is_selected(&expanded_protocols),
+            };
+            if should_process {
+                match proto {
 
-            // ── SAP/SDP ──────────────────────────────────
-            Some(AvProtocol::Sap { src, sdp }) => {
-                println!("📋 SAP received from {}  session=\"{}\"  ({} media(s))",
-                    src, sdp.session_name, sdp.media.len());
-                logger.log(&format!("📋 SAP received from {}  session=\"{}\"  ({} media(s))",
-                    src, sdp.session_name, sdp.media.len()));
-
-                for m in &sdp.media {
-                    logger.log(&format!("   {} port {}  {}  {:.0} Hz  {}ch  ptime {:.2} ms",
-                        m.media_type, m.port, m.rtpmap,
-                        m.clock_hz, m.channels, m.ptime_ms));
-                    if !m.ts_refclk.is_empty() {
-                        logger.log(&format!("   PTP refclk: {}", m.ts_refclk));
+                    // ── SAP/SDP ──────────────────────────────────
+                    AvProtocol::Sap { src: _, sdp } => {
+                        for m in &sdp.media {
+                            // Enrich stream SDP metadata by port (break on first match)
+                            for stats in streams.values_mut() {
+                                if stats.dst_port == m.port && stats.sdp_name.is_none() {
+                                    stats.sdp_name   = Some(sdp.session_name.clone());
+                                    stats.sdp_rtpmap = Some(m.rtpmap.clone());
+                                    if m.clock_hz > 0.0 { stats.clock_hz = m.clock_hz; }
+                                    if m.ptime_ms > 0.0 { stats.ptime_ms = m.ptime_ms; }
+                                    if m.channels > 0   { stats.channels = m.channels; }
+                                    break;
+                                }
+                            }
+                        }
+                        sdp_cache.insert(sdp.session_id.clone(), sdp);
                     }
-                    if !m.mediaclk.is_empty() {
-                        logger.log(&format!("   mediaclk: {}", m.mediaclk));
+
+                    // ── PTP ───────────────────────────────────────
+                    AvProtocol::Ptp { info } => {
+                        let stats = ptp_domains
+                            .entry((info.domain, info.version))
+                            .or_insert_with(|| PtpStats::new(info.domain, info.version));
+                        stats.update(&info, &info.protocol_kind);
                     }
-                    // Enrich stream SDP metadata by port (break on first match)
-                    for stats in streams.values_mut() {
-                        if stats.dst_port == m.port && stats.sdp_name.is_none() {
-                            stats.sdp_name   = Some(sdp.session_name.clone());
-                            stats.sdp_rtpmap = Some(m.rtpmap.clone());
-                            if m.clock_hz > 0.0 { stats.clock_hz = m.clock_hz; }
-                            if m.ptime_ms > 0.0 { stats.ptime_ms = m.ptime_ms; }
-                            if m.channels > 0   { stats.channels = m.channels; }
-                            break; // O(1) after first match
+
+                    // ── AES67 ────────────────────────────────────
+                    AvProtocol::Aes67 { dst, dst_port, .. } => {
+                        let key = format!("AES67 {}:{}", dst, dst_port);
+                        let stats = streams.entry(key).or_insert_with(|| {
+                            let (clock, rtpmap) = sdp_cache.values()
+                                .flat_map(|s| s.media.iter())
+                                .find(|m| m.port == dst_port)
+                                .map(|m| (m.clock_hz, Some(m.rtpmap.clone())))
+                                .unwrap_or((DEFAULT_CLOCK_HZ, None));
+                            let mut s = StreamStats::new_with_info("AES67", clock, is_aes67_multicast(dst), dst, dst_port);
+                            s.sdp_rtpmap = rtpmap;
+                            s.media_type = "audio".to_string();
+                            s.channels = 1;
+                            s
+                        });
+                        if let Some(ip) = pnet_packet::ipv4::Ipv4Packet::new(eth.payload()) {
+                            if let Some(udp) = pnet_packet::udp::UdpPacket::new(ip.payload()) {
+                                network_health.track_dscp(&ip);
+                                if let Some((seq, ts, ssrc)) = parse_rtp(udp.payload()) {
+                                    stats.update(seq, ts, ssrc, udp.payload().len());
+                                }
+                            }
                         }
                     }
-                }
-                sdp_cache.insert(sdp.session_id.clone(), sdp);
-            }
 
-            // ── PTP ───────────────────────────────────────
-            Some(AvProtocol::Ptp { info }) => {
-                let stats = ptp_domains
-                    .entry((info.domain, info.version))
-                    .or_insert_with(|| PtpStats::new(info.domain, info.version));
-                stats.update(&info, &info.protocol_kind);
-            }
-
-            // ── AES67 ────────────────────────────────────
-            Some(AvProtocol::Aes67 { dst, dst_port, .. }) => {
-                let key = format!("AES67 {}:{}", dst, dst_port);
-                let stats = streams.entry(key).or_insert_with(|| {
-                    let (clock, rtpmap) = sdp_cache.values()
-                        .flat_map(|s| s.media.iter())
-                        .find(|m| m.port == dst_port)
-                        .map(|m| (m.clock_hz, Some(m.rtpmap.clone())))
-                        .unwrap_or((DEFAULT_CLOCK_HZ, None));
-                    let mut s = StreamStats::new_with_info("AES67", clock, is_aes67_multicast(dst), dst, dst_port);
-                    s.sdp_rtpmap = rtpmap;
-                    s.media_type = "audio".to_string();
-                    s.channels = 1;
-                    s
-                });
-                let ip  = pnet_packet::ipv4::Ipv4Packet::new(eth.payload()).unwrap();
-                let udp = pnet_packet::udp::UdpPacket::new(ip.payload()).unwrap();
-                network_health.dscp_total += 1;
-                if ip.get_dscp() != 46 { network_health.dscp_violations += 1; }
-                if ip.get_ecn() == 3   { network_health.ecn_congestion_marks += 1; }
-                if let Some((seq, ts, ssrc)) = parse_rtp(udp.payload()) {
-                    stats.update(seq, ts, ssrc, udp.payload().len());
-                }
-            }
-
-            // ── ST 2110 ──────────────────────────────────
-            Some(AvProtocol::St2110 { dst, dst_port, stream_type, .. }) => {
-                let label = match stream_type {
-                    St2110Type::Video   => "2110-20",
-                    St2110Type::Audio   => "2110-30",
-                    St2110Type::Ancdata => "2110-40",
-                    St2110Type::Unknown => "2110-??",
-                };
-                let key = format!("ST {} {}:{}", label, dst, dst_port);
-                let default_clock = if matches!(stream_type, St2110Type::Video) { 90_000.0 } else { DEFAULT_CLOCK_HZ };
-                let stats = streams.entry(key).or_insert_with(|| {
-                    let (clock, rtpmap) = sdp_cache.values()
-                        .flat_map(|s| s.media.iter())
-                        .find(|m| m.port == dst_port)
-                        .map(|m| (m.clock_hz, Some(m.rtpmap.clone())))
-                        .unwrap_or((default_clock, None));
-                    let mut s = StreamStats::new_with_info(label, clock, is_st2110_multicast(dst), dst, dst_port);
-                    s.sdp_rtpmap = rtpmap;
-                    s.media_type = match stream_type {
-                        St2110Type::Video => "video".to_string(),
-                        St2110Type::Audio => "audio".to_string(),
-                        St2110Type::Ancdata => "ancillary".to_string(),
-                        St2110Type::Unknown => "unknown".to_string(),
-                    };
-                    s
-                });
-                let ip  = pnet_packet::ipv4::Ipv4Packet::new(eth.payload()).unwrap();
-                let udp = pnet_packet::udp::UdpPacket::new(ip.payload()).unwrap();
-                network_health.dscp_total += 1;
-                if ip.get_dscp() != 46 { network_health.dscp_violations += 1; }
-                if ip.get_ecn() == 3   { network_health.ecn_congestion_marks += 1; }
-                if let Some((seq, ts, ssrc)) = parse_rtp(udp.payload()) {
-                    stats.update(seq, ts, ssrc, udp.payload().len());
-                }
-            }
-
-            // ── Dante ────────────────────────────────────
-            Some(AvProtocol::Dante { kind, src, dst_port }) => {
-                match kind {
-                    DanteKind::Discovery => {
-                        let msg = format!("🔍 Dante discovered: {}", src);
-                        println!("{}", msg);
-                        logger.log(&msg);
-                    }
-                    DanteKind::Control     => {}
-                    DanteKind::AudioStream => {
-                        let key   = format!("Dante {}:{}", src, dst_port);
-                        let stats = streams.entry(key)
-                            .or_insert_with(|| StreamStats::new("Dante", DEFAULT_CLOCK_HZ));
-                        let ip  = pnet_packet::ipv4::Ipv4Packet::new(eth.payload()).unwrap();
-                        let udp = pnet_packet::udp::UdpPacket::new(ip.payload()).unwrap();
-                        if let Some((seq, ts, ssrc)) = parse_rtp(udp.payload()) { 
-                            stats.update(seq, ts, ssrc, udp.payload().len()); 
+                    // ── ST 2110 ──────────────────────────────────
+                    AvProtocol::St2110 { dst, dst_port, stream_type, .. } => {
+                        let label = match stream_type {
+                            St2110Type::Video   => "2110-20",
+                            St2110Type::Audio   => "2110-30",
+                            St2110Type::Ancdata => "2110-40",
+                            St2110Type::Unknown => "2110-??",
+                        };
+                        let key = format!("ST {} {}:{}", label, dst, dst_port);
+                        let default_clock = if matches!(stream_type, St2110Type::Video) { 90_000.0 } else { DEFAULT_CLOCK_HZ };
+                        let stats = streams.entry(key).or_insert_with(|| {
+                            let (clock, rtpmap) = sdp_cache.values()
+                                .flat_map(|s| s.media.iter())
+                                .find(|m| m.port == dst_port)
+                                .map(|m| (m.clock_hz, Some(m.rtpmap.clone())))
+                                .unwrap_or((default_clock, None));
+                            let mut s = StreamStats::new_with_info(label, clock, is_st2110_multicast(dst), dst, dst_port);
+                            s.sdp_rtpmap = rtpmap;
+                            s.media_type = match stream_type {
+                                St2110Type::Video => "video".to_string(),
+                                St2110Type::Audio => "audio".to_string(),
+                                St2110Type::Ancdata => "ancillary".to_string(),
+                                St2110Type::Unknown => "unknown".to_string(),
+                            };
+                            s
+                        });
+                        if let Some(ip) = pnet_packet::ipv4::Ipv4Packet::new(eth.payload()) {
+                            if let Some(udp) = pnet_packet::udp::UdpPacket::new(ip.payload()) {
+                                network_health.track_dscp(&ip);
+                                if let Some((seq, ts, ssrc)) = parse_rtp(udp.payload()) {
+                                    stats.update(seq, ts, ssrc, udp.payload().len());
+                                }
+                            }
                         }
                     }
-                }
-            }
 
-            // ── NDI ──────────────────────────────────────
-            Some(AvProtocol::Ndi { kind, src }) => {
-                match kind {
-                    NdiKind::Discovery => {
-                        ndi_sources.insert(src);
-                        let msg = format!("🔍 NDI source: {}", src);
-                        println!("{}", msg);
-                        logger.log(&msg);
-                    },
-                    NdiKind::Stream    => {
-                        let stats = streams.entry(format!("NDI {}", src))
-                            .or_insert_with(|| StreamStats::new("NDI", 0.0));
+                    // ── Dante ────────────────────────────────────
+                    AvProtocol::Dante { kind, src, dst_port } => {
+                        match kind {
+                            DanteKind::Discovery => {
+                                let msg = format!("🔍 Dante discovered: {}", src);
+                                println!("{}", msg);
+                                logger.log(&msg);
+                            }
+                            DanteKind::Control     => {}
+                            DanteKind::AudioStream => {
+                                let key   = format!("Dante {}:{}", src, dst_port);
+                                let stats = streams.entry(key)
+                                    .or_insert_with(|| StreamStats::new("Dante", DEFAULT_CLOCK_HZ));
+                                if let Some(ip) = pnet_packet::ipv4::Ipv4Packet::new(eth.payload()) {
+                                    if let Some(udp) = pnet_packet::udp::UdpPacket::new(ip.payload()) {
+                                        if let Some((seq, ts, ssrc)) = parse_rtp(udp.payload()) {
+                                            stats.update(seq, ts, ssrc, udp.payload().len());
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // ── NDI ──────────────────────────────────────
+                    AvProtocol::Ndi { kind, src } => {
+                        match kind {
+                            NdiKind::Discovery => {
+                                ndi_sources.insert(src);
+                                let msg = format!("🔍 NDI source: {}", src);
+                                println!("{}", msg);
+                                logger.log(&msg);
+                            }
+                            _ => {}
+                        }
+                    }
+
+                    // ── AVB ──────────────────────────────────────
+                    AvProtocol::Avb { subtype } => {
+                        let stats = streams.entry(format!("AVB subtype=0x{:02X}", subtype))
+                            .or_insert_with(|| StreamStats::new("AVB", 0.0));
                         stats.packets += 1;
-                        stats.last_packet_time = Some(Instant::now());
                     }
-                }
-            }
 
-            // ── AVB ──────────────────────────────────────
-            Some(AvProtocol::Avb { subtype }) => {
-                let stats = streams.entry(format!("AVB subtype=0x{:02X}", subtype))
-                    .or_insert_with(|| StreamStats::new("AVB", 0.0));
-                stats.packets += 1;
-            }
-
-            // ── SRT ──────────────────────────────────────
-            Some(AvProtocol::Srt { src, dst, dst_port, is_handshake })
-                if !ndi_sources.contains(&src) && !ndi_sources.contains(&dst) => {
-                let key = format!("SRT {}:{}", src, dst_port);
-                let stats = streams.entry(key)
-                    .or_insert_with(|| StreamStats::new("SRT", 0.0));
-                stats.packets += 1;
-                stats.last_packet_time = Some(Instant::now());
-                if is_handshake {
-                    let msg = format!("🤝 SRT handshake: {} → port {}", src, dst_port);
-                    println!("{}", msg);
-                    logger.log(&msg);
-                }
-            }
-
-            // ── RIST ─────────────────────────────────────
-            Some(AvProtocol::Rist { src, dst, dst_port })
-                if !ndi_sources.contains(&src) && !ndi_sources.contains(&dst) => {
-                let key = format!("RIST {}:{}", dst, dst_port);
-                let stats = streams.entry(key)
-                    .or_insert_with(|| {
-                        let mut s = StreamStats::new_with_info("RIST", DEFAULT_CLOCK_HZ, is_multicast(dst), dst, dst_port);
-                        s.media_type = "video".to_string();
-                        s
-                    });
-                let ip  = pnet_packet::ipv4::Ipv4Packet::new(eth.payload()).unwrap();
-                let udp = pnet_packet::udp::UdpPacket::new(ip.payload()).unwrap();
-                if let Some((seq, ts, ssrc)) = parse_rtp(udp.payload()) {
-                    stats.update(seq, ts, ssrc, udp.payload().len());
-                }
-                let _ = src;
-            }
-
-            // ── IGMP ─────────────────────────────────────
-            Some(AvProtocol::Igmp { src, group, igmp_type }) => {
-                let (icon, label) = match &igmp_type {
-                    IgmpType::Join       => ("➕", "Join"),
-                    IgmpType::Leave      => ("➖", "Leave"),
-                    IgmpType::Query      => ("❓", "Query"),
-                    IgmpType::Unknown(_) => ("❔", "Unknown")
-                };
-                let msg = format!("{} IGMP {}: {} → group {}", icon, label, src, group);
-                println!("{}", msg);
-                logger.log(&msg);
-                if matches!(igmp_type, IgmpType::Query) {
-                    network_health.last_igmp_query = Some(Instant::now());
-                }
-                if matches!(igmp_type, IgmpType::Leave) {
-                    for key in streams.keys() {
-                        if streams[key].dst_ip == Some(group) {
-                            let alert = format!("    ⚠  IGMP Leave on monitored group {}", group);
-                            println!("\x1b[33m{}\x1b[0m", alert);
-                            logger.log(&alert);
+                    // ── SRT ──────────────────────────────────────
+                    AvProtocol::Srt { src, dst, dst_port, is_handshake }
+                        if !ndi_sources.contains(&src) && !ndi_sources.contains(&dst) => {
+                        let key = format!("SRT {}:{}", src, dst_port);
+                        let stats = streams.entry(key)
+                            .or_insert_with(|| StreamStats::new("SRT", 0.0));
+                        stats.packets += 1;
+                        stats.last_packet_time = Some(now);
+                        if is_handshake {
+                            let msg = format!("🤝 SRT handshake: {} → port {}", src, dst_port);
+                            println!("{}", msg);
+                            logger.log(&msg);
                         }
                     }
+
+                    // ── RIST ─────────────────────────────────────
+                    AvProtocol::Rist { src, dst, dst_port }
+                        if !ndi_sources.contains(&src) && !ndi_sources.contains(&dst) => {
+                        let key = format!("RIST {}:{}", dst, dst_port);
+                        let stats = streams.entry(key)
+                            .or_insert_with(|| {
+                                let mut s = StreamStats::new_with_info("RIST", DEFAULT_CLOCK_HZ, is_multicast(dst), dst, dst_port);
+                                s.media_type = "video".to_string();
+                                s
+                            });
+                        if let Some(ip) = pnet_packet::ipv4::Ipv4Packet::new(eth.payload()) {
+                            if let Some(udp) = pnet_packet::udp::UdpPacket::new(ip.payload()) {
+                                if let Some((seq, ts, ssrc)) = parse_rtp(udp.payload()) {
+                                    stats.update(seq, ts, ssrc, udp.payload().len());
+                                }
+                            }
+                        }
+                        let _ = src;
+                    }
+
+                    // ── IGMP ─────────────────────────────────────
+                    AvProtocol::Igmp { src, group, igmp_type } => {
+                        let (icon, label) = match &igmp_type {
+                            IgmpType::Join       => ("➕", "Join"),
+                            IgmpType::Leave      => ("➖", "Leave"),
+                            IgmpType::Query      => ("❓", "Query"),
+                            IgmpType::Unknown(_) => ("❔", "Unknown")
+                        };
+                        let msg = format!("{} IGMP {}: {} → group {}", icon, label, src, group);
+                        println!("{}", msg);
+                        logger.log(&msg);
+                        if matches!(igmp_type, IgmpType::Query) {
+                            network_health.last_igmp_query = Some(now);
+                        }
+                        if matches!(igmp_type, IgmpType::Leave) {
+                            for key in streams.keys() {
+                                if streams[key].dst_ip == Some(group) {
+                                    let alert = format!("    ⚠  IGMP Leave on monitored group {}", group);
+                                    println!("\x1b[33m{}\x1b[0m", alert);
+                                    logger.log(&alert);
+                                }
+                            }
+                        }
+                    }
+
+                    _ => {}
                 }
             }
-
-            _ => {}
         }
+
+        // ── Hoist IPv4 parse — shared by NDI detection and health tracking ───
+        let outer_ip = pnet_packet::ipv4::Ipv4Packet::new(eth.payload());
 
         // ── NDI stream via known source IP ───────────────────────────────────
         // The official NDI SDK uses dynamically assigned ports advertised in mDNS.
         // Port-range matching is unreliable; we identify NDI traffic by the sender
         // IP learned from mDNS discovery instead.
-        if !ndi_sources.is_empty() {
-            if let Some(ip) = pnet_packet::ipv4::Ipv4Packet::new(eth.payload()) {
-                if ip.get_next_level_protocol() == pnet_packet::ip::IpNextHeaderProtocols::Tcp {
-                    let s = ip.get_source();
-                    let d = ip.get_destination();
-                    let sender = if ndi_sources.contains(&s) { Some(s) }
-                                else if ndi_sources.contains(&d) { Some(d) }
-                                else { None };
-                    if let Some(sender_ip) = sender {
-                        let stats = streams.entry(format!("NDI {}", sender_ip))
-                            .or_insert_with(|| StreamStats::new("NDI", 0.0));
-                        stats.packets += 1;
-                        stats.last_packet_time = Some(Instant::now());
-                    }
+        let ndi_selected = expanded_protocols.iter().any(|c| matches!(c, protocols::ProtocolChoice::NDI | protocols::ProtocolChoice::All));
+        if ndi_selected {
+        if let Some(ref ip) = outer_ip {
+            if !ndi_sources.is_empty()
+                && ip.get_next_level_protocol() == pnet_packet::ip::IpNextHeaderProtocols::Tcp
+            {
+                let s = ip.get_source();
+                let d = ip.get_destination();
+                let sender = if ndi_sources.contains(&s) { Some(s) }
+                            else if ndi_sources.contains(&d) { Some(d) }
+                            else { None };
+                if let Some(sender_ip) = sender {
+                    let stats = streams.entry(format!("NDI {}", sender_ip))
+                        .or_insert_with(|| StreamStats::new("NDI", 0.0));
+                    stats.packets += 1;
+                    stats.last_packet_time = Some(now);
                 }
             }
         }
-
-        // ── Dead stream detection ─────────────────────────────
-        if last_report.elapsed() > Duration::from_secs(STREAM_TIMEOUT_SECS) {
-            for (key, stats) in &streams {
-                if let Some(last_time) = stats.last_packet_time {
-                    if last_time.elapsed() > Duration::from_secs(STREAM_TIMEOUT_SECS) {
-                        let alert = format!("💀 Stream silent (> {}s): {}", STREAM_TIMEOUT_SECS, key);
-                        println!("\x1b[31m{}\x1b[0m", alert);
-                        logger.log(&alert);
-                    }
-                }
-            }
-        }
+        } // ndi_selected
 
         // ── TCP Monitoring — NDI ports only ──────────────────
         // Only track TCP flows on NDI ports (5960-5980). Unrelated TCP (HTTP, SSH, etc.)
         // is ignored even when `tcp` is in the BPF filter, keeping the report clean.
+        let is_tcp = outer_ip.as_ref().map_or(false, |ip| {
+            ip.get_next_level_protocol() == pnet_packet::ip::IpNextHeaderProtocols::Tcp
+        });
+        if is_tcp {
         if let Some((src_ip, dst_ip, src_port, dst_port, has_fin, has_syn, has_rst, seq, ack)) = parse_tcp_packet(&eth) {
             let ndi_range = protocols::NDI_PORT_MIN..=protocols::NDI_PORT_MAX;
             let is_ndi = ndi_range.contains(&src_port) || ndi_range.contains(&dst_port)
@@ -335,7 +329,7 @@ fn main() {
                 let key = format!("TCP {}:{} → {}:{}", src_ip, src_port, dst_ip, dst_port);
                 let tcp_stat = tcp_streams.entry(key.clone()).or_insert_with(|| TcpStreamStats::new(src_ip, src_port, dst_ip, dst_port));
                 tcp_stat.packets += 1;
-                tcp_stat.last_seen = Instant::now();
+                tcp_stat.last_seen = now;
 
                 let frame_size = eth.packet().len() as u64;
                 let estimated_payload = if frame_size > 40 { frame_size - 40 } else { 0 };
@@ -361,22 +355,15 @@ fn main() {
                 tcp_stat.update_bitrate();
                 tcp_stat.update_quality();
             }
+        } // end is_tcp guard
         }
 
         // ── Network health tracking ───────────────────────────
         network_health.total_packets += 1;
-        if let Some(ip) = pnet_packet::ipv4::Ipv4Packet::new(eth.payload()) {
-            network_health.total_bytes += eth.packet().len() as u64;
+        bytes_this_window += eth.packet().len() as u64;
+        if let Some(ref ip) = outer_ip {
             if is_multicast(ip.get_destination()) {
                 network_health.multicast_packets += 1;
-                if let Some(udp) = pnet_packet::udp::UdpPacket::new(ip.payload()) {
-                    let multicast_key = (ip.get_destination(), udp.get_destination());
-                    let count = multicast_seen.entry(multicast_key).or_insert(0);
-                    *count += 1;
-                    if *count > 1 {
-                        network_health.detected_duplicates += 1;
-                    }
-                }
             } else {
                 network_health.unicast_packets += 1;
             }
@@ -397,9 +384,53 @@ fn main() {
                     ));
                 }
             }
+            // ── ts-refclk vs active grandmaster cross-check ──────────────────
+            // Only runs when at least one stream port from the SDP session has been seen,
+            // to avoid false alerts for announced-but-not-yet-active sessions.
+            for sdp in sdp_cache.values() {
+                let session_active = sdp.media.iter().any(|m| {
+                    streams.values().any(|s| s.dst_port == m.port && s.packets > 0)
+                });
+                if !session_active { continue; }
+
+                for m in &sdp.media {
+                    if m.ts_refclk.is_empty() { continue; }
+                    let Some((claimed_gm, claimed_domain)) = parse_ts_refclk(&m.ts_refclk) else { continue };
+
+                    // Try PTPv2 first, then PTPv1
+                    let entry = ptp_domains.get(&(claimed_domain, protocols::PTP_VERSION_V2))
+                        .or_else(|| ptp_domains.get(&(claimed_domain, protocols::PTP_VERSION_V1)));
+
+                    match entry {
+                        None => {
+                            let alert = format!(
+                                "⚠  SDP \"{}\" claims PTP domain {} but no PTP traffic detected",
+                                sdp.session_name, claimed_domain
+                            );
+                            println!("\x1b[33m{}\x1b[0m", alert);
+                            logger.log(&alert);
+                        }
+                        Some(ptp) if ptp.clock_valid => {
+                            if let Some(ref active_gm) = ptp.last_grandmaster
+                                && *active_gm != claimed_gm
+                            {
+                                let alert = format!(
+                                    "⚠  PTP grandmaster mismatch for SDP \"{}\": claims {} (domain {}), active is {}",
+                                    sdp.session_name, claimed_gm, claimed_domain, active_gm
+                                );
+                                println!("\x1b[33m{}\x1b[0m", alert);
+                                logger.log(&alert);
+                            }
+                        }
+                        _ => {} // clock not yet valid — GRANDMASTER LOST already alerted
+                    }
+                }
+            }
+
             network_health.calculate_score(&streams, &tcp_streams);
             let requires_valid_ptp = cli::protocol_requires_ptp(&selected_protocols);
-            print_report(&streams, &tcp_streams, &ptp_domains, requires_valid_ptp, &mut logger, &network_health);
+            print_report(&streams, &tcp_streams, &ptp_domains, requires_valid_ptp, &mut logger, &network_health, bytes_this_window);
+            bytes_this_window = 0;
             last_report = Instant::now();
         }
     }

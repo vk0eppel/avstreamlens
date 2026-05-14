@@ -135,6 +135,10 @@ impl ProtocolChoice {
         matches!(self, ProtocolChoice::NDI)
     }
 
+    pub fn needs_ptp(&self) -> bool {
+        self.needs_ptp_filter() || self.requires_valid_ptp_clock()
+    }
+
     /// Does this protocol require AVB (Ethernet AV) filtering?
     pub fn needs_avb(&self) -> bool {
         matches!(self, ProtocolChoice::AVB)
@@ -182,6 +186,24 @@ impl ProtocolChoice {
                 ProtocolChoice::RIST,
             ],
             other => vec![other.clone()],
+        }
+    }
+}
+
+impl AvProtocol {
+    pub fn is_selected(&self, expanded: &[ProtocolChoice]) -> bool {
+        if expanded.iter().any(|c| matches!(c, ProtocolChoice::All)) {
+            return true;
+        }
+        match self {
+            AvProtocol::Aes67  { .. } => expanded.iter().any(|c| matches!(c, ProtocolChoice::AES67)),
+            AvProtocol::St2110 { .. } => expanded.iter().any(|c| matches!(c, ProtocolChoice::ST2110)),
+            AvProtocol::Dante  { .. } => expanded.iter().any(|c| matches!(c, ProtocolChoice::Dante)),
+            AvProtocol::Ndi    { .. } => expanded.iter().any(|c| matches!(c, ProtocolChoice::NDI)),
+            AvProtocol::Avb    { .. } => expanded.iter().any(|c| matches!(c, ProtocolChoice::AVB)),
+            AvProtocol::Srt    { .. } => expanded.iter().any(|c| matches!(c, ProtocolChoice::SRT)),
+            AvProtocol::Rist   { .. } => expanded.iter().any(|c| matches!(c, ProtocolChoice::RIST)),
+            AvProtocol::Ptp { .. } | AvProtocol::Igmp { .. } | AvProtocol::Sap { .. } => true,
         }
     }
 }
