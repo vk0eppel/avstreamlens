@@ -92,7 +92,7 @@ pub struct PtpInfo {
 pub enum ProtocolChoice {
     All,            // Monitor all standard AV protocols (PTP/IGMP always active)
     AES67,          // Audio over RTP
-    Audio,          // Audio streams (AES67 + Dante + RIST)
+    Audio,          // Audio streams (AES67 + Dante + AVB + RIST)
     Video,          // Video streams (ST2110 + NDI + SRT + RIST)
     ST2110,         // SMPTE ST 2110
     Dante,          // Dante digital audio
@@ -167,6 +167,7 @@ impl ProtocolChoice {
             ProtocolChoice::Audio => vec![
                 ProtocolChoice::AES67,
                 ProtocolChoice::Dante,
+                ProtocolChoice::AVB,
                 ProtocolChoice::RIST,
             ],
             ProtocolChoice::Video => vec![
