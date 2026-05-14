@@ -380,35 +380,34 @@ impl PtpStats {
 
         // Note: masters tracking removed - use clock_id/grandmaster_id directly from PtpInfo
 
-        // ── Announce message: Clock presence confirmed ────────
-        if info.message_type == 0x0B {
-            if let Some(gm) = &info.grandmaster_id {
-                // Check for grandmaster change
-                if let Some(current) = &self.last_grandmaster {
-                    if current != gm {
-                        self.grandmaster_changes += 1;
-                        self.protocol_changes_count += 1;
-                        println!(
-                            "\x1b[33m⚠️  GRANDMASTER CHANGED (Domain {} v{}): {} → {}\x1b[0m",
-                            self.domain, self.version, current, gm
-                        );
-                        self.last_grandmaster = Some(gm.clone());
-                        self.protocol_grandmaster_detected = true;
-                    }
-                } else {
-                    // First time seeing this grandmaster
+        // ── Grandmaster detection (PTPv2: Announce 0x0B, PTPv1: Sync 0x00) ────
+        // Fires whenever grandmaster_id is populated, regardless of message type.
+        if let Some(gm) = &info.grandmaster_id {
+            match &self.last_grandmaster {
+                Some(current) if current == gm => {
+                    // Same grandmaster — just keep the clock valid.
+                }
+                Some(current) => {
+                    self.grandmaster_changes += 1;
+                    self.protocol_changes_count += 1;
                     println!(
-                        "\x1b[32m✓️  GRANDMASTER DETECTED (Domain {} v{}): {}",
+                        "\x1b[33m⚠️  GRANDMASTER CHANGED (Domain {} v{}): {} → {}\x1b[0m",
+                        self.domain, self.version, current, gm
+                    );
+                    self.last_grandmaster = Some(gm.clone());
+                    self.protocol_grandmaster_detected = true;
+                }
+                None => {
+                    println!(
+                        "\x1b[32m✓  GRANDMASTER DETECTED (Domain {} v{}): {}\x1b[0m",
                         self.domain, self.version, gm
                     );
                     self.last_grandmaster = Some(gm.clone());
                     self.protocol_grandmaster_detected = true;
                 }
-
-                // Mark clock as valid and reset timer
-                self.clock_valid = true;
-                self.last_seen = Instant::now(); // Reset last_seen for timeout calculation
             }
+            self.clock_valid = true;
+            self.last_seen = Instant::now();
             if let Some(q) = &info.clock_quality {
                 self.last_quality = Some(q.clone());
             }

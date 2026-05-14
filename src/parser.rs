@@ -14,7 +14,7 @@ use pnet_packet::{
     Packet,
 };
 
-use crate::protocols::{AvProtocol, St2110Type, DanteKind, NdiKind, SdpSession, SdpMedia, PtpInfo, DEFAULT_CLOCK_HZ};
+use crate::protocols::{AvProtocol, St2110Type, DanteKind, NdiKind, SdpSession, SdpMedia, PtpInfo, DEFAULT_CLOCK_HZ, PTP_VERSION_V1, PTP_VERSION_V2};
 use std::net::Ipv4Addr;
 
 // Constants for network filtering and detection
@@ -266,6 +266,19 @@ pub fn detect_protocol(eth: &EthernetPacket) -> Option<AvProtocol> {
         return Some(AvProtocol::Ndi { kind: NdiKind::Stream, src: src_ip });
     }
 
+    // ── PTP over UDP (ports 319/320) ─────────────────────
+    // Must come before the RTP gate: PTP payloads don't have RTP version bits set.
+    if dst_port == crate::protocols::PTP_EVENT_PORT || dst_port == crate::protocols::PTP_GENERAL_PORT || src_port == crate::protocols::PTP_EVENT_PORT || src_port == crate::protocols::PTP_GENERAL_PORT {
+        if let Some(mut info) = parse_ptp(payload) {
+            info.protocol_kind = Some(if info.version == crate::protocols::PTP_VERSION_V1 {
+                "Dante".to_string()
+            } else {
+                "PTPv2".to_string()
+            });
+            return Some(AvProtocol::Ptp { info });
+        }
+    }
+
     // ── SRT handshake detection ───────────────────────────
     if payload.len() >= 16 {
         let is_control = (payload[0] & 0x80) != 0;
@@ -310,19 +323,6 @@ pub fn detect_protocol(eth: &EthernetPacket) -> Option<AvProtocol> {
     // Dante audio streams have specific port and payload type patterns, even if unicast
     if is_likely_dante_audio(src_port, dst_port, payload_type) {
         return Some(AvProtocol::Dante { kind: DanteKind::AudioStream, src: src_ip, dst_port });
-    }
-
-    // ── PTP over UDP ─────────────────────────────────────
-    if dst_port == crate::protocols::PTP_EVENT_PORT || dst_port == crate::protocols::PTP_GENERAL_PORT || src_port == crate::protocols::PTP_EVENT_PORT || src_port == crate::protocols::PTP_GENERAL_PORT {
-        if let Some(mut info) = parse_ptp(payload) {
-            // PTPv1 (Dante) vs PTPv2 (AES67/ST2110 — indistinguishable at the PTP layer)
-            info.protocol_kind = Some(if info.version == crate::protocols::PTP_VERSION_V1 {
-                "Dante".to_string()
-            } else {
-                "PTPv2".to_string()
-            });
-            return Some(AvProtocol::Ptp { info });
-        }
     }
 
     None
@@ -370,11 +370,120 @@ pub fn parse_rtp(payload: &[u8]) -> Option<(u16, u32, u32)> {
     Some((seq, ts, ssrc))
 }
 
+// ─── PTPv1 subdomain → domain number mapping ────────────────────────────────
+// IEEE 1588-2002 uses 16-byte ASCII subdomain names instead of a numeric domain.
+// The four well-known names map to 0–3; anything else maps to 0 (unknown = default).
+fn map_ptpv1_subdomain(s: &[u8]) -> u8 {
+    let s = &s[..16.min(s.len())];
+    let starts = |prefix: &[u8]| s.starts_with(prefix);
+    if      starts(b"_ALT1") { 1 }
+    else if starts(b"_ALT2") { 2 }
+    else if starts(b"_ALT3") { 3 }
+    else                      { 0 }  // "_DFLT" and anything else → 0
+}
+
+/// Parse a PTPv1 (IEEE 1588-2002) UDP payload.
+///
+/// Header layout (40 bytes, from ptpd HEADER_LENGTH):
+///   [0]     versionPTP = 1
+///   [1]     versionNetwork = 1 (UDP/IP)
+///   [2-17]  subdomain (16 bytes ASCII, null-padded)
+///   [18]    (messageType<<4) | sourceCommunicationTechnology
+///   [19]    reserved
+///   [20-25] sourceUuid (6-byte MAC-based identifier)
+///   [26-27] sourcePortId
+///   [28-29] sequenceId
+///   [30]    control: 0=Sync 1=Delay_Req 2=Follow_Up 3=Delay_Resp 4=Management
+///   [31]    logMessagePeriod
+///   [32-39] (reserved, completing 40-byte header)
+///
+/// Sync body (bytes 40-123):
+///   [40-41] originTimestamp.epoch   [42-45] .seconds   [46-49] .nanoseconds
+///   [50-53] epochNumber / currentUTCOffset
+///   [54]    padding   [55] grandmasterCommunicationTechnology
+///   [56-61] grandmasterClockUuid (6 bytes)
+///   [62-65] grandmasterPortId / grandmasterSequenceId
+///   [66]    padding   [67] grandmasterClockStratum
+///   [68-71] grandmasterClockIdentifier (4 bytes ASCII, e.g. "ATOM", "GPS ")
+fn parse_ptp_v1(payload: &[u8]) -> Option<PtpInfo> {
+    if payload.len() < 40 { return None; }
+
+    let domain   = map_ptpv1_subdomain(&payload[2..18]);
+    let control  = payload[30];
+    let sequence_id = u16::from_be_bytes([payload[28], payload[29]]);
+    let log_sync_interval = payload[31] as i8;
+
+    let (message_type, message_name) = match control {
+        0x00 => (0x00u8, "Sync"),
+        0x01 => (0x01u8, "Delay_Req"),
+        0x02 => (0x08u8, "Follow_Up"),
+        0x03 => (0x09u8, "Delay_Resp"),
+        0x04 => (0x0Du8, "Management"),
+        _    => (0xFFu8, "Unknown"),
+    };
+
+    let clock_id = Some(format!(
+        "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+        payload[20], payload[21], payload[22], payload[23], payload[24], payload[25]
+    ));
+
+    let port_id = Some(u16::from_be_bytes([payload[26], payload[27]]));
+
+    // Grandmaster fields live in the Sync body starting at offset 55.
+    // Only populate for Sync messages with enough bytes.
+    let (grandmaster_id, clock_quality) = if message_type == 0x00 && payload.len() >= 72 {
+        let uuid = &payload[56..62];
+        // Skip all-zero UUIDs (device not yet configured)
+        if uuid.iter().all(|&b| b == 0) {
+            (None, None)
+        } else {
+            let gm = format!(
+                "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+                uuid[0], uuid[1], uuid[2], uuid[3], uuid[4], uuid[5]
+            );
+            let stratum = payload[67];
+            let ident = std::str::from_utf8(&payload[68..72])
+                .unwrap_or("????")
+                .trim_end_matches('\0');
+            let quality = format!("stratum={} ident={}", stratum, ident);
+            (Some(gm), Some(quality))
+        }
+    } else {
+        (None, None)
+    };
+
+    Some(PtpInfo {
+        version:                  PTP_VERSION_V1,
+        message_type,
+        domain,
+        clock_id,
+        grandmaster_id,
+        clock_quality,
+        correction_ns:            None,
+        path_delay_ns:            None,
+        origin_timestamp_ns:      None,
+        message_name:             message_name.to_string(),
+        port_id,
+        sequence_id,
+        log_sync_interval,
+        log_min_pdelay_req_interval: 0,
+        protocol_kind:            None,
+    })
+}
+
 /// Parses a PTP message payload against defined RFC standards (RFC 6188).
 pub fn parse_ptp(payload: &[u8]) -> Option<PtpInfo> {
-    if payload.len() < 64 { return None; } // PTP Announce (v1/v2) message is 64 bytes
+    if payload.len() < 2 { return None; }
 
-    // PTP message types
+    // PTPv1: byte[0]=versionPTP=1, byte[1]=versionNetwork=1
+    // Must be checked before the PTPv2 64-byte minimum to avoid discarding v1 packets.
+    if payload[0] == PTP_VERSION_V1 && payload[1] == 1 {
+        return parse_ptp_v1(payload);
+    }
+
+    // PTPv2 — Announce is 64 bytes; shorter messages (Sync=44) are not yet parsed.
+    if payload.len() < 64 { return None; }
+
     let message_type = payload[0] & 0x0F;
     let message_name = match message_type {
         0x0 => "Sync".to_string(),
@@ -390,15 +499,8 @@ pub fn parse_ptp(payload: &[u8]) -> Option<PtpInfo> {
         _ => format!("Unknown(0x{:X})", message_type),
     };
 
-    // PTPv2 (IEEE 1588-2008): version = low nibble of byte 1 (= 2)
-    // PTPv1 (IEEE 1588-2002): version = high nibble of byte 0 (= 1)
-    let version_ptp = if payload[1] & 0x0F == crate::protocols::PTP_VERSION_V2 {
-        crate::protocols::PTP_VERSION_V2
-    } else if (payload[0] >> 4) & 0x0F == crate::protocols::PTP_VERSION_V1 {
-        crate::protocols::PTP_VERSION_V1
-    } else {
-        crate::protocols::PTP_VERSION_V2
-    };
+    // PTPv2: version in low nibble of byte 1 (= 2); default to v2 for unknown.
+    let version_ptp = if payload[1] & 0x0F == PTP_VERSION_V2 { PTP_VERSION_V2 } else { PTP_VERSION_V2 };
     let domain = payload[4];
 
     let correction_field = i64::from_be_bytes([
@@ -434,7 +536,7 @@ pub fn parse_ptp(payload: &[u8]) -> Option<PtpInfo> {
     let origin_timestamp_ns = if payload.len() >= 48 {
         let seconds = u64::from_be_bytes(payload[34..42].try_into().ok()?);
         let nanos = u32::from_be_bytes([payload[41], payload[42], payload[43], payload[44]]);
-        Some(seconds * 1_000_000_000 + nanos as u64)
+        Some(seconds.saturating_mul(1_000_000_000).saturating_add(nanos as u64))
     } else {
         None
     };

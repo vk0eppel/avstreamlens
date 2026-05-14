@@ -6,11 +6,12 @@
 - Style : Default Rust Style
 
 AVStreamLens processes audio/visual streaming over network protocols. Key components:
-- `src/main.rs`: Entry point, CLI handling, protocol dispatcher
-- `src/parser.rs`: Data parsing and deserialization for protocol-specific formats
-- `src/protocols.rs`: Protocol interface and abstraction layer
-- `src/stats.rs`: Stream statistics collection and reporting
-- `src/report.rs`: Report generation and output formatting
+- `src/main.rs`: Entry point, capture loop, protocol dispatcher
+- `src/cli.rs`: Interactive prompts — interface selection, protocol selection, BPF filter building
+- `src/parser.rs`: Protocol detection and packet parsing (SDP, RTP, PTP, TCP)
+- `src/protocols.rs`: Protocol enums, constants, and type definitions
+- `src/stats.rs`: Stream statistics — RTP, TCP, PTP, network health
+- `src/report.rs`: Terminal reporting and log file output
 - `Cargo.toml`: Dependencies and build configuration
 
 ## Common Commands
@@ -31,11 +32,14 @@ Lint: `cargo clippy -- -D warnings`
 - BPF filter is built dynamically from selected protocols
 - RTP analysis: RFC 3550 jitter, sequence loss (16-bit wrapping), SSRC change detection, timestamp discontinuity detection
 - PTP grandmaster detection tracks clock presence per protocol
-- AES67/ST2110: Monitors PTPv2 (RFC 6188) grandmaster
-- Dante: Monitors PTPv1 grandmaster
+- AES67/ST2110: Monitors PTPv2 (IEEE 1588-2008) grandmaster via UDP ports 319/320, multicast 224.0.1.129–132
+- Dante: Monitors PTPv1 (IEEE 1588-2002) grandmaster via UDP ports 319/320; grandmaster detected from Sync body (bytes 56–61 grandmasterClockUuid, byte 67 stratum)
 - AVB (gPTP): Monitors gPTP grandmaster via EtherType 0x88F7 (L2, no IP layer)
+- PTPv1 subdomain mapped to domain number: _DFLT→0, _ALT1→1, _ALT2→2, _ALT3→3
 - PTP domains tracked per (domain, version) tuple — separates Dante PTPv1 from AES67/ST2110 PTPv2 on the same domain number
+- Grandmaster detection fires on any PtpInfo with grandmaster_id set (PTPv2: Announce, PTPv1: Sync)
 - Alerts show: GRANDMASTER DETECTED/CHANGED/LOST per protocol
+- Detection order: L2 AVB/gPTP → IGMP → SAP → mDNS → Dante control → NDI → UDP PTP → SRT → RIST → RTP gate → AES67 → ST2110 → Dante audio; UDP PTP must precede the RTP gate
 - Protocol association via multicast IP (239.69.*=AES67, other 239.x.x.x=ST2110)
 - PTP and IGMP are always monitored regardless of user protocol selection
 
