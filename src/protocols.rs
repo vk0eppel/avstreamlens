@@ -52,7 +52,7 @@ pub enum AvProtocol {
     Sap    { src: Ipv4Addr, sdp: SdpSession },
     Ptp    { info: PtpInfo },
     // ── Nouveaux protocoles ──
-    Srt    { src: Ipv4Addr, dst_port: u16, is_handshake: bool },
+    Srt    { src: Ipv4Addr, dst: Ipv4Addr, dst_port: u16, is_handshake: bool },
     Rist   { src: Ipv4Addr, dst: Ipv4Addr, dst_port: u16 },
     Igmp   { src: Ipv4Addr, group: Ipv4Addr, igmp_type: IgmpType },
 }
@@ -128,6 +128,11 @@ impl ProtocolChoice {
         matches!(self, ProtocolChoice::AES67 | ProtocolChoice::Audio | ProtocolChoice::Video
             | ProtocolChoice::ST2110 | ProtocolChoice::Dante | ProtocolChoice::NDI 
             | ProtocolChoice::SRT | ProtocolChoice::RIST)
+    }
+
+    /// Does this protocol require TCP packets?
+    pub fn needs_tcp(&self) -> bool {
+        matches!(self, ProtocolChoice::NDI)
     }
 
     /// Does this protocol require AVB (Ethernet AV) filtering?

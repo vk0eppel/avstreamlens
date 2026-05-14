@@ -49,8 +49,11 @@ pub fn classify_st2110(pt: u8, port: u16) -> St2110Type {
 }
 // Detect if a stream is likely Dante audio based on port and payload type patterns
 pub fn is_likely_dante_audio(src: u16, dst: u16, pt: u8) -> bool {
+    // Dante requires BOTH endpoints to use even ports in 5000-6000 (transmitter and receiver
+    // are both allocated from this range). OR logic produces false positives when any app
+    // uses a Dante-range source port while sending to a high ephemeral destination port.
     let port_ok = ((5000..=6000).contains(&dst) && dst % 2 == 0)
-               || ((5000..=6000).contains(&src) && src % 2 == 0);
+               && ((5000..=6000).contains(&src) && src % 2 == 0);
     (pt == 0 || pt == 8 || pt >= 96) && port_ok
 }
 // Check if mDNS payload contains a specific service string (e.g., "_netaudio._udp" or "_ndi._tcp")
@@ -227,6 +230,9 @@ pub fn detect_protocol(eth: &EthernetPacket) -> Option<AvProtocol> {
         }
     }
 
+    // NDI stream detection is handled in main.rs via IP-based matching (ndi_sources set
+    // populated from mDNS discovery). A port-range check here would cause double-counting.
+
     if eth.get_ethertype() != EtherTypes::Ipv4 { return None; }
 
     // Try to extract IPv4/UDP layers
@@ -261,11 +267,6 @@ pub fn detect_protocol(eth: &EthernetPacket) -> Option<AvProtocol> {
         return Some(AvProtocol::Dante { kind: DanteKind::Control, src: src_ip, dst_port });
     }
 
-    // ── NDI stream (ports 5960-5980) ─────────────────────
-    if (crate::protocols::NDI_PORT_MIN..=crate::protocols::NDI_PORT_MAX).contains(&dst_port) {
-        return Some(AvProtocol::Ndi { kind: NdiKind::Stream, src: src_ip });
-    }
-
     // ── PTP over UDP (ports 319/320) ─────────────────────
     // Must come before the RTP gate: PTP payloads don't have RTP version bits set.
     if dst_port == crate::protocols::PTP_EVENT_PORT || dst_port == crate::protocols::PTP_GENERAL_PORT || src_port == crate::protocols::PTP_EVENT_PORT || src_port == crate::protocols::PTP_GENERAL_PORT {
@@ -288,18 +289,20 @@ pub fn detect_protocol(eth: &EthernetPacket) -> Option<AvProtocol> {
             if ctrl_type == 0x0000 {
                 // Type 0 = Handshake SRT
                 let is_handshake = payload.len() >= 20;
-                return Some(AvProtocol::Srt { src: src_ip, dst_port, is_handshake });
+                return Some(AvProtocol::Srt { src: src_ip, dst: dst_ip, dst_port, is_handshake });
             }
         }
     }
 
     // ── RIST detection ───────────────────────────────────
+    // RIST carries MPEG-2 TS encapsulated in RTP; PT must be exactly 33 (MP2T).
+    // Using pt >= 33 was too broad and caused false positives on NDI and other protocols.
     if (crate::protocols::RIST_PORT_BASE..5999).contains(&dst_port) && dst_port % 2 == 0
         && !is_aes67_multicast(dst_ip) && !is_st2110_multicast(dst_ip)
     {
         if payload.len() >= 12 && (payload[0] >> 6) & 0b11 == 2 {
             let pt = payload[1] & 0x7F;
-            if pt >= 33 { // PT 33 = MP2T classique dans RIST
+            if pt == 33 {
                 return Some(AvProtocol::Rist { src: src_ip, dst: dst_ip, dst_port: dst_port });
             }
         }

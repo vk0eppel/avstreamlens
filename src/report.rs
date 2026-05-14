@@ -89,6 +89,40 @@ pub fn print_report(
     logger.log(&net_summary);
     println!("{}", net_summary);
 
+    // ── Health breakdown ────────────────────────────────────────────────────
+    let qos_str = if health.dscp_total == 0 {
+        "QoS: – (no AV streams)".to_string()
+    } else {
+        let pct = health.dscp_violations * 100 / health.dscp_total;
+        if health.dscp_violations == 0 {
+            format!("QoS: ✓ DSCP EF ({} pkts)", health.dscp_total)
+        } else {
+            format!("QoS: ⚠ {}% untagged ({}/{})", pct, health.dscp_violations, health.dscp_total)
+        }
+    };
+
+    let igmp_str = if health.ecn_congestion_marks == 0 {
+        "Congestion: ✓ none".to_string()
+    } else {
+        format!("Congestion: ⚠ {} ECN marks", health.ecn_congestion_marks)
+    };
+
+    let querier_str = match health.last_igmp_query {
+        None => "IGMP: – (no query seen)".to_string(),
+        Some(t) => {
+            let secs = t.elapsed().as_secs();
+            if secs > 130 {
+                format!("IGMP: ⚠ querier silent {}s", secs)
+            } else {
+                format!("IGMP: ✓ querier {}s ago", secs)
+            }
+        }
+    };
+
+    let breakdown = format!("   {}  |  {}  |  {}", qos_str, igmp_str, querier_str);
+    logger.log(&breakdown);
+    println!("{}", breakdown);
+
     // ── RTP Streams Report ──────────────────────────────────────────────────
     let group_order = vec!["AES67", "AVB", "Dante", "NDI", "ST"];
     let mut keys: Vec<&String> = streams.keys().collect();

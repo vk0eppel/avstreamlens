@@ -92,12 +92,14 @@ pub fn build_bpf_filter(selected: &[ProtocolChoice]) -> String {
     }
 
     let needs_udp = expanded.iter().any(|c| c.needs_udp());
+    let needs_tcp = expanded.iter().any(|c| c.needs_tcp());
     let needs_avb = expanded.iter().any(|c| c.needs_avb());
     let needs_ptp = expanded.iter().any(|c| c.needs_ptp_filter())
                  || expanded.iter().any(|c| c.requires_valid_ptp_clock());
 
     let mut filters = vec!["igmp".to_string()];
     if needs_udp { filters.push("udp".to_string()); }
+    if needs_tcp { filters.push("tcp".to_string()); }
     if needs_avb { filters.push("(ether proto 0x22f0)".to_string()); }
     if needs_ptp { filters.push("(ether proto 0x88f7)".to_string()); }
 
@@ -130,5 +132,5 @@ pub fn protocol_requires_ptp(selected: &[ProtocolChoice]) -> bool {
 }
 
 fn all_protocols_filter() -> String {
-    "igmp or udp or (ether proto 0x22f0) or (ether proto 0x88f7)".to_string()
+    "igmp or udp or tcp or (ether proto 0x22f0) or (ether proto 0x88f7)".to_string()
 }

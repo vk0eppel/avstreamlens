@@ -250,15 +250,23 @@ pub struct NetworkHealth {
     pub total_bytes: u64,
     pub multicast_packets: u64,
     pub unicast_packets: u64,
-    pub packet_loss_streams: u64,        // count of streams with loss
+    pub packet_loss_streams: u64,
     pub high_jitter_streams: u64,
     pub aes67_discontinuities: u64,
     pub timestamp_errors: u64,
     pub tcp_retransmissions: u64,
-    pub detected_duplicates: u64,        // multicast duplicates
+    pub detected_duplicates: u64,
     pub congestion_events: u64,
     pub saturation_warnings: u64,
-    pub network_score: f64,              // 0-100
+    pub network_score: f64,
+    // QoS / DSCP tracking
+    pub dscp_total: u64,                 // AV packets checked for DSCP marking
+    pub dscp_violations: u64,            // AV packets without DSCP EF (46)
+    // Congestion (ECN)
+    pub ecn_congestion_marks: u64,       // IP ECN=CE packets (congestion signalled by router)
+    // IGMP / snooping
+    pub last_igmp_query: Option<Instant>, // last IGMP Membership Query seen
+    pub igmp_leave_events: u64,          // Leave events on active multicast groups
 }
 
 impl NetworkHealth {
@@ -277,48 +285,83 @@ impl NetworkHealth {
             congestion_events: 0,
             saturation_warnings: 0,
             network_score: 100.0,
+            dscp_total: 0,
+            dscp_violations: 0,
+            ecn_congestion_marks: 0,
+            last_igmp_query: None,
+            igmp_leave_events: 0,
         }
     }
 
     pub fn calculate_score(&mut self, streams: &std::collections::HashMap<String, StreamStats>, tcp_streams: &std::collections::HashMap<String, TcpStreamStats>) {
         let mut score = 100.0;
 
-        // Deduct for packet loss
+        // ── Stream quality — also populate derived counters ───────────────────
+        self.packet_loss_streams = 0;
+        self.high_jitter_streams = 0;
+        self.aes67_discontinuities = 0;
+
         for stats in streams.values() {
             if stats.loss_pct() > 0.0 {
+                self.packet_loss_streams += 1;
                 score -= stats.loss_pct().min(10.0);
             }
-        }
-
-        // Deduct for jitter
-        for stats in streams.values() {
             if stats.jitter_ms() > 20.0 {
+                self.high_jitter_streams += 1;
                 score -= 5.0;
             } else if stats.jitter_ms() > 10.0 {
+                self.high_jitter_streams += 1;
                 score -= 2.0;
             }
-        }
-
-        // Deduct for timestamp discontinuities
-        for stats in streams.values() {
             if stats.ts_discontinuities > 0 {
                 score -= 3.0 * (stats.ts_discontinuities as f64).min(5.0);
+                if stats.protocol == "AES67" {
+                    self.aes67_discontinuities += stats.ts_discontinuities;
+                }
             }
         }
 
-        // Deduct for TCP issues
+        // ── TCP quality ───────────────────────────────────────────────────────
         for tcp_stats in tcp_streams.values() {
             match tcp_stats.stream_quality {
-                StreamQuality::Healthy => {},
-                StreamQuality::Degrading => score -= 5.0,
-                StreamQuality::Critical => score -= 15.0,
+                StreamQuality::Healthy    => {}
+                StreamQuality::Degrading  => score -= 5.0,
+                StreamQuality::Critical   => score -= 15.0,
                 StreamQuality::Terminated => score -= 25.0,
             }
         }
+        score -= (self.tcp_retransmissions as f64 * 0.5).min(10.0);
 
-        // Deduct for detected issues
+        // ── QoS / DSCP ───────────────────────────────────────────────────────
+        // AES67 and ST2110 require DSCP EF (46). Deduct proportionally to violation rate.
+        if self.dscp_total > 0 {
+            let violation_pct = self.dscp_violations as f64 / self.dscp_total as f64;
+            if violation_pct > 0.5 {
+                score -= 20.0;  // majority of AV traffic untagged
+            } else if violation_pct > 0.1 {
+                score -= 10.0;
+            } else if self.dscp_violations > 0 {
+                score -= 3.0;
+            }
+        }
+
+        // ── Congestion (ECN Congestion Experienced marks) ─────────────────────
+        // ECN=CE is set by routers when they are experiencing congestion mid-path.
+        score -= (self.ecn_congestion_marks as f64 * 2.0).min(20.0);
         score -= (self.detected_duplicates as f64).min(10.0);
-        score -= (self.congestion_events as f64 * 0.5).min(15.0);
+
+        // ── IGMP / Snooping ───────────────────────────────────────────────────
+        // Multicast snooping requires a live IGMP Querier. If multicast streams are
+        // active but no Query has been seen in >130 s (slightly above RFC 3376 default
+        // 125 s query interval), managed switches may start flooding multicast.
+        let has_active_multicast = streams.values().any(|s| s.is_multicast && s.packets > 0);
+        if has_active_multicast {
+            match self.last_igmp_query {
+                None => score -= 10.0,
+                Some(t) if t.elapsed().as_secs() > 130 => score -= 10.0,
+                _ => {}
+            }
+        }
 
         self.network_score = score.max(0.0);
     }
