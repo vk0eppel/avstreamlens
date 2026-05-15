@@ -162,6 +162,31 @@ impl StreamStats {
 }
 
 // ═════════════════════──══════════════════──═════════════════════════
+// SECTION 2b — AVTP STREAM STATISTICS (per stream_id)
+// ═════════════════════──══════════════════──═════════════════════════
+
+#[derive(Debug, Clone)]
+pub struct AvtpStreamStats {
+    pub stream_id: [u8; 8],
+    pub subtype:   u8,
+    pub packets:   u64,
+    pub last_seen: Instant,
+}
+
+impl AvtpStreamStats {
+    pub fn new(stream_id: [u8; 8], subtype: u8) -> Self {
+        Self { stream_id, subtype, packets: 0, last_seen: Instant::now() }
+    }
+
+    pub fn stream_id_str(&self) -> String {
+        let id = &self.stream_id;
+        format!("{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:04x}",
+            id[0], id[1], id[2], id[3], id[4], id[5],
+            u16::from_be_bytes([id[6], id[7]]))
+    }
+}
+
+// ═════════════════════──══════════════════──═════════════════════════
 // SECTION 3 — TCP STREAM STATISTICS
 // ═════════════════════──══════════════════──═════════════════════════
 
@@ -297,7 +322,13 @@ impl NetworkHealth {
         }
     }
 
-    pub fn calculate_score(&mut self, streams: &std::collections::HashMap<String, StreamStats>, tcp_streams: &std::collections::HashMap<String, TcpStreamStats>) {
+    pub fn calculate_score(
+        &mut self,
+        streams: &std::collections::HashMap<String, StreamStats>,
+        tcp_streams: &std::collections::HashMap<String, TcpStreamStats>,
+        ptp_domains: &std::collections::HashMap<(u8, u8), PtpStats>,
+        msrp_state: &std::collections::HashMap<[u8; 8], crate::protocols::MsrpDeclaration>,
+    ) {
         let mut score = 100.0;
 
         // ── Stream quality — also populate derived counters ───────────────────
@@ -326,6 +357,12 @@ impl NetworkHealth {
                 if stats.protocol == "AES67" {
                     self.aes67_discontinuities += stats.ts_discontinuities;
                 }
+            }
+            if stats.ssrc_changes > 0 {
+                score -= 10.0 * (stats.ssrc_changes as f64).min(3.0);
+            }
+            if stats.last_packet_time.map_or(false, |t| t.elapsed() > Duration::from_secs(crate::protocols::STREAM_TIMEOUT_SECS)) {
+                score -= 30.0;
             }
         }
 
@@ -368,6 +405,27 @@ impl NetworkHealth {
             }
         }
 
+        // ── PTP clock health ──────────────────────────────────────────────────
+        for ptp in ptp_domains.values() {
+            if !ptp.clock_valid {
+                if ptp.protocol_clock_lost {
+                    score -= 25.0;  // grandmaster confirmed then lost
+                } else if ptp.packets > 0 {
+                    score -= 15.0;  // PTP traffic seen but no grandmaster yet
+                }
+            }
+            if ptp.grandmaster_changes > 0 {
+                score -= 10.0 * (ptp.grandmaster_changes as f64).min(3.0);
+            }
+        }
+
+        // ── MSRP / AVB bandwidth reservations ────────────────────────────────
+        for decl in msrp_state.values() {
+            if matches!(decl.decl_type, crate::protocols::MsrpDeclType::TalkerFailed) {
+                score -= 20.0;
+            }
+        }
+
         self.network_score = score.max(0.0);
     }
 }
@@ -398,6 +456,7 @@ pub struct PtpStats {
     pub protocol_clock_lost:           bool,          // Was clock lost for this protocol
     pub protocol_changes_count:        u64,           // Grandmaster changes for this protocol
     pub last_src_ip:                   Option<std::net::Ipv4Addr>, // Source IP of last PTP packet
+    pub last_clock_id:                 Option<String>,             // Source EUI-64 from most recent PTP message
 }
 
 impl PtpStats {
@@ -420,6 +479,7 @@ impl PtpStats {
             protocol_clock_lost: false,
             protocol_changes_count: 0,
             last_src_ip: None,
+            last_clock_id: None,
         }
     }
 
@@ -428,6 +488,7 @@ impl PtpStats {
         self.last_seen = Instant::now();
         self.protocol_kind = protocol_kind.as_ref().map(|s| s.to_string());
         if let Some(ip) = info.src_ip { self.last_src_ip = Some(ip); }
+        if let Some(ref id) = info.clock_id { self.last_clock_id = Some(id.clone()); }
 
         // Note: masters tracking removed - use clock_id/grandmaster_id directly from PtpInfo
 

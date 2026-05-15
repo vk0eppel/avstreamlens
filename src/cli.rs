@@ -99,7 +99,7 @@ pub fn build_bpf_filter(selected: &[ProtocolChoice]) -> String {
     let mut filters = vec!["igmp".to_string()];
     if needs_udp { filters.push("udp".to_string()); }
     if needs_tcp { filters.push("tcp".to_string()); }
-    if needs_avb { filters.push("(ether proto 0x22f0)".to_string()); }
+    if needs_avb { filters.push("(ether proto 0x22f0) or (ether proto 0x22ea) or (ether proto 0x88f5)".to_string()); }
     if needs_ptp { filters.push("(ether proto 0x88f7)".to_string()); }
 
     if filters.len() == 1 {
@@ -107,6 +107,17 @@ pub fn build_bpf_filter(selected: &[ProtocolChoice]) -> String {
     } else {
         filters.join(" or ")
     }
+}
+
+/// Human-readable comma-separated list for the startup banner.
+pub fn selected_protocol_display(selected: &[ProtocolChoice]) -> String {
+    if selected.iter().any(|c| matches!(c, ProtocolChoice::All)) {
+        return "all protocols".to_string();
+    }
+    selected.iter()
+        .map(|c| c.name().split(" (").next().unwrap_or(c.name()))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Format selected protocol names for use in the log filename.
@@ -131,5 +142,5 @@ pub fn protocol_requires_ptp(selected: &[ProtocolChoice]) -> bool {
 }
 
 fn all_protocols_filter() -> String {
-    "igmp or udp or tcp or (ether proto 0x22f0) or (ether proto 0x88f7)".to_string()
+    "igmp or udp or tcp or (ether proto 0x22f0) or (ether proto 0x22ea) or (ether proto 0x88f5) or (ether proto 0x88f7)".to_string()
 }

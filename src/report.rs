@@ -5,8 +5,8 @@ use chrono::{Datelike, Timelike, Local};
 use std::collections::HashMap;
 use std::time::Duration;
 
-use crate::stats::{StreamStats, TcpStreamStats, PtpStats, NetworkHealth, StreamQuality};
-use crate::protocols::STREAM_TIMEOUT_SECS;
+use crate::stats::{StreamStats, TcpStreamStats, PtpStats, NetworkHealth, StreamQuality, AvtpStreamStats};
+use crate::protocols::{STREAM_TIMEOUT_SECS, MsrpDeclaration, MsrpDeclType};
 
 /// Logger for writing timestamped messages to both file and console.
 #[derive(Debug)]
@@ -61,6 +61,9 @@ pub fn print_report(
     logger: &mut Logger,
     health: &NetworkHealth,
     bytes_this_window: u64,
+    avtp_streams: &HashMap<[u8; 8], AvtpStreamStats>,
+    msrp_state: &HashMap<[u8; 8], MsrpDeclaration>,
+    mvrp_vlans: &std::collections::HashSet<u16>,
 ) {
     let now = Local::now();
     let timestamp = now.format("%Y-%m-%d %H:%M:%S").to_string();
@@ -111,6 +114,34 @@ pub fn print_report(
     logger.log(&net_summary);
     println!("{}", net_summary);
 
+    // ── Top-level status ────────────────────────────────────────────────────
+    let stream_issues = streams.values().filter(|s| {
+        s.loss_pct() > 0.0
+            || s.jitter_ms() > 20.0
+            || s.ts_discontinuities > 0
+            || s.ssrc_changes > 0
+            || s.last_packet_time.map_or(false, |t| t.elapsed() > Duration::from_secs(STREAM_TIMEOUT_SECS))
+    }).count();
+    let ptp_issue = requires_valid_ptp && !ptp_domains.values().any(|s| s.clock_valid);
+    let mut parts = Vec::new();
+    if stream_issues > 0 { parts.push(format!("{} stream issue(s)", stream_issues)); }
+    if ptp_issue { parts.push("no clock source".to_string()); }
+    let status_line = if !parts.is_empty() {
+        format!("⚠  {}", parts.join("  |  "))
+    } else if streams.is_empty() {
+        "–  No streams detected".to_string()
+    } else {
+        "✓  All streams healthy".to_string()
+    };
+    logger.log(&status_line);
+    if status_line.starts_with('✓') {
+        println!("\x1b[32m{}\x1b[0m", status_line);
+    } else if status_line.starts_with('⚠') {
+        println!("\x1b[33m{}\x1b[0m", status_line);
+    } else {
+        println!("{}", status_line);
+    }
+
     // ── RTP Streams Report ──────────────────────────────────────────────────
     let group_order = vec!["AES67", "AVB", "Dante", "NDI", "ST"];
     let mut keys: Vec<&String> = streams.keys().collect();
@@ -128,33 +159,34 @@ pub fn print_report(
 
     for key in keys {
         let s = &streams[key];
-        let name_str = s
-            .sdp_name
-            .as_deref()
+
+        // Protocol label: prefix ST2110 subtypes clearly
+        let proto_label = if s.protocol.starts_with("2110-") {
+            format!("ST{}", s.protocol)
+        } else {
+            s.protocol.clone()
+        };
+
+        let name_str = s.sdp_name.as_deref()
             .map(|n| format!("  \"{}\"", n))
             .unwrap_or_default();
-        let codec_str = s
-            .sdp_rtpmap
-            .as_deref()
-            .map(|c| format!("  [{}]", c))
+
+        let codec_str = s.sdp_rtpmap.as_deref()
+            .map(|r| format!("  [{}]", r))
             .unwrap_or_default();
-        let mc_str = if s.is_multicast { " [MC]" } else { " [UC]" };
-        let media_str = if s.media_type != "unknown" {
-            format!("  ({})", s.media_type)
-        } else {
-            String::new()
+
+        let addr_str = match s.dst_ip {
+            Some(ip) if s.dst_port > 0 => format!("  —  {}:{}", ip, s.dst_port),
+            Some(ip)                   => format!("  —  {}", ip),
+            None                       => String::new(),
         };
-        let stream_line = format!(
-            "\n  ▸ [{}] {}{}{}{}{}",
-            s.protocol, key, name_str, codec_str, mc_str, media_str
-        );
+
+        let stream_line = format!("\n  ▸ {}{}{}{}", proto_label, name_str, codec_str, addr_str);
         logger.log(&stream_line);
         println!("{}", stream_line);
 
         let status_line = format!(
-            "    packets: {}  |  losses: {} ({:.1}%)  |  jitter: {:.2} ms  |  rate: {:.1} Mbps",
-            s.packets,
-            s.lost_packets,
+            "    loss: {:.1}%  |  jitter: {:.2} ms  |  {:.1} Mbps",
             s.loss_pct(),
             s.jitter_ms(),
             (s.bitrate_bps as f64) / 1_000_000.0
@@ -162,61 +194,45 @@ pub fn print_report(
         logger.log(&status_line);
         println!("{}", status_line);
 
-        // Timestamp discontinuity warning
         if s.ts_discontinuities > 0 {
-            let ts_alert = format!(
-                "    ⚠  Timestamp discontinuities: {} detected",
-                s.ts_discontinuities
-            );
-            logger.log(&ts_alert);
-            println!("\x1b[33m{}\x1b[0m", ts_alert);
+            let alert = "    ⚠  Audio glitch risk — timing discontinuity detected";
+            logger.log(alert);
+            println!("\x1b[33m{}\x1b[0m", alert);
         }
 
-        // Packet loss warning
         if s.loss_pct() > 0.0 {
-            let alert = "    ⚠  Packet loss";
+            let alert = "    ⚠  Packet loss detected";
             logger.log(alert);
             println!("\x1b[33m{}\x1b[0m", alert);
         }
 
-        // Jitter warning
         if s.jitter_ms() > 20.0 {
-            let alert = "    ⚠  High jitter (> 20 ms)";
+            let alert = "    ⚠  High jitter — stream quality at risk";
             logger.log(alert);
             println!("\x1b[33m{}\x1b[0m", alert);
         }
 
-        // AES67-specific warnings
         if s.protocol == "AES67" && s.jitter_ms() > 10.0 {
-            let alert = "    ⚠  AES67 compliance risk: RTP/PTP drift or strict timing issue";
+            let alert = "    ⚠  AES67 timing issue — check PTP lock";
             logger.log(alert);
             println!("\x1b[33m{}\x1b[0m", alert);
         }
 
-        // Dante-specific warnings
         if s.protocol == "Dante" && (s.loss_pct() > 0.0 || s.jitter_ms() > 15.0) {
-            let alert = "    ⚠  Dante subscription or clock mismatch detected";
+            let alert = "    ⚠  Dante clock or subscription issue";
             logger.log(alert);
             println!("\x1b[33m{}\x1b[0m", alert);
         }
 
-        // SSRC change warning
         if s.ssrc_changes > 0 {
-            let alert = format!(
-                "    ⚠  SSRC changed {} time(s) — source interrupted and reconnected",
-                s.ssrc_changes
-            );
+            let alert = format!("    ⚠  Source interrupted and reconnected ({} time(s))", s.ssrc_changes);
             logger.log(&alert);
             println!("\x1b[33m{}\x1b[0m", alert);
         }
 
-        // Dead stream detection
         if let Some(last_time) = s.last_packet_time {
             if last_time.elapsed() > Duration::from_secs(STREAM_TIMEOUT_SECS) {
-                let alert = format!(
-                    "    💀 No packet since {:.0}s — stream may be dead",
-                    last_time.elapsed().as_secs_f64()
-                );
+                let alert = format!("    💀 No signal for {:.0}s", last_time.elapsed().as_secs_f64());
                 logger.log(&alert);
                 println!("\x1b[31m{}\x1b[0m", alert);
             }
@@ -262,70 +278,149 @@ pub fn print_report(
         }
     }
 
-    // ── PTP Domains Report ──────────────────────────────────────────────────
-    if !ptp_domains.is_empty() {
-        logger.log("\nPTP Domains:");
-        println!("\n\x1b[35m📡 PTP Domains:\x1b[0m");
+    // ── AVB Extended Report ─────────────────────────────────────────────────
+    let avb_stream_count = streams.values().filter(|s| s.protocol == "AVB").count();
+    if avb_stream_count > 0 || !avtp_streams.is_empty() || !msrp_state.is_empty() || !mvrp_vlans.is_empty() {
+        logger.log("\nAVB:");
+        println!("\n\x1b[32m🔗 AVB:\x1b[0m");
 
-        for ((domain, _version), stats) in ptp_domains.iter() {
-            let gm_icon = if stats.clock_valid { "✓" } else if stats.last_grandmaster.is_some() { "⚠" } else { "❌" };
+        // MVRP
+        if !mvrp_vlans.is_empty() {
+            let mut vids: Vec<u16> = mvrp_vlans.iter().copied().collect();
+            vids.sort();
+            let vids_str: Vec<String> = vids.iter().map(|v| v.to_string()).collect();
+            let line = format!("  ✓ VLAN QoS active: {}", vids_str.join(", "));
+            logger.log(&line); println!("{}", line);
+        } else if avb_stream_count > 0 {
+            let line = "  ⚠  No VLAN registration detected — L2 QoS may not be configured";
+            logger.log(line); println!("\x1b[33m{}\x1b[0m", line);
+        }
 
-            let version_str = format!(" v{}", stats.version);
-            let protocol_str = if let Some(ref pk) = stats.protocol_kind {
-                format!(" [{}]", pk)
-            } else {
-                String::new()
-            };
-
-            let domain_line = format!(
-                "  {}: Domain {} PTP{}",
-                gm_icon, domain, version_str
-            );
-            logger.log(&domain_line);
-            println!("{}", domain_line);
-
-            if let Some(ref gm) = stats.last_grandmaster {
-                let ip_str = stats.last_src_ip
-                    .map(|ip| format!("  ({})", ip))
-                    .unwrap_or_default();
-                let line = format!("    {} Grandmaster clock: {}{}", gm_icon, gm, ip_str);
-                println!("{}", line);
-                logger.log(&line);
+        // AVTP stream IDs
+        if !avtp_streams.is_empty() {
+            let mut sorted: Vec<&AvtpStreamStats> = avtp_streams.values().collect();
+            sorted.sort_by_key(|s| s.stream_id);
+            for s in sorted {
+                let dead = s.last_seen.elapsed() > Duration::from_secs(STREAM_TIMEOUT_SECS);
+                let icon = if dead { "💀" } else { "▸" };
+                let line = format!("  {} AVTP stream {}  ({} pkts)", icon, s.stream_id_str(), s.packets);
+                logger.log(&line); println!("{}", line);
             }
+        }
 
-            if let Some(ref q) = stats.last_quality {
-                println!("    {} Lock quality: {}", "✔", q);
-                logger.log(&format!("    {} Lock quality: {}", "✔", q));
-            }
-
-            if stats.protocol_clock_lost {
-                println!("    {} ⚠  Clock LOST (protocol grandmaster disappeared)", "✘");
-                logger.log(&format!("    {} ⚠  Clock LOST (protocol grandmaster disappeared)", "✘"));
-            }
-
-            if stats.protocol_changes_count > 0 {
-                println!(
-                    "    {} ⚠  Grandmaster changed {} time(s) for {}",
-                    "✙", stats.protocol_changes_count, stats.protocol_kind.as_ref().unwrap_or(&"unknown".to_string())
-                );
-                logger.log(&format!(
-                    "    {} ⚠  Grandmaster changed {} time(s) for {}",
-                    "✙", stats.protocol_changes_count, stats.protocol_kind.as_ref().unwrap_or(&"unknown".to_string())
-                ));
+        // MSRP reservations
+        if !msrp_state.is_empty() {
+            let mut sorted: Vec<&MsrpDeclaration> = msrp_state.values().collect();
+            sorted.sort_by_key(|d| d.stream_id);
+            for decl in sorted {
+                let id = &decl.stream_id;
+                let sid = format!("{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:04x}",
+                    id[0], id[1], id[2], id[3], id[4], id[5],
+                    u16::from_be_bytes([id[6], id[7]]));
+                match decl.decl_type {
+                    MsrpDeclType::TalkerAdvertise => {
+                        let bw = if let (Some(f), Some(n)) = (decl.max_frame_size, decl.max_interval_frames) {
+                            format!("  {:.1} Mbps", f as f64 * n as f64 * 8.0 * 8000.0 / 1_000_000.0)
+                        } else { String::new() };
+                        let vlan = decl.vlan_id.map(|v| format!("  VLAN {}", v)).unwrap_or_default();
+                        let prio = decl.priority.map(|p| format!("  prio {}", p)).unwrap_or_default();
+                        let line = format!("  ✓ Talker {}{}{}{}",  sid, bw, vlan, prio);
+                        logger.log(&line); println!("{}", line);
+                        // Listener state for same stream
+                        if let Some(listener) = msrp_state.values().find(|d| {
+                            d.stream_id == decl.stream_id && matches!(d.decl_type, MsrpDeclType::Listener)
+                        }) {
+                            let lst_str = match listener.listener_state {
+                                Some(2) => "  ✓ Listener Ready",
+                                Some(1) => "  ⚠  Listener AskingFailed",
+                                Some(3) => "  ⚠  Listener ReadyFailed",
+                                _       => "  Listener Unknown",
+                            };
+                            logger.log(lst_str); println!("{}", lst_str);
+                        }
+                    }
+                    MsrpDeclType::TalkerFailed => {
+                        let code_str = match decl.failure_code {
+                            Some(1) => "insufficient bandwidth",
+                            Some(2) => "insufficient bridge resources",
+                            Some(3) => "insufficient bandwidth for Traffic Class",
+                            Some(_) => "unknown failure",
+                            None    => "failed",
+                        };
+                        let line = format!("  ⚠  Talker Failed {}  ({})", sid, code_str);
+                        logger.log(&line); println!("\x1b[33m{}\x1b[0m", line);
+                    }
+                    MsrpDeclType::Listener => {} // shown inline above
+                }
             }
         }
     }
 
-    // ── PTP Validation ──────────────────────────────────────────────────────
-    if requires_valid_ptp {
-        // Check if any domain has a currently valid clock
-        let has_valid_clock = ptp_domains.values().any(|stats| stats.clock_valid);
+    // ── PTP / Clock Sources ─────────────────────────────────────────────────
+    if !ptp_domains.is_empty() {
+        logger.log("\nClock Sources:");
+        println!("\n\x1b[35m🕐 Clock Sources:\x1b[0m");
 
-        if !has_valid_clock {
-            let alert = "⚠  No valid PTP clock detected for the selected protocols.";
-            logger.log(&format!("\n{}", alert));
-            println!("\x1b[31m{}\x1b[0m", alert);
+        let multi_domain = ptp_domains.len() > 1;
+
+        for ((domain, _version), stats) in ptp_domains.iter() {
+            let gm_icon = if stats.clock_valid { "✓" } else if stats.last_grandmaster.is_some() { "⚠" } else { "❌" };
+
+            // Primary label: protocol association (Dante, AES67/ST2110, AVB, …)
+            let proto_label = stats.protocol_kind.as_deref().unwrap_or("PTP");
+            // Show domain number only when multiple domains exist (to distinguish them)
+            let domain_suffix = if multi_domain || *domain > 0 {
+                format!("  (domain {})", domain)
+            } else {
+                String::new()
+            };
+
+            let clock_line = match (&stats.last_grandmaster, stats.clock_valid) {
+                (Some(gm), true) => {
+                    let ip_str = stats.last_src_ip
+                        .map(|ip| format!("  ({})", ip))
+                        .unwrap_or_default();
+                    format!("  {}  {}{}  —  grandmaster {}{}", gm_icon, proto_label, domain_suffix, gm, ip_str)
+                }
+                (Some(_), false) => {
+                    format!("  {}  {}{}  —  clock lost", gm_icon, proto_label, domain_suffix)
+                }
+                (None, _) => {
+                    // No Announce seen yet; use source clock ID from Sync as fallback
+                    match &stats.last_clock_id {
+                        Some(id) => format!("  ○  {}{}  —  clock source: {}  (sync only, no announce)", proto_label, domain_suffix, id),
+                        None     => format!("  {}  {}{}  —  no clock detected", gm_icon, proto_label, domain_suffix),
+                    }
+                }
+            };
+            logger.log(&clock_line);
+            println!("{}", clock_line);
+
+            if let Some(ref q) = stats.last_quality {
+                let quality_line = format!("      clock quality: {}", q);
+                logger.log(&quality_line);
+                println!("{}", quality_line);
+            }
+
+            if stats.protocol_clock_lost {
+                let alert = "      ⚠  Clock lost — grandmaster disappeared";
+                logger.log(alert);
+                println!("\x1b[33m{}\x1b[0m", alert);
+            }
+
+            if stats.protocol_changes_count > 0 {
+                let alert = format!("      ⚠  Clock source changed {} time(s)", stats.protocol_changes_count);
+                logger.log(&alert);
+                println!("\x1b[33m{}\x1b[0m", alert);
+            }
         }
+    }
+
+    // ── Clock source required but absent ───────────────────────────────────
+    if requires_valid_ptp && !ptp_domains.values().any(|s| s.clock_valid) {
+        let alert = "⚠  No clock source — streams requiring PTP may lose sync";
+        logger.log(&format!("\n{}", alert));
+        println!("\x1b[31m{}\x1b[0m", alert);
     }
 
     // ── Health breakdown ────────────────────────────────────────────────────
@@ -339,14 +434,8 @@ pub fn print_report(
         format!("QoS: ⚠ {}% untagged ({}/{})", pct_str, health.dscp_violations, health.dscp_total)
     };
 
-    let congestion_str = if health.ecn_congestion_marks == 0 {
-        "Congestion: ✓ none".to_string()
-    } else {
-        format!("Congestion: ⚠ {} ECN marks", health.ecn_congestion_marks)
-    };
-
     let querier_str = match health.last_igmp_query {
-        None => "IGMP: – (no query seen)".to_string(),
+        None => "IGMP: – (no querier seen)".to_string(),
         Some(t) => {
             let secs = t.elapsed().as_secs();
             if secs > 130 {
@@ -357,7 +446,7 @@ pub fn print_report(
         }
     };
 
-    let breakdown = format!("\n   {}  |  {}  |  {}", qos_str, congestion_str, querier_str);
+    let breakdown = format!("\n   {}  |  {}", qos_str, querier_str);
     logger.log(&breakdown);
     println!("{}", breakdown);
 

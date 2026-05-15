@@ -15,6 +15,8 @@ pub const PTP_GENERAL_PORT:  u16 = 320;    // PTP general port (Announce, Follow
 // EtherType values for PTP and AVB
 pub const ETHERTYPE_AVTP:    u16 = 0x22F0; // AVTP (AVB)
 pub const ETHERTYPE_PTP:     u16 = 0x88F7; // PTP (IEEE 1588)
+pub const ETHERTYPE_MSRP:    u16 = 0x22EA; // MSRP — IEEE 802.1Qat stream reservation
+pub const ETHERTYPE_MVRP:    u16 = 0x88F5; // MVRP — IEEE 802.1Q VLAN registration
 
 // IGMP protocol number
 pub const IP_PROTO_IGMP:     u8  = 0x02;
@@ -48,7 +50,9 @@ pub enum AvProtocol {
     St2110 { src: Ipv4Addr, dst: Ipv4Addr, dst_port: u16, stream_type: St2110Type },
     Dante  { kind: DanteKind, src: Ipv4Addr, dst_port: u16 },
     Ndi    { kind: NdiKind,   src: Ipv4Addr },
-    Avb    { subtype: u8 },
+    Avb    { subtype: u8, stream_id: Option<[u8; 8]> },
+    Msrp   { declarations: Vec<MsrpDeclaration> },
+    Mvrp   { vlan_ids: Vec<u16> },
     Sap    { src: Ipv4Addr, sdp: SdpSession },
     Ptp    { info: PtpInfo },
     // ── Nouveaux protocoles ──
@@ -200,7 +204,9 @@ impl AvProtocol {
             AvProtocol::St2110 { .. } => expanded.iter().any(|c| matches!(c, ProtocolChoice::ST2110)),
             AvProtocol::Dante  { .. } => expanded.iter().any(|c| matches!(c, ProtocolChoice::Dante)),
             AvProtocol::Ndi    { .. } => expanded.iter().any(|c| matches!(c, ProtocolChoice::NDI)),
-            AvProtocol::Avb    { .. } => expanded.iter().any(|c| matches!(c, ProtocolChoice::AVB)),
+            AvProtocol::Avb    { .. }
+            | AvProtocol::Msrp { .. }
+            | AvProtocol::Mvrp { .. } => expanded.iter().any(|c| matches!(c, ProtocolChoice::AVB)),
             AvProtocol::Srt    { .. } => expanded.iter().any(|c| matches!(c, ProtocolChoice::SRT)),
             AvProtocol::Rist   { .. } => expanded.iter().any(|c| matches!(c, ProtocolChoice::RIST)),
             AvProtocol::Ptp { .. } | AvProtocol::Igmp { .. } | AvProtocol::Sap { .. } => true,
@@ -212,6 +218,24 @@ impl AvProtocol {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum St2110Type { Video, Audio, Ancdata, Unknown }
+
+// ── AVB / MSRP types ──
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum MsrpDeclType { TalkerAdvertise, TalkerFailed, Listener }
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct MsrpDeclaration {
+    pub decl_type:           MsrpDeclType,
+    pub stream_id:           [u8; 8],
+    pub dest_mac:            Option<[u8; 6]>,
+    pub vlan_id:             Option<u16>,
+    pub max_frame_size:      Option<u16>,
+    pub max_interval_frames: Option<u16>,
+    pub priority:            Option<u8>,     // traffic class priority (0–7)
+    pub failure_code:        Option<u8>,     // TalkerFailed only
+    pub listener_state:      Option<u8>,     // Listener only: 0=Ignore 1=AskingFailed 2=Ready 3=ReadyFailed
+}
 #[derive(Debug, Clone, PartialEq)]
 pub enum DanteKind  { Discovery, AudioStream, Control }
 #[derive(Debug, Clone, PartialEq)]

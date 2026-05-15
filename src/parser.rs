@@ -14,7 +14,7 @@ use pnet_packet::{
     Packet,
 };
 
-use crate::protocols::{AvProtocol, St2110Type, DanteKind, NdiKind, SdpSession, SdpMedia, PtpInfo, DEFAULT_CLOCK_HZ, PTP_VERSION_V1, PTP_VERSION_V2};
+use crate::protocols::{AvProtocol, St2110Type, DanteKind, NdiKind, SdpSession, SdpMedia, PtpInfo, MsrpDeclaration, MsrpDeclType, DEFAULT_CLOCK_HZ, PTP_VERSION_V1, PTP_VERSION_V2};
 use std::net::Ipv4Addr;
 
 // Constants for network filtering and detection
@@ -188,16 +188,162 @@ pub fn parse_sdp(sdp: &str) -> SdpSession {
 }
 
 // ═════════════════════════════════════════════════════════════════
+// SECTION 2b — AVB PROTOCOL PARSERS (AVTP / MSRP / MVRP)
+// ═════════════════════════════════════════════════════════════════
+
+/// Extract the AVTP stream_id from a raw AVTP payload (after Ethernet header).
+/// Returns Some only when the stream_valid (sv) bit is set.
+pub fn parse_avtp_stream_id(payload: &[u8]) -> Option<[u8; 8]> {
+    if payload.len() < 12 { return None; }
+    if payload[1] & 0x80 == 0 { return None; } // sv bit not set
+    payload[4..12].try_into().ok()
+}
+
+/// Parse an MSRP PDU (IEEE 802.1Qat, EtherType 0x22EA).
+/// Returns a vec of Talker Advertise, Talker Failed, and Listener declarations.
+/// Ignores Domain messages (type 4) and unknown types.
+pub fn parse_msrp(payload: &[u8]) -> Vec<MsrpDeclaration> {
+    let mut decls = Vec::new();
+    if payload.is_empty() || payload[0] != 0x00 { return decls; } // ProtocolVersion check
+
+    let mut pos = 1usize;
+    while pos < payload.len() {
+        let attr_type = payload[pos];
+        if attr_type == 0x00 { break; } // end-mark
+        if pos + 4 > payload.len() { break; }
+
+        let attr_len  = payload[pos + 1] as usize;
+        let list_len  = u16::from_be_bytes([payload[pos + 2], payload[pos + 3]]) as usize;
+        pos += 4;
+
+        // VectorHeader (2 bytes) + FirstValue (attr_len bytes)
+        if pos + 2 + attr_len > payload.len() { break; }
+        let first_value = &payload[pos + 2 .. pos + 2 + attr_len];
+
+        match attr_type {
+            1 if attr_len >= 25 => { // TalkerAdvertise
+                let stream_id: [u8; 8] = first_value[0..8].try_into().unwrap_or([0u8; 8]);
+                let dest_mac:  [u8; 6] = first_value[8..14].try_into().unwrap_or([0u8; 6]);
+                let vlan_id    = u16::from_be_bytes([first_value[14], first_value[15]]) & 0x0FFF;
+                let max_frame  = u16::from_be_bytes([first_value[16], first_value[17]]);
+                let max_frames = u16::from_be_bytes([first_value[18], first_value[19]]);
+                let priority   = (first_value[20] >> 5) & 0x07;
+                decls.push(MsrpDeclaration {
+                    decl_type: MsrpDeclType::TalkerAdvertise,
+                    stream_id,
+                    dest_mac: Some(dest_mac),
+                    vlan_id: Some(vlan_id),
+                    max_frame_size: Some(max_frame),
+                    max_interval_frames: Some(max_frames),
+                    priority: Some(priority),
+                    failure_code: None,
+                    listener_state: None,
+                });
+            }
+            2 if attr_len >= 34 => { // TalkerFailed
+                let stream_id: [u8; 8] = first_value[0..8].try_into().unwrap_or([0u8; 8]);
+                let dest_mac:  [u8; 6] = first_value[8..14].try_into().unwrap_or([0u8; 6]);
+                let vlan_id    = u16::from_be_bytes([first_value[14], first_value[15]]) & 0x0FFF;
+                let max_frame  = u16::from_be_bytes([first_value[16], first_value[17]]);
+                let max_frames = u16::from_be_bytes([first_value[18], first_value[19]]);
+                let priority   = (first_value[20] >> 5) & 0x07;
+                let failure    = first_value[28];
+                decls.push(MsrpDeclaration {
+                    decl_type: MsrpDeclType::TalkerFailed,
+                    stream_id,
+                    dest_mac: Some(dest_mac),
+                    vlan_id: Some(vlan_id),
+                    max_frame_size: Some(max_frame),
+                    max_interval_frames: Some(max_frames),
+                    priority: Some(priority),
+                    failure_code: Some(failure),
+                    listener_state: None,
+                });
+            }
+            3 if attr_len >= 9 => { // Listener
+                let stream_id: [u8; 8] = first_value[0..8].try_into().unwrap_or([0u8; 8]);
+                let state = first_value[8];
+                decls.push(MsrpDeclaration {
+                    decl_type: MsrpDeclType::Listener,
+                    stream_id,
+                    dest_mac: None,
+                    vlan_id: None,
+                    max_frame_size: None,
+                    max_interval_frames: None,
+                    priority: None,
+                    failure_code: None,
+                    listener_state: Some(state),
+                });
+            }
+            _ => {} // Domain (4) or unknown — skip
+        }
+
+        // Advance past VectorHeader + AttributeList
+        if list_len == 0 { break; }
+        pos += list_len;
+    }
+    decls
+}
+
+/// Parse an MVRP PDU (IEEE 802.1Q, EtherType 0x88F5).
+/// Returns the list of VLAN IDs being registered (deduped).
+pub fn parse_mvrp(payload: &[u8]) -> Vec<u16> {
+    let mut vlans: Vec<u16> = Vec::new();
+    if payload.is_empty() || payload[0] != 0x00 { return vlans; }
+
+    let mut pos = 1usize;
+    while pos < payload.len() {
+        let attr_type = payload[pos];
+        if attr_type == 0x00 { break; }
+        if pos + 4 > payload.len() { break; }
+
+        let attr_len = payload[pos + 1] as usize;
+        let list_len = u16::from_be_bytes([payload[pos + 2], payload[pos + 3]]) as usize;
+        pos += 4;
+
+        // VLAN ID: AttributeType=1, AttributeLength=2
+        if attr_type == 1 && attr_len == 2 && pos + 2 + 2 <= payload.len() {
+            let vid = u16::from_be_bytes([payload[pos + 2], payload[pos + 3]]) & 0x0FFF;
+            if vid > 0 && !vlans.contains(&vid) { vlans.push(vid); }
+        }
+
+        if list_len == 0 { break; }
+        pos += list_len;
+    }
+    vlans
+}
+
+// ═════════════════════════════════════════════════════════════════
 // SECTION 3 — PROTOCOL DETECTION (ETHERNET/IP/UDP)
 // ══════════════════════════════════════════════════════════
 
 /// Analyzes an Ethernet frame to determine the encapsulated AV protocol.
 pub fn detect_protocol(eth: &EthernetPacket) -> Option<AvProtocol> {
-    // ── AVB / AVTP : L2 pure (EtherType 0x22F0) ─────────
     let raw_et = u16::from_be_bytes([eth.packet()[12], eth.packet()[13]]);
+
+    // ── MSRP : L2 (EtherType 0x22EA) ────────────────────
+    if raw_et == crate::protocols::ETHERTYPE_MSRP {
+        let decls = parse_msrp(eth.payload());
+        if !decls.is_empty() {
+            return Some(AvProtocol::Msrp { declarations: decls });
+        }
+        return None;
+    }
+
+    // ── MVRP : L2 (EtherType 0x88F5) ────────────────────
+    if raw_et == crate::protocols::ETHERTYPE_MVRP {
+        let vlan_ids = parse_mvrp(eth.payload());
+        if !vlan_ids.is_empty() {
+            return Some(AvProtocol::Mvrp { vlan_ids });
+        }
+        return None;
+    }
+
+    // ── AVB / AVTP : L2 pure (EtherType 0x22F0) ─────────
     if raw_et == crate::protocols::ETHERTYPE_AVTP {
-        let subtype = eth.payload().first().copied().unwrap_or(0);
-        return Some(AvProtocol::Avb { subtype });
+        let subtype   = eth.payload().first().copied().unwrap_or(0);
+        let stream_id = parse_avtp_stream_id(eth.payload());
+        return Some(AvProtocol::Avb { subtype, stream_id });
     }
 
     // ── gPTP / AVB : L2 (EtherType 0x88F7) ──────────────────────
@@ -274,7 +420,7 @@ pub fn detect_protocol(eth: &EthernetPacket) -> Option<AvProtocol> {
     if dst_port == crate::protocols::PTP_EVENT_PORT || dst_port == crate::protocols::PTP_GENERAL_PORT || src_port == crate::protocols::PTP_EVENT_PORT || src_port == crate::protocols::PTP_GENERAL_PORT {
         if let Some(mut info) = parse_ptp(payload) {
             info.protocol_kind = Some(if info.version == crate::protocols::PTP_VERSION_V1 {
-                "Dante".to_string()
+                "PTPv1".to_string()
             } else {
                 "PTPv2".to_string()
             });
@@ -538,8 +684,9 @@ pub fn parse_ptp(payload: &[u8]) -> Option<PtpInfo> {
         return parse_ptp_v1(payload, hdr_shift);
     }
 
-    // PTPv2 — Announce is 64 bytes; shorter messages (Sync=44) are not yet parsed.
-    if payload.len() < 64 { return None; }
+    // Common header is 34 bytes — enough to identify domain, clock, and message type.
+    // Announce-specific fields (grandmaster) require 64 bytes and are guarded below.
+    if payload.len() < 34 { return None; }
 
     let message_type = payload[0] & 0x0F;
     let message_name = match message_type {
@@ -599,7 +746,7 @@ pub fn parse_ptp(payload: &[u8]) -> Option<PtpInfo> {
 
     // Parse grandmaster info (Announce messages)
     // PTPv1 (RFC 6188): version=0, clock_class at offset 48
-    let grandmaster_id = if message_type == 0x0B {
+    let grandmaster_id = if message_type == 0x0B && payload.len() >= 64 {
         Some(format!("{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
             payload[53], payload[54], payload[55], payload[56],
             payload[57], payload[58], payload[59], payload[60]))
@@ -607,7 +754,7 @@ pub fn parse_ptp(payload: &[u8]) -> Option<PtpInfo> {
         None
     };
 
-    let clock_quality = if message_type == 0x0B {
+    let clock_quality = if message_type == 0x0B && payload.len() >= 64 {
         let clock_class = payload[48];
         let clock_accuracy = payload[49];
         let log_var = u16::from_be_bytes([payload[50], payload[51]]);

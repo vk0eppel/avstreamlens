@@ -22,8 +22,8 @@ use std::net::Ipv4Addr;
 use std::time::{Duration, Instant};
 
 // Import types from modules
-use crate::protocols::{AvProtocol, SdpSession, DanteKind, NdiKind, St2110Type, IgmpType};
-use crate::stats::{StreamStats, TcpStreamStats, NetworkHealth, PtpStats};
+use crate::protocols::{AvProtocol, SdpSession, DanteKind, NdiKind, St2110Type, IgmpType, MsrpDeclType};
+use crate::stats::{StreamStats, TcpStreamStats, NetworkHealth, PtpStats, StreamQuality, AvtpStreamStats};
 use crate::parser::{detect_protocol, parse_tcp_packet, parse_rtp, parse_ts_refclk, is_multicast, is_aes67_multicast, is_st2110_multicast};
 use crate::report::{create_logger, print_report};
 
@@ -46,10 +46,14 @@ fn main() {
         .collect();
     let mut logger = create_logger(&protocol_names).expect("Unable to create log file");
 
-    println!("Selected protocols: {}", protocol_names);
-    logger.log(&format!("Selected protocols: {}", protocol_names));
-    println!("📡 Listening on {}", device.name);
-    logger.log(&format!("📡 Listening on {}", device.name));
+    let proto_display = cli::selected_protocol_display(&selected_protocols);
+    let banner = if proto_display == "all protocols" {
+        format!("📡 Listening on {}  —  all protocols", device.name)
+    } else {
+        format!("📡 Listening on {}  for {}  (+ PTP, IGMP)  streams", device.name, proto_display)
+    };
+    println!("{}", banner);
+    logger.log(&banner);
 
     // ── Opening capture with BPF filter ───────────────
     let mut cap = Capture::from_device(device.name.as_str())
@@ -73,11 +77,83 @@ fn main() {
     // NDI sender IPs learned from mDNS — used for IP-based stream detection
     // (official NDI SDK assigns ports dynamically, port-range matching is unreliable)
     let mut ndi_sources: std::collections::HashSet<Ipv4Addr> = std::collections::HashSet::new();
+    // Deduplicates IGMP Join console output — cleared on Leave so re-joins print again
+    let mut igmp_joins_seen: std::collections::HashSet<(Ipv4Addr, Ipv4Addr)> = std::collections::HashSet::new();
+    // AVB extended state
+    let mut avtp_streams: std::collections::HashMap<[u8; 8], AvtpStreamStats> = std::collections::HashMap::new();
+    let mut msrp_state:   std::collections::HashMap<[u8; 8], crate::protocols::MsrpDeclaration> = std::collections::HashMap::new();
+    let mut mvrp_vlans:   std::collections::HashSet<u16> = std::collections::HashSet::new();
     let mut bytes_this_window: u64 = 0;
     let mut last_report = Instant::now();
 
     // ── Capture loop ────────────────────────────────
     loop {
+        // Report check at the TOP of the loop so it fires even when cap.next_packet()
+        // times out (Err path hits `continue` and never reaches code below the read).
+        if last_report.elapsed() > Duration::from_secs(5) {
+            for stats in ptp_domains.values_mut() {
+                if stats.check_timeout() {
+                    logger.log(&format!(
+                        "❌ PTP Clock LOST (Domain {} v{}) [{}]",
+                        stats.domain,
+                        stats.version,
+                        stats.protocol_kind.as_deref().unwrap_or("?")
+                    ));
+                }
+            }
+            for sdp in sdp_cache.values() {
+                let session_active = sdp.media.iter().any(|m| {
+                    streams.values().any(|s| s.dst_port == m.port && s.packets > 0)
+                });
+                if !session_active { continue; }
+                for m in &sdp.media {
+                    if m.ts_refclk.is_empty() { continue; }
+                    let Some((claimed_gm, claimed_domain)) = parse_ts_refclk(&m.ts_refclk) else { continue };
+                    let entry = ptp_domains.get(&(claimed_domain, protocols::PTP_VERSION_V2))
+                        .or_else(|| ptp_domains.get(&(claimed_domain, protocols::PTP_VERSION_V1)));
+                    match entry {
+                        None => {
+                            let alert = format!(
+                                "⚠  SDP \"{}\" claims PTP domain {} but no PTP traffic detected",
+                                sdp.session_name, claimed_domain
+                            );
+                            println!("\x1b[33m{}\x1b[0m", alert);
+                            logger.log(&alert);
+                        }
+                        Some(ptp) if ptp.clock_valid => {
+                            if let Some(ref active_gm) = ptp.last_grandmaster
+                                && *active_gm != claimed_gm
+                            {
+                                let alert = format!(
+                                    "⚠  PTP grandmaster mismatch for SDP \"{}\": claims {} (domain {}), active is {}",
+                                    sdp.session_name, claimed_gm, claimed_domain, active_gm
+                                );
+                                println!("\x1b[33m{}\x1b[0m", alert);
+                                logger.log(&alert);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            network_health.calculate_score(&streams, &tcp_streams, &ptp_domains, &msrp_state);
+            let requires_valid_ptp = cli::protocol_requires_ptp(&selected_protocols);
+            print_report(&streams, &tcp_streams, &ptp_domains, requires_valid_ptp, &mut logger, &network_health, bytes_this_window, &avtp_streams, &msrp_state, &mvrp_vlans);
+            bytes_this_window = 0;
+            last_report = Instant::now();
+            streams.retain(|_, s| {
+                s.last_packet_time
+                    .map_or(true, |t| t.elapsed().as_secs() < STREAM_TIMEOUT_SECS * 2)
+            });
+            tcp_streams.retain(|_, s| {
+                s.last_seen.elapsed().as_secs() < STREAM_TIMEOUT_SECS * 2
+                    && !matches!(s.stream_quality, StreamQuality::Terminated)
+            });
+            avtp_streams.retain(|_, s| {
+                s.last_seen.elapsed().as_secs() < STREAM_TIMEOUT_SECS * 2
+            });
+        }
+
         let packet = match cap.next_packet() { Ok(p) => p, Err(_) => continue };
         let eth    = match EthernetPacket::new(packet.data) { Some(e) => e, _ => continue };
         let now    = Instant::now();
@@ -215,10 +291,53 @@ fn main() {
                     }
 
                     // ── AVB ──────────────────────────────────────
-                    AvProtocol::Avb { subtype } => {
+                    AvProtocol::Avb { subtype, stream_id } => {
                         let stats = streams.entry(format!("AVB subtype=0x{:02X}", subtype))
                             .or_insert_with(|| StreamStats::new("AVB", 0.0));
                         stats.packets += 1;
+                        stats.last_packet_time = Some(now);
+                        if let Some(sid) = stream_id {
+                            let entry = avtp_streams.entry(sid)
+                                .or_insert_with(|| AvtpStreamStats::new(sid, subtype));
+                            entry.packets += 1;
+                            entry.last_seen = now;
+                        }
+                    }
+
+                    // ── MSRP ─────────────────────────────────────
+                    AvProtocol::Msrp { declarations } => {
+                        for decl in declarations {
+                            if matches!(decl.decl_type, MsrpDeclType::TalkerFailed) {
+                                let code_str = match decl.failure_code {
+                                    Some(1) => " (insufficient bandwidth)",
+                                    Some(2) => " (insufficient bridge resources)",
+                                    Some(3) => " (insufficient bandwidth for Traffic Class)",
+                                    Some(n) => { let _ = n; " (failure)" }
+                                    None    => "",
+                                };
+                                let id = &decl.stream_id;
+                                let alert = format!(
+                                    "⚠  MSRP Talker Failed: {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:04x}{}",
+                                    id[0], id[1], id[2], id[3], id[4], id[5],
+                                    u16::from_be_bytes([id[6], id[7]]),
+                                    code_str
+                                );
+                                println!("\x1b[33m{}\x1b[0m", alert);
+                                logger.log(&alert);
+                            }
+                            msrp_state.insert(decl.stream_id, decl);
+                        }
+                    }
+
+                    // ── MVRP ─────────────────────────────────────
+                    AvProtocol::Mvrp { vlan_ids } => {
+                        for vid in vlan_ids {
+                            if mvrp_vlans.insert(vid) {
+                                let msg = format!("🔖 MVRP: VLAN {} registered", vid);
+                                println!("{}", msg);
+                                logger.log(&msg);
+                            }
+                        }
                     }
 
                     // ── SRT ──────────────────────────────────────
@@ -258,25 +377,37 @@ fn main() {
 
                     // ── IGMP ─────────────────────────────────────
                     AvProtocol::Igmp { src, group, igmp_type } => {
-                        let (icon, label) = match &igmp_type {
-                            IgmpType::Join       => ("➕", "Join"),
-                            IgmpType::Leave      => ("➖", "Leave"),
-                            IgmpType::Query      => ("❓", "Query"),
-                            IgmpType::Unknown(_) => ("❔", "Unknown")
-                        };
-                        let msg = format!("{} IGMP {}: {} → group {}", icon, label, src, group);
-                        println!("{}", msg);
-                        logger.log(&msg);
-                        if matches!(igmp_type, IgmpType::Query) {
-                            network_health.last_igmp_query = Some(now);
-                        }
-                        if matches!(igmp_type, IgmpType::Leave) {
-                            for key in streams.keys() {
-                                if streams[key].dst_ip == Some(group) {
-                                    let alert = format!("    ⚠  IGMP Leave on monitored group {}", group);
-                                    println!("\x1b[33m{}\x1b[0m", alert);
-                                    logger.log(&alert);
+                        match &igmp_type {
+                            IgmpType::Join => {
+                                if igmp_joins_seen.insert((src, group)) {
+                                    let msg = format!("➕ IGMP Join: {} → group {}", src, group);
+                                    println!("{}", msg);
+                                    logger.log(&msg);
                                 }
+                            }
+                            IgmpType::Leave => {
+                                igmp_joins_seen.remove(&(src, group));
+                                let msg = format!("➖ IGMP Leave: {} → group {}", src, group);
+                                println!("{}", msg);
+                                logger.log(&msg);
+                                for key in streams.keys() {
+                                    if streams[key].dst_ip == Some(group) {
+                                        let alert = format!("    ⚠  IGMP Leave on monitored group {}", group);
+                                        println!("\x1b[33m{}\x1b[0m", alert);
+                                        logger.log(&alert);
+                                    }
+                                }
+                            }
+                            IgmpType::Query => {
+                                network_health.last_igmp_query = Some(now);
+                                let msg = format!("❓ IGMP Query: {} → group {}", src, group);
+                                println!("{}", msg);
+                                logger.log(&msg);
+                            }
+                            IgmpType::Unknown(t) => {
+                                let msg = format!("❔ IGMP Unknown(0x{:02x}): {} → group {}", t, src, group);
+                                println!("{}", msg);
+                                logger.log(&msg);
                             }
                         }
                     }
@@ -369,69 +500,5 @@ fn main() {
             }
         }
 
-        // ── Report every 5 seconds ────────────────
-        if last_report.elapsed() > Duration::from_secs(5) {
-            // Check for lost PTP clocks before printing the report.
-            // Must run here — update() is only called on packet arrival so it
-            // cannot detect loss when the grandmaster has gone silent.
-            for stats in ptp_domains.values_mut() {
-                if stats.check_timeout() {
-                    logger.log(&format!(
-                        "❌ PTP Clock LOST (Domain {} v{}) [{}]",
-                        stats.domain,
-                        stats.version,
-                        stats.protocol_kind.as_deref().unwrap_or("?")
-                    ));
-                }
-            }
-            // ── ts-refclk vs active grandmaster cross-check ──────────────────
-            // Only runs when at least one stream port from the SDP session has been seen,
-            // to avoid false alerts for announced-but-not-yet-active sessions.
-            for sdp in sdp_cache.values() {
-                let session_active = sdp.media.iter().any(|m| {
-                    streams.values().any(|s| s.dst_port == m.port && s.packets > 0)
-                });
-                if !session_active { continue; }
-
-                for m in &sdp.media {
-                    if m.ts_refclk.is_empty() { continue; }
-                    let Some((claimed_gm, claimed_domain)) = parse_ts_refclk(&m.ts_refclk) else { continue };
-
-                    // Try PTPv2 first, then PTPv1
-                    let entry = ptp_domains.get(&(claimed_domain, protocols::PTP_VERSION_V2))
-                        .or_else(|| ptp_domains.get(&(claimed_domain, protocols::PTP_VERSION_V1)));
-
-                    match entry {
-                        None => {
-                            let alert = format!(
-                                "⚠  SDP \"{}\" claims PTP domain {} but no PTP traffic detected",
-                                sdp.session_name, claimed_domain
-                            );
-                            println!("\x1b[33m{}\x1b[0m", alert);
-                            logger.log(&alert);
-                        }
-                        Some(ptp) if ptp.clock_valid => {
-                            if let Some(ref active_gm) = ptp.last_grandmaster
-                                && *active_gm != claimed_gm
-                            {
-                                let alert = format!(
-                                    "⚠  PTP grandmaster mismatch for SDP \"{}\": claims {} (domain {}), active is {}",
-                                    sdp.session_name, claimed_gm, claimed_domain, active_gm
-                                );
-                                println!("\x1b[33m{}\x1b[0m", alert);
-                                logger.log(&alert);
-                            }
-                        }
-                        _ => {} // clock not yet valid — GRANDMASTER LOST already alerted
-                    }
-                }
-            }
-
-            network_health.calculate_score(&streams, &tcp_streams);
-            let requires_valid_ptp = cli::protocol_requires_ptp(&selected_protocols);
-            print_report(&streams, &tcp_streams, &ptp_domains, requires_valid_ptp, &mut logger, &network_health, bytes_this_window);
-            bytes_this_window = 0;
-            last_report = Instant::now();
-        }
     }
 }
