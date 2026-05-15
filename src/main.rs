@@ -340,41 +340,6 @@ fn main() {
                         }
                     }
 
-                    // ── SRT ──────────────────────────────────────
-                    AvProtocol::Srt { src, dst, dst_port, is_handshake }
-                        if !ndi_sources.contains(&src) && !ndi_sources.contains(&dst) => {
-                        let key = format!("SRT {}:{}", src, dst_port);
-                        let stats = streams.entry(key)
-                            .or_insert_with(|| StreamStats::new("SRT", 0.0));
-                        stats.packets += 1;
-                        stats.last_packet_time = Some(now);
-                        if is_handshake {
-                            let msg = format!("🤝 SRT handshake: {} → port {}", src, dst_port);
-                            println!("{}", msg);
-                            logger.log(&msg);
-                        }
-                    }
-
-                    // ── RIST ─────────────────────────────────────
-                    AvProtocol::Rist { src, dst, dst_port }
-                        if !ndi_sources.contains(&src) && !ndi_sources.contains(&dst) => {
-                        let key = format!("RIST {}:{}", dst, dst_port);
-                        let stats = streams.entry(key)
-                            .or_insert_with(|| {
-                                let mut s = StreamStats::new_with_info("RIST", DEFAULT_CLOCK_HZ, is_multicast(dst), dst, dst_port);
-                                s.media_type = "video".to_string();
-                                s
-                            });
-                        if let Some(ip) = pnet_packet::ipv4::Ipv4Packet::new(eth.payload()) {
-                            if let Some(udp) = pnet_packet::udp::UdpPacket::new(ip.payload()) {
-                                if let Some((seq, ts, ssrc)) = parse_rtp(udp.payload()) {
-                                    stats.update(seq, ts, ssrc, udp.payload().len());
-                                }
-                            }
-                        }
-                        let _ = src;
-                    }
-
                     // ── IGMP ─────────────────────────────────────
                     AvProtocol::Igmp { src, group, igmp_type } => {
                         match &igmp_type {

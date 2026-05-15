@@ -85,8 +85,6 @@ pub fn print_report(
         ("Dante",  |p| p == "Dante"),
         ("NDI",    |p| p == "NDI"),
         ("AVB",    |p| p == "AVB"),
-        ("SRT",    |p| p == "SRT"),
-        ("RIST",   |p| p == "RIST"),
     ];
 
     let mut proto_parts: Vec<String> = protocol_groups.iter()

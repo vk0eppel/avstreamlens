@@ -429,33 +429,6 @@ pub fn detect_protocol(eth: &EthernetPacket) -> Option<AvProtocol> {
         }
     }
 
-    // ── SRT handshake detection ───────────────────────────
-    if payload.len() >= 16 {
-        let is_control = (payload[0] & 0x80) != 0;
-        if is_control {
-            let ctrl_type = u16::from_be_bytes([payload[0] & 0x7F, payload[1]]);
-            if ctrl_type == 0x0000 {
-                // Type 0 = Handshake SRT
-                let is_handshake = payload.len() >= 20;
-                return Some(AvProtocol::Srt { src: src_ip, dst: dst_ip, dst_port, is_handshake });
-            }
-        }
-    }
-
-    // ── RIST detection ───────────────────────────────────
-    // RIST carries MPEG-2 TS encapsulated in RTP; PT must be exactly 33 (MP2T).
-    // Using pt >= 33 was too broad and caused false positives on NDI and other protocols.
-    if (crate::protocols::RIST_PORT_BASE..5999).contains(&dst_port) && dst_port % 2 == 0
-        && !is_aes67_multicast(dst_ip) && !is_st2110_multicast(dst_ip)
-    {
-        if payload.len() >= 12 && (payload[0] >> 6) & 0b11 == 2 {
-            let pt = payload[1] & 0x7F;
-            if pt == 33 {
-                return Some(AvProtocol::Rist { src: src_ip, dst: dst_ip, dst_port: dst_port });
-            }
-        }
-    }
-
     // ── RTP Streams ─────────────────────────────────────────
     if payload.len() < 12 { return None; }
     if (payload[0] >> 6) & 0b11 != 2 { return None; }

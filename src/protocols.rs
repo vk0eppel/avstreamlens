@@ -8,7 +8,6 @@ use std::net::Ipv4Addr;
 // Port numbers and UDP/TCP ports
 pub const SAP_PORT:          u16 = 9875;   // SAP/SDP metadata
 pub const MDNS_PORT:         u16 = 5353;   // mDNS discovery (Dante)
-pub const RIST_PORT_BASE:    u16 = 5000;   // RIST base port
 pub const PTP_EVENT_PORT:    u16 = 319;    // PTP event port (Sync, Delay_Req, P_Delay_Req)
 pub const PTP_GENERAL_PORT:  u16 = 320;    // PTP general port (Announce, Follow_Up, Management)
 
@@ -32,9 +31,6 @@ pub const DEFAULT_CLOCK_HZ: f64 = 48_000.0;
 pub const PTP_VERSION_V1: u8 = 1;  // IEEE 1588-2002 wire value (high nibble of byte 0)
 pub const PTP_VERSION_V2: u8 = 2;  // IEEE 1588-2008 wire value (low nibble of byte 1)
 
-// SRT magic number for handshake detection
-pub const SRT_MAGIC:         u32 = 0x00000004;
-
 // Dante control ports
 pub const DANTE_CTRL_PORTS: &[u16] = &[4440, 4455, 8700, 8800];
 
@@ -55,9 +51,6 @@ pub enum AvProtocol {
     Mvrp   { vlan_ids: Vec<u16> },
     Sap    { src: Ipv4Addr, sdp: SdpSession },
     Ptp    { info: PtpInfo },
-    // ── Nouveaux protocoles ──
-    Srt    { src: Ipv4Addr, dst: Ipv4Addr, dst_port: u16, is_handshake: bool },
-    Rist   { src: Ipv4Addr, dst: Ipv4Addr, dst_port: u16 },
     Igmp   { src: Ipv4Addr, group: Ipv4Addr, igmp_type: IgmpType },
 }
 
@@ -96,15 +89,13 @@ pub struct PtpInfo {
 pub enum ProtocolChoice {
     All,            // Monitor all standard AV protocols (PTP/IGMP always active)
     AES67,          // Audio over RTP
-    Audio,          // Audio streams (AES67 + Dante + AVB + RIST)
-    Video,          // Video streams (ST2110 + NDI + SRT + RIST)
+    Audio,          // Audio streams (AES67 + Dante + AVB)
+    Video,          // Video streams (ST2110 + NDI)
     ST2110,         // SMPTE ST 2110
     Dante,          // Dante digital audio
-    NDI,            // Newtek Display
+    NDI,            // NDI (NewTek/Vizrt)
     AVB,            // Audio Video Bridging
     PTP,            // Precision Time Protocol
-    SRT,            // Reliable Transport
-    RIST,           // Robust Real-time Transport
     IGMP,           // IGMP membership
 }
 
@@ -114,15 +105,13 @@ impl ProtocolChoice {
         match self {
             ProtocolChoice::All   => "All",
             ProtocolChoice::AES67 => "AES67",
-            ProtocolChoice::Audio => "Audio (AES67 + Dante + RIST)",
-            ProtocolChoice::Video => "Video (ST2110 + NDI + SRT + RIST)",
+            ProtocolChoice::Audio => "Audio (AES67 + Dante + AVB)",
+            ProtocolChoice::Video => "Video (ST2110 + NDI)",
             ProtocolChoice::ST2110 => "ST2110",
             ProtocolChoice::Dante => "Dante",
             ProtocolChoice::NDI   => "NDI",
             ProtocolChoice::AVB   => "AVB",
             ProtocolChoice::PTP   => "PTP",
-            ProtocolChoice::SRT   => "SRT",
-            ProtocolChoice::RIST  => "RIST",
             ProtocolChoice::IGMP  => "IGMP",
         }
     }
@@ -130,8 +119,7 @@ impl ProtocolChoice {
     /// Does this protocol require UDP packets?
     pub fn needs_udp(&self) -> bool {
         matches!(self, ProtocolChoice::AES67 | ProtocolChoice::Audio | ProtocolChoice::Video
-            | ProtocolChoice::ST2110 | ProtocolChoice::Dante | ProtocolChoice::NDI 
-            | ProtocolChoice::SRT | ProtocolChoice::RIST)
+            | ProtocolChoice::ST2110 | ProtocolChoice::Dante | ProtocolChoice::NDI)
     }
 
     /// Does this protocol require TCP packets?
@@ -169,8 +157,6 @@ impl ProtocolChoice {
             ProtocolChoice::Dante,
             ProtocolChoice::NDI,
             ProtocolChoice::ST2110,
-            ProtocolChoice::SRT,
-            ProtocolChoice::RIST,
         ]
     }
 
@@ -181,13 +167,10 @@ impl ProtocolChoice {
                 ProtocolChoice::AES67,
                 ProtocolChoice::Dante,
                 ProtocolChoice::AVB,
-                ProtocolChoice::RIST,
             ],
             ProtocolChoice::Video => vec![
                 ProtocolChoice::ST2110,
                 ProtocolChoice::NDI,
-                ProtocolChoice::SRT,
-                ProtocolChoice::RIST,
             ],
             other => vec![other.clone()],
         }
@@ -207,8 +190,6 @@ impl AvProtocol {
             AvProtocol::Avb    { .. }
             | AvProtocol::Msrp { .. }
             | AvProtocol::Mvrp { .. } => expanded.iter().any(|c| matches!(c, ProtocolChoice::AVB)),
-            AvProtocol::Srt    { .. } => expanded.iter().any(|c| matches!(c, ProtocolChoice::SRT)),
-            AvProtocol::Rist   { .. } => expanded.iter().any(|c| matches!(c, ProtocolChoice::RIST)),
             AvProtocol::Ptp { .. } | AvProtocol::Igmp { .. } | AvProtocol::Sap { .. } => true,
         }
     }
