@@ -433,9 +433,14 @@ pub fn detect_protocol(eth: &EthernetPacket) -> Option<AvProtocol> {
     if payload.len() < 12 { return None; }
     if (payload[0] >> 6) & 0b11 != 2 { return None; }
 
-    // Note: timestamp diff validation will be added when needed
     let payload_type = payload[1] & 0x7F;
-    // Check for AES67/ST2110 multicast patterns first (overlapping with RIST)
+
+    // Dante port check first — takes priority over IP-based multicast classification.
+    // Dante multicast uses 239.x.x.x addresses (typically 239.255.*) which would otherwise
+    // be misclassified as ST2110. Both src AND dst must be in 5000–6000 (even).
+    if is_likely_dante_audio(src_port, dst_port, payload_type) {
+        return Some(AvProtocol::Dante { kind: DanteKind::AudioStream, src: src_ip, dst_port });
+    }
     if is_aes67_multicast(dst_ip) {
         return Some(AvProtocol::Aes67 { src: src_ip, dst: dst_ip, dst_port, payload_type });
     }
@@ -444,10 +449,6 @@ pub fn detect_protocol(eth: &EthernetPacket) -> Option<AvProtocol> {
             src: src_ip, dst: dst_ip, dst_port,
             stream_type: classify_st2110(payload_type, dst_port),
         });
-    }
-    // Dante audio streams have specific port and payload type patterns, even if unicast
-    if is_likely_dante_audio(src_port, dst_port, payload_type) {
-        return Some(AvProtocol::Dante { kind: DanteKind::AudioStream, src: src_ip, dst_port });
     }
 
     None

@@ -43,7 +43,7 @@ Lint: `cargo clippy -- -D warnings`
 - Grandmaster detection fires on any PtpInfo with grandmaster_id set (PTPv2: Announce ≥64b, PTPv1: Sync)
 - Alerts show: GRANDMASTER DETECTED/CHANGED/LOST per protocol
 - Clock loss detected via `PtpStats::check_timeout()` called from the 5-second report loop — NOT inside `update()`, which only runs on packet arrival and cannot detect silence
-- Detection order: MSRP → MVRP → AVTP/AVB → gPTP → IGMP → SAP → mDNS → Dante control → UDP PTP → SRT → RIST → RTP gate → AES67 → ST2110 → Dante audio; UDP PTP must precede the RTP gate
+- Detection order: MSRP → MVRP → AVTP/AVB → gPTP → IGMP → SAP → mDNS → Dante control → UDP PTP → RTP gate → **Dante audio** → AES67 → ST2110; Dante port check is before AES67/ST2110 so that multicast Dante streams (239.255.x.x) are not misclassified as ST2110
 - Protocol association via multicast IP (239.69.*=AES67, other 239.x.x.x=ST2110)
 - PTP, IGMP, and SAP are always processed regardless of user protocol selection; all other protocols are gated by `AvProtocol::is_selected()` in `protocols.rs`
 - BPF filter includes `tcp` for NDI (only protocol using TCP); `all_protocols_filter` also includes `tcp`
