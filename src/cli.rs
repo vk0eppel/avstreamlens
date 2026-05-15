@@ -14,7 +14,8 @@ pub fn select_interface() -> Device {
         .filter(|d| {
             let n = d.name.as_str();
             if n == "lo" || n == "lo0" { return false; }
-            let skip = ["utun", "awdl", "llw", "bridge", "vpn", "docker", "veth", "virbr"];
+            let skip = ["utun", "awdl", "llw", "bridge", "vpn", "docker", "veth", "virbr",
+                        "ap1", "anpi", "gif", "stf"];
             !skip.iter().any(|k| n.contains(k))
         })
         .collect();
@@ -24,9 +25,28 @@ pub fn select_interface() -> Device {
         std::process::exit(1);
     }
 
+    let port_names = macos_port_names();
+
     println!("📡 Available interfaces:\n");
     for (i, d) in filtered.iter().enumerate() {
-        println!("  {}: {}", i, d.name);
+        let desc = port_names.get(&d.name)
+            .map(|s| s.as_str())
+            .or(d.desc.as_deref())
+            .unwrap_or("");
+        let ipv4 = d.addresses.iter()
+            .filter_map(|a| match a.addr {
+                std::net::IpAddr::V4(ip) => Some(ip.to_string()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        let info = match (desc.is_empty(), ipv4.is_empty()) {
+            (false, false) => format!("  —  {}  ({})", desc, ipv4),
+            (false, true)  => format!("  —  {}  (no IPv4)", desc),
+            (true,  false) => format!("  —  {}", ipv4),
+            (true,  true)  => String::new(),
+        };
+        println!("  {}: {}{}", i, d.name, info);
     }
 
     println!("\n👉 Choose an interface by its number:");
@@ -141,6 +161,31 @@ pub fn protocol_requires_ptp(selected: &[ProtocolChoice]) -> bool {
         return true;
     }
     expanded.iter().any(|c| c.requires_valid_ptp_clock())
+}
+
+/// Query macOS for human-readable hardware port names (e.g. "Wi-Fi", "Thunderbolt Ethernet Slot 1").
+/// Returns an empty map on Linux or if networksetup is unavailable.
+fn macos_port_names() -> std::collections::HashMap<String, String> {
+    let mut map = std::collections::HashMap::new();
+    let Ok(out) = std::process::Command::new("networksetup")
+        .arg("-listallhardwareports")
+        .output()
+    else {
+        return map;
+    };
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut current_port = String::new();
+    for line in text.lines() {
+        if let Some(port) = line.strip_prefix("Hardware Port: ") {
+            current_port = port.trim().to_string();
+        } else if let Some(dev) = line.strip_prefix("Device: ") {
+            let dev = dev.trim().to_string();
+            if !dev.is_empty() && !current_port.is_empty() {
+                map.insert(dev, std::mem::take(&mut current_port));
+            }
+        }
+    }
+    map
 }
 
 fn all_protocols_filter() -> String {
