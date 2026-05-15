@@ -16,6 +16,7 @@ pub const ETHERTYPE_AVTP:    u16 = 0x22F0; // AVTP (AVB)
 pub const ETHERTYPE_PTP:     u16 = 0x88F7; // PTP (IEEE 1588)
 pub const ETHERTYPE_MSRP:    u16 = 0x22EA; // MSRP — IEEE 802.1Qat stream reservation
 pub const ETHERTYPE_MVRP:    u16 = 0x88F5; // MVRP — IEEE 802.1Q VLAN registration
+pub const ETHERTYPE_LLDP:    u16 = 0x88CC; // LLDP — IEEE 802.1AB link layer discovery
 
 // IGMP protocol number
 pub const IP_PROTO_IGMP:     u8  = 0x02;
@@ -52,6 +53,7 @@ pub enum AvProtocol {
     Sap    { src: Ipv4Addr, sdp: SdpSession },
     Ptp    { info: PtpInfo },
     Igmp   { src: Ipv4Addr, group: Ipv4Addr, igmp_type: IgmpType },
+    LldpEee { chassis_id: String, port_id: String, tx_wake_us: u16, rx_wake_us: u16 },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -190,7 +192,8 @@ impl AvProtocol {
             AvProtocol::Avb    { .. }
             | AvProtocol::Msrp { .. }
             | AvProtocol::Mvrp { .. } => expanded.iter().any(|c| matches!(c, ProtocolChoice::AVB)),
-            AvProtocol::Ptp { .. } | AvProtocol::Igmp { .. } | AvProtocol::Sap { .. } => true,
+            AvProtocol::Ptp { .. } | AvProtocol::Igmp { .. } | AvProtocol::Sap { .. }
+            | AvProtocol::LldpEee { .. } => true,
         }
     }
 }

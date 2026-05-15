@@ -83,6 +83,8 @@ fn main() {
     let mut avtp_streams: std::collections::HashMap<[u8; 8], AvtpStreamStats> = std::collections::HashMap::new();
     let mut msrp_state:   std::collections::HashMap<[u8; 8], crate::protocols::MsrpDeclaration> = std::collections::HashMap::new();
     let mut mvrp_vlans:   std::collections::HashSet<u16> = std::collections::HashSet::new();
+    // EEE detection: keyed by (chassis_id, port_id) → (tx_wake_us, rx_wake_us)
+    let mut eee_ports:    std::collections::HashMap<(String, String), (u16, u16)> = std::collections::HashMap::new();
     let mut bytes_this_window: u64 = 0;
     let mut last_report = Instant::now();
 
@@ -136,9 +138,9 @@ fn main() {
                     }
                 }
             }
-            network_health.calculate_score(&streams, &tcp_streams, &ptp_domains, &msrp_state);
+            network_health.calculate_score(&streams, &tcp_streams, &ptp_domains, &msrp_state, &eee_ports);
             let requires_valid_ptp = cli::protocol_requires_ptp(&selected_protocols);
-            print_report(&streams, &tcp_streams, &ptp_domains, requires_valid_ptp, &mut logger, &network_health, bytes_this_window, &avtp_streams, &msrp_state, &mvrp_vlans);
+            print_report(&streams, &tcp_streams, &ptp_domains, requires_valid_ptp, &mut logger, &network_health, bytes_this_window, &avtp_streams, &msrp_state, &mvrp_vlans, &eee_ports);
             bytes_this_window = 0;
             last_report = Instant::now();
             streams.retain(|_, s| {
@@ -337,6 +339,19 @@ fn main() {
                                 println!("{}", msg);
                                 logger.log(&msg);
                             }
+                        }
+                    }
+
+                    // ── LLDP / EEE ───────────────────────────────
+                    AvProtocol::LldpEee { chassis_id, port_id, tx_wake_us, rx_wake_us } => {
+                        let key = (chassis_id.clone(), port_id.clone());
+                        if eee_ports.insert(key, (tx_wake_us, rx_wake_us)).is_none() {
+                            let alert = format!(
+                                "⚠  EEE active on switch port \"{}\" (chassis {})  —  Tx wake: {}µs  Rx wake: {}µs  —  disable EEE for AV reliability",
+                                port_id, chassis_id, tx_wake_us, rx_wake_us
+                            );
+                            println!("\x1b[33m{}\x1b[0m", alert);
+                            logger.log(&alert);
                         }
                     }
 

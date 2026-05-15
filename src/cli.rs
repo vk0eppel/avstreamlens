@@ -100,6 +100,8 @@ pub fn build_bpf_filter(selected: &[ProtocolChoice]) -> String {
     if needs_udp { filters.push("udp".to_string()); }
     if needs_tcp { filters.push("tcp".to_string()); }
     if needs_avb { filters.push("(ether proto 0x22f0) or (ether proto 0x22ea) or (ether proto 0x88f5)".to_string()); }
+    // LLDP is always included — EEE detection is infrastructure-level, not protocol-specific
+    filters.push("(ether proto 0x88cc)".to_string());
     if needs_ptp { filters.push("(ether proto 0x88f7)".to_string()); }
 
     if filters.len() == 1 {
@@ -142,5 +144,5 @@ pub fn protocol_requires_ptp(selected: &[ProtocolChoice]) -> bool {
 }
 
 fn all_protocols_filter() -> String {
-    "igmp or udp or tcp or (ether proto 0x22f0) or (ether proto 0x22ea) or (ether proto 0x88f5) or (ether proto 0x88f7)".to_string()
+    "igmp or udp or tcp or (ether proto 0x22f0) or (ether proto 0x22ea) or (ether proto 0x88f5) or (ether proto 0x88f7) or (ether proto 0x88cc)".to_string()
 }

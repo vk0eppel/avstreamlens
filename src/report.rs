@@ -32,13 +32,6 @@ impl Logger {
         let _ = writeln!(self.file, "{}", message);
     }
 
-    /// Log a formatted message to the file.
-    #[allow(dead_code)]
-    pub fn log_fmt(&mut self, args: std::fmt::Arguments) {
-        use std::io::Write;
-        let message = args.to_string();
-        let _ = writeln!(self.file, "{}", message);
-    }
 }
 
 /// Create a new logger
@@ -64,6 +57,7 @@ pub fn print_report(
     avtp_streams: &HashMap<[u8; 8], AvtpStreamStats>,
     msrp_state: &HashMap<[u8; 8], MsrpDeclaration>,
     mvrp_vlans: &std::collections::HashSet<u16>,
+    eee_ports: &std::collections::HashMap<(String, String), (u16, u16)>,
 ) {
     let now = Local::now();
     let timestamp = now.format("%Y-%m-%d %H:%M:%S").to_string();
@@ -400,6 +394,14 @@ pub fn print_report(
                 println!("{}", quality_line);
             }
 
+            if let Some(offset_ns) = stats.last_offset_ns {
+                if offset_ns != 0 {
+                    let offset_line = format!("      offset: {} ns", offset_ns);
+                    logger.log(&offset_line);
+                    println!("{}", offset_line);
+                }
+            }
+
             if stats.protocol_clock_lost {
                 let alert = "      ⚠  Clock lost — grandmaster disappeared";
                 logger.log(alert);
@@ -447,6 +449,20 @@ pub fn print_report(
     let breakdown = format!("\n   {}  |  {}", qos_str, querier_str);
     logger.log(&breakdown);
     println!("{}", breakdown);
+
+    if !eee_ports.is_empty() {
+        let eee_alert = format!(
+            "   ⚠  EEE active on {} switch port(s) — may cause audio/video glitches  (disable EEE on all AV switch ports)",
+            eee_ports.len()
+        );
+        logger.log(&eee_alert);
+        println!("\x1b[33m{}\x1b[0m", eee_alert);
+        for ((chassis, port), (tx, rx)) in eee_ports.iter() {
+            let detail = format!("      port \"{}\"  chassis {}  Tx wake: {}µs  Rx wake: {}µs", port, chassis, tx, rx);
+            logger.log(&detail);
+            println!("{}", detail);
+        }
+    }
 
     logger.log("");
 }

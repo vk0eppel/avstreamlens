@@ -188,6 +188,86 @@ pub fn parse_sdp(sdp: &str) -> SdpSession {
 }
 
 // ═════════════════════════════════════════════════════════════════
+// SECTION 2a — LLDP / EEE PARSER
+// ═════════════════════════════════════════════════════════════════
+
+/// Parse an LLDP frame (EtherType 0x88CC) looking for the IEEE 802.3az EEE TLV.
+///
+/// LLDP TLV encoding: `[type(7 bits) | length(9 bits)][value]`
+/// EEE TLV: type=127 (org-specific), OUI=00-12-0F, subtype=0x05
+/// Value layout: Tw_sys_tx(2) Tw_sys_rx(2) Fallback_tw(2) Tx_tw_echo(2) Rx_tw_echo(2)
+///
+/// Returns Some only when EEE TLV is present and at least one wake-up time is non-zero.
+pub fn parse_lldp_eee(payload: &[u8]) -> Option<crate::protocols::AvProtocol> {
+    let mut pos = 0usize;
+    let mut chassis_id = String::new();
+    let mut port_id    = String::new();
+    let mut tx_wake: u16 = 0;
+    let mut rx_wake: u16 = 0;
+    let mut eee_found  = false;
+
+    while pos + 2 <= payload.len() {
+        let header  = u16::from_be_bytes([payload[pos], payload[pos + 1]]);
+        let tlv_type   = (header >> 9) as u8;
+        let tlv_len    = (header & 0x01FF) as usize;
+        pos += 2;
+
+        if tlv_type == 0 { break; } // End of LLDPDU
+        if pos + tlv_len > payload.len() { break; }
+
+        let value = &payload[pos..pos + tlv_len];
+
+        match tlv_type {
+            1 => { // Chassis ID
+                if tlv_len >= 2 {
+                    chassis_id = format_lldp_id(&value[1..]);
+                }
+            }
+            2 => { // Port ID
+                if tlv_len >= 2 {
+                    port_id = format_lldp_id(&value[1..]);
+                }
+            }
+            127 if tlv_len >= 4 => { // Organizationally Specific
+                let oui     = (value[0] as u32) << 16 | (value[1] as u32) << 8 | value[2] as u32;
+                let subtype = value[3];
+                // IEEE 802.3 OUI = 0x00120F, EEE subtype = 0x05
+                if oui == 0x00120F && subtype == 0x05 && tlv_len >= 14 {
+                    tx_wake   = u16::from_be_bytes([value[4],  value[5]]);
+                    rx_wake   = u16::from_be_bytes([value[6],  value[7]]);
+                    eee_found = true;
+                }
+            }
+            _ => {}
+        }
+
+        pos += tlv_len;
+    }
+
+    if eee_found && (tx_wake > 0 || rx_wake > 0) {
+        Some(crate::protocols::AvProtocol::LldpEee {
+            chassis_id,
+            port_id,
+            tx_wake_us: tx_wake,
+            rx_wake_us: rx_wake,
+        })
+    } else {
+        None
+    }
+}
+
+fn format_lldp_id(bytes: &[u8]) -> String {
+    // Try UTF-8 first (port descriptions are often ASCII)
+    if let Ok(s) = std::str::from_utf8(bytes) {
+        if s.chars().all(|c| c.is_ascii_graphic() || c == ' ') {
+            return s.trim().to_string();
+        }
+    }
+    // Fall back to colon-separated hex
+    bytes.iter().map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join(":")
+}
+
+// ═════════════════════════════════════════════════════════════════
 // SECTION 2b — AVB PROTOCOL PARSERS (AVTP / MSRP / MVRP)
 // ═════════════════════════════════════════════════════════════════
 
@@ -330,6 +410,11 @@ pub fn detect_protocol(eth: &EthernetPacket) -> Option<AvProtocol> {
         return None;
     }
 
+    // ── LLDP : L2 (EtherType 0x88CC) — scan for EEE TLV ─
+    if raw_et == crate::protocols::ETHERTYPE_LLDP {
+        return parse_lldp_eee(eth.payload());
+    }
+
     // ── MVRP : L2 (EtherType 0x88F5) ────────────────────
     if raw_et == crate::protocols::ETHERTYPE_MVRP {
         let vlan_ids = parse_mvrp(eth.payload());
@@ -356,7 +441,7 @@ pub fn detect_protocol(eth: &EthernetPacket) -> Option<AvProtocol> {
         return None;
     }
 
-    // ── IGMP (protocole IP 0x02, sans couche UDP) ────────
+    // ── IGMP (IP protocol 0x02, no UDP layer) ────────────
     if eth.get_ethertype() == EtherTypes::Ipv4 {
         if let Some(ip) = Ipv4Packet::new(eth.payload()) {
             if ip.get_next_level_protocol().0 == crate::protocols::IP_PROTO_IGMP {
@@ -710,9 +795,12 @@ pub fn parse_ptp(payload: &[u8]) -> Option<PtpInfo> {
     };
 
     // Parse origin timestamp (for Sync and Delay_Req)
-    let origin_timestamp_ns = if payload.len() >= 48 {
-        let seconds = u64::from_be_bytes(payload[34..42].try_into().ok()?);
-        let nanos = u32::from_be_bytes([payload[41], payload[42], payload[43], payload[44]]);
+    // PTPv2 originTimestamp: 6-byte seconds (34–39) + 4-byte nanoseconds (40–43)
+    let origin_timestamp_ns = if payload.len() >= 44 {
+        let seconds = u64::from_be_bytes([
+            0, 0, payload[34], payload[35], payload[36], payload[37], payload[38], payload[39],
+        ]);
+        let nanos = u32::from_be_bytes([payload[40], payload[41], payload[42], payload[43]]);
         Some(seconds.saturating_mul(1_000_000_000).saturating_add(nanos as u64))
     } else {
         None

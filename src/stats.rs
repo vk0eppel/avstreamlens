@@ -255,7 +255,7 @@ impl TcpStreamStats {
     }
 
     pub fn update_quality(&mut self) {
-        if self.rst_packets > 0 || self.fin_packets > 2 {
+        if self.rst_packets > 0 || self.fin_packets >= 1 {
             self.stream_quality = StreamQuality::Terminated;
         } else if self.retransmissions > 10 {
             self.stream_quality = StreamQuality::Critical;
@@ -328,6 +328,7 @@ impl NetworkHealth {
         tcp_streams: &std::collections::HashMap<String, TcpStreamStats>,
         ptp_domains: &std::collections::HashMap<(u8, u8), PtpStats>,
         msrp_state: &std::collections::HashMap<[u8; 8], crate::protocols::MsrpDeclaration>,
+        eee_ports: &std::collections::HashMap<(String, String), (u16, u16)>,
     ) {
         let mut score = 100.0;
 
@@ -426,6 +427,11 @@ impl NetworkHealth {
             }
         }
 
+        // ── EEE (Energy Efficient Ethernet) ──────────────────────────────────
+        // EEE causes micro-bursting (packets held during sleep, released on wake-up)
+        // directly threatening jitter-sensitive AV streams.
+        score -= (eee_ports.len() as f64 * 15.0).min(30.0);
+
         self.network_score = score.max(0.0);
     }
 }
@@ -446,7 +452,6 @@ pub struct PtpStats {
     pub last_grandmaster:  Option<String>,
     pub grandmaster_changes: u64,
     pub clock_valid:       bool,                     // Clock is currently present and valid
-    pub clock_presence_duration: Duration,           // Time since last valid clock activity
     pub timeout_secs:      u64,                      // Configurable timeout (default: 5s)
     pub last_quality:      Option<String>,
     pub last_offset_ns:    Option<i64>,
@@ -470,7 +475,6 @@ impl PtpStats {
             last_grandmaster: None,
             grandmaster_changes: 0,
             clock_valid: false,
-            clock_presence_duration: Duration::ZERO,
             timeout_secs: 5,
             last_quality: None,
             last_offset_ns: None,

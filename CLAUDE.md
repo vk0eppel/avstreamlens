@@ -43,9 +43,10 @@ Lint: `cargo clippy -- -D warnings`
 - Grandmaster detection fires on any PtpInfo with grandmaster_id set (PTPv2: Announce ≥64b, PTPv1: Sync)
 - Alerts show: GRANDMASTER DETECTED/CHANGED/LOST per protocol
 - Clock loss detected via `PtpStats::check_timeout()` called from the 5-second report loop — NOT inside `update()`, which only runs on packet arrival and cannot detect silence
-- Detection order: MSRP → MVRP → AVTP/AVB → gPTP → IGMP → SAP → mDNS → Dante control → UDP PTP → RTP gate → **Dante audio** → AES67 → ST2110; Dante port check is before AES67/ST2110 so that multicast Dante streams (239.255.x.x) are not misclassified as ST2110
+- Detection order: LLDP → MSRP → MVRP → AVTP/AVB → gPTP → IGMP → SAP → mDNS → Dante control → UDP PTP → RTP gate → **Dante audio** → AES67 → ST2110; Dante port check is before AES67/ST2110 so that multicast Dante streams (239.255.x.x) are not misclassified as ST2110
 - Protocol association via multicast IP (239.69.*=AES67, other 239.x.x.x=ST2110)
-- PTP, IGMP, and SAP are always processed regardless of user protocol selection; all other protocols are gated by `AvProtocol::is_selected()` in `protocols.rs`
+- PTP, IGMP, SAP, and LLDP are always processed regardless of user protocol selection; all other protocols are gated by `AvProtocol::is_selected()` in `protocols.rs`
+- BPF filter always includes `(ether proto 0x88cc)` (LLDP) for EEE detection, regardless of protocol selection
 - BPF filter includes `tcp` for NDI (only protocol using TCP); `all_protocols_filter` also includes `tcp`
 - Protocol selection is pre-expanded once before the capture loop (`expanded_protocols: Vec<ProtocolChoice>`) and passed to `is_selected()` on each detected packet
 - Startup banner: `📡 Listening on en0  for AES67, Dante  (+ PTP, IGMP)  streams` — formatted by `cli::selected_protocol_display()`; for "all" selection shows `📡 Listening on en0  —  all protocols`; "Audio"/"Video" group choices show the group name, not the expanded sub-protocols; the redundant "Selected protocols:" line was removed
@@ -66,8 +67,15 @@ Lint: `cargo clippy -- -D warnings`
 
 ## False Positive Prevention
 - **Dante audio**: `is_likely_dante_audio` requires BOTH src AND dst ports in 5000–6000 (even); OR logic caused false positives when any app used a Dante-range source port with a high ephemeral destination
-- **RIST**: payload type must be exactly 33 (MPEG-TS); `pt >= 33` was too broad and matched NDI auxiliary traffic
-- **SRT/RIST**: match arms in `main.rs` check `!ndi_sources.contains(&src) && !ndi_sources.contains(&dst)` — NDI receiver→sender UDP packets can accidentally match SRT (control bit pattern) or RIST (port + PT check)
+- **Multicast Dante**: Dante port check (`is_likely_dante_audio`) runs before the AES67/ST2110 multicast IP checks — Dante multicast uses 239.255.x.x which would otherwise match `is_st2110_multicast`
+
+## EEE Detection (Energy Efficient Ethernet — IEEE 802.3az)
+- EEE causes micro-bursting (switch holds packets during sleep, releases on wake-up ~4–16µs) — a common cause of unexplained jitter on AV networks
+- Detected via LLDP (EtherType 0x88CC): the IEEE 802.3az EEE TLV (OUI 00-12-0F, subtype 0x05) advertises Tx/Rx wake-up times per port
+- `parse_lldp_eee()` in `parser.rs` walks the LLDP TLV list; returns `AvProtocol::LldpEee` only when EEE TLV is present AND at least one wake-up time is non-zero
+- `eee_ports: HashMap<(chassis_id, port_id), (tx_wake_us, rx_wake_us)>` in `main.rs` — alert printed on first detection per port
+- Shown in health breakdown with per-port wake-up times; −15 pts/port in health score (capped at −30)
+- Limitation: only detected if the switch sends LLDP and includes the EEE TLV; absence of detection does NOT confirm EEE is disabled
 
 ## AVB Extended Monitoring
 - AVTP stream_id tracking: `avtp_streams: HashMap<[u8;8], AvtpStreamStats>` in `main.rs` — only populated when sv (stream_valid) bit is set in the AVTP header; stream_id = bytes 4–11 (6-byte source MAC + 2-byte unique ID)
@@ -96,7 +104,7 @@ Lint: `cargo clippy -- -D warnings`
 - IGMP Join deduplication: `igmp_joins_seen: HashSet<(Ipv4Addr, Ipv4Addr)>` in `main.rs` suppresses repeated Join prints for the same (src, group); cleared on Leave so re-joins print again; Queries and Unknowns always print
 
 ## Network Health
-- `calculate_score()` signature: `(&mut self, streams, tcp_streams, ptp_domains, msrp_state)` — all four are required
+- `calculate_score()` signature: `(&mut self, streams, tcp_streams, ptp_domains, msrp_state, eee_ports)` — all five are required
 - `calculate_score()` also populates `packet_loss_streams`, `high_jitter_streams`, `aes67_discontinuities`
 - IGMP querier absence penalizes score only when active multicast streams exist
 - Bitrate (`bitrate_bps`) is computed by dividing byte delta by actual elapsed seconds — not assumed 1s — applies to both `StreamStats` and `TcpStreamStats`
@@ -124,4 +132,5 @@ Lint: `cargo clippy -- -D warnings`
 | PTP traffic seen, no grandmaster | −15/domain |
 | PTP grandmaster changed | −10/domain × changes, capped at 3 |
 | MSRP TalkerFailed (AVB) | −20/failed reservation |
+| EEE active on switch port | −15/port, capped at −30 |
 

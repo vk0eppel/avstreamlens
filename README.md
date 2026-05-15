@@ -16,7 +16,7 @@ AVStreamLens reads the network passively using pcap, identifies streams and cloc
 | **NDI** | TCP (dynamic ports) | Sources discovered via mDNS, stream activity, connection quality |
 | **AVB / IEEE 802.1** | L2 Ethernet | gPTP grandmaster (802.1AS), MSRP bandwidth reservations (802.1Qat), MVRP VLAN registrations (802.1Q) |
 
-**Always monitored regardless of selection:** PTP (IEEE 1588 / gPTP) and IGMP.
+**Always monitored regardless of selection:** PTP (IEEE 1588 / gPTP), IGMP, and LLDP (for EEE detection).
 
 ---
 
@@ -110,6 +110,8 @@ Choose the protocols to monitor:
   ✓  AVB  —  grandmaster 00:1a:e5:ff:fe:ab:cd:ef
 
    QoS: ✓ DSCP EF (1247 pkts)  |  IGMP: ✓ querier 42s ago
+   ⚠  EEE active on 1 switch port(s) — may cause audio/video glitches
+      port "Gi0/1"  chassis 00:1a:2b:3c:4d:5e  Tx wake: 16µs  Rx wake: 16µs
 ```
 
 **Status line** — `✓ All streams healthy` or `⚠ N issue(s)` with a brief description.
@@ -119,13 +121,14 @@ Choose the protocols to monitor:
 - `⚠  Packet loss detected`
 - `⚠  Dante clock or subscription issue`
 - `⚠  No clock source — streams requiring PTP may lose sync`
+- `⚠  EEE active on switch port — disable EEE for AV reliability`
 - `💀 No signal for 12s`
 
 ---
 
 ## Health Score
 
-The health percentage reflects the overall network quality. Factors that reduce the score include packet loss, high jitter, timestamp discontinuities, source interruptions (SSRC changes), dead streams, PTP clock loss or instability, QoS tagging violations, IGMP querier absence, and AVB bandwidth reservation failures.
+The health percentage reflects the overall network quality. Factors that reduce the score include packet loss, high jitter, timestamp discontinuities, source interruptions (SSRC changes), dead streams, PTP clock loss or instability, QoS tagging violations, IGMP querier absence, AVB bandwidth reservation failures, and EEE active on switch ports.
 
 ---
 
