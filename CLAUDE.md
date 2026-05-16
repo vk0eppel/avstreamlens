@@ -38,6 +38,10 @@ Lint: `cargo clippy -- -D warnings`
 - AVB BPF filter includes all three EtherTypes: 0x22F0 (AVTP), 0x22EA (MSRP), 0x88F5 (MVRP), 0x88F7 (gPTP)
 - PTPv2 minimum payload lowered to 34 bytes (common header) — allows Sync (44b) and P_Delay (54b) to populate `ptp_domains`, not just Announce (64b)
 - gPTP clock source display: ✓ grandmaster from Announce, ○ source EUI-64 from Sync when no Announce seen yet (`PtpStats::last_clock_id`), ❌ no traffic
+- Clock quality is formatted as human-readable strings at parse time (`parser.rs`):
+  - PTPv2: `ptp_class_str()` translates clock_class (e.g. class=6 → "Primary reference — locked"); `ptp_accuracy_str()` translates accuracy byte (e.g. 0x20 → "< 100 ns"); combined: `"Primary reference — locked  < 1 µs"`
+  - PTPv1: stratum 1 → "Primary reference", 2 → "Secondary reference", N → "Stratum N"; 4-char ident appended (e.g. "GPS", "ATOM")
+  - Key PTPv2 class values: 6=locked, 7=free-running, 135=holdover, 165=default, 187/255=slave-only
 - PTPv1 subdomain mapped to domain number: _DFLT→0, _ALT1→1, _ALT2→2, _ALT3→3
 - PTP domains tracked per (domain, version) tuple — separates Dante PTPv1 from AES67/ST2110 PTPv2 on the same domain number
 - Grandmaster detection fires on any PtpInfo with grandmaster_id set (PTPv2: Announce ≥64b, PTPv1: Sync)
@@ -51,7 +55,8 @@ Lint: `cargo clippy -- -D warnings`
 - Protocol selection is pre-expanded once before the capture loop (`expanded_protocols: Vec<ProtocolChoice>`) and passed to `is_selected()` on each detected packet
 - Startup banner: `📡 Listening on en0  for AES67, Dante  (+ PTP, IGMP)  streams` — formatted by `cli::selected_protocol_display()`; for "all" selection shows `📡 Listening on en0  —  all protocols`; "Audio"/"Video" group choices show the group name, not the expanded sub-protocols; the redundant "Selected protocols:" line was removed
 - UDP PTP protocol_kind labels: PTPv1 (Dante/IEEE 1588-2002) → `"PTPv1"`, PTPv2 (AES67/ST2110/IEEE 1588-2008) → `"PTPv2"`, L2 gPTP → `"AVB"` — version-based labels, not application-layer names
-- SAP produces no console or log output — it silently enriches stream stats (clock_hz, ptime_ms, channels, sdp_name) and populates `sdp_cache` for the ts-refclk cross-check
+- SAP produces no console or log output — it enriches stream stats (clock_hz, ptime_ms, channels, sdp_name, expected_pt) and sets `clock_hz_confirmed = true` on existing entries; also populates `sdp_cache` for the ts-refclk cross-check
+- SAP enrichment runs on existing stream entries (not just at creation): a stream detected before SAP arrives will be fully enriched when the announcement arrives — `clock_hz_confirmed`, `expected_pt`, `ptime_ms` are all updated retroactively
 - ts-refclk cross-check: every 5s, for each active SDP session, `parse_ts_refclk()` (parser.rs) extracts the claimed PTP grandmaster EUI-64 and domain, then compares against `ptp_domains`; alerts on missing PTP traffic or grandmaster mismatch
 - `parse_ts_refclk(s)` handles `ptp=IEEE1588-2008:<eui64>:<domain>` (PTPv2) and `ptp=IEEE1588-2002:<uuid>:<domain>` (PTPv1); normalizes to lowercase colon-separated bytes matching `PtpStats::last_grandmaster`
 - Loopback (`lo`/`lo0`) is filtered from the interface list — macOS loopback uses DLT_NULL link-layer (4-byte BSD null header, no Ethernet frame), which is incompatible with the Ethernet-based packet parser; mDNS multicast also does not flow over loopback, so NDI discovery would never fire
@@ -59,11 +64,47 @@ Lint: `cargo clippy -- -D warnings`
 ## NDI Detection
 - NDI uses dynamically assigned TCP ports — port-range matching is unreliable
 - `ndi_sources: HashSet<Ipv4Addr>` in `main.rs` is populated from mDNS `_ndi._tcp` discovery packets
-- IP-based stream tracking: any TCP packet from/to a known NDI source IP is counted as NDI
+- `ndi_names: HashMap<Ipv4Addr, String>` stores source names extracted from mDNS DNS labels via `extract_ndi_name()` in `parser.rs`; source name shown in discovery alert and as stream label
+- IP-based stream tracking: any TCP packet from/to a known NDI source IP is counted as NDI; `dst_ip` is set on stream entry so bitrate aggregation works
+- NDI bitrate aggregated from all matching `tcp_streams` entries every 5s (summed by src/dst IP match)
 - NDI TCP detection block is gated on `ndi_selected` (computed from `expanded_protocols`) — skipped entirely if NDI not in selection
-- SRT and RIST match arms guard against both src AND dst being in `ndi_sources` — prevents NDI receiver→sender traffic from being misclassified (check both directions, not just src)
 - `detect_protocol` does NOT contain NDI TCP port-range detection — that path caused double-counting
 - NDI on loopback does not work: DLT_NULL parser incompatibility + no mDNS multicast on lo0
+
+## Protocol-Specific Health Monitoring
+
+### AES67
+- All RTP metrics: loss, jitter (RFC 3550), SSRC changes, timestamp discontinuities, bitrate, dead stream
+- `clock_hz_confirmed` set at creation if SDP available, or retroactively when SAP arrives — gates TS discontinuity detection
+- `expected_pt` from SDP `a=rtpmap` payload type; mismatches counted as `pt_mismatches`
+- Signal gap detection (`gap_events`, `max_iat_ms`): fires when IAT > 50ms; both counters reset each 5s report cycle so count reflects the current window; alert says "Signal gap detected (N in last 5s, worst Xms)"
+- PTP correction field (Sync/Follow_Up) stored in `PtpStats::last_offset_ns` (nanoseconds); alert if abs > 1µs
+- DSCP EF=46 checked on every packet via `network_health.track_dscp()`
+- Alert `⚑ Stream not announced (no SAP)` shown when stream active > 10 packets without SDP enrichment
+
+### Dante
+- All RTP metrics (same as AES67)
+- Device name extracted from mDNS `_netaudio._udp` DNS labels via `extract_dante_name()` in `parser.rs`; stored in `dante_names: HashMap<Ipv4Addr, String>`
+- `DanteKind::Discovery { device_name }` carries name through to main.rs dispatch
+- Default `ptime_ms = 1.0` (Dante standard 48 samples at 48kHz) — not needed for gap detection (50ms threshold is fixed) but kept for timestamp discontinuity tolerance
+- DSCP checked on every audio stream packet
+- PTPv1 clock monitored (grandmaster via Sync body)
+- Alert `⚠ Dante clock or subscription issue` for loss > 0% or jitter > 15ms
+
+### NDI
+- Packet count, dead stream, bitrate (aggregated from tcp_streams)
+- TCP quality per flow (Healthy/Degrading/Critical/Terminated), retransmissions, RST/FIN
+- Source name from mDNS `_ndi._tcp` DNS labels via `extract_ndi_name()` in `parser.rs`
+
+### ST2110
+- All RTP metrics (same as AES67)
+- ST2110-20 video: `clock_hz_confirmed = true` immediately (90kHz is always correct per spec)
+- ST2110-30 audio: default `ptime_ms = 1.0` enables burst detection without SDP
+- Alert `⚠ Stream type unknown` when stream is classified as 2110-??
+
+### mDNS name extraction (shared helper)
+- `extract_mdns_instance_name(payload, service_needle)` in `parser.rs` finds the DNS-encoded service label and extracts the preceding instance name label (1–63 bytes, printable ASCII, longest match)
+- Used by both `extract_dante_name()` (needle `\x09_netaudio`) and `extract_ndi_name()` (needle `\x04_ndi`)
 
 ## False Positive Prevention
 - **Dante audio**: `is_likely_dante_audio` requires BOTH src AND dst ports in 5000–6000 (even); OR logic caused false positives when any app used a Dante-range source port with a high ephemeral destination
@@ -79,6 +120,9 @@ Lint: `cargo clippy -- -D warnings`
 
 ## AVB Extended Monitoring
 - AVTP stream_id tracking: `avtp_streams: HashMap<[u8;8], AvtpStreamStats>` in `main.rs` — only populated when sv (stream_valid) bit is set in the AVTP header; stream_id = bytes 4–11 (6-byte source MAC + 2-byte unique ID)
+- AVTP subtype decoded to human-readable name via `avtp_subtype_name()` in `protocols.rs`: 0x00=IEC 61883, 0x02=CRF, 0x03=CVF, 0x7E=MAAP, etc.; used in stream key ("AVB IEC 61883" not "AVB subtype=0x00")
+- AVTP sequence loss: `AvtpStreamStats.last_seq` and `lost_frames` track byte 2 (8-bit wrapping counter) per stream_id; loss% shown per stream, alert on any drops
+- AVTP bitrate: tracked per stream_id (`AvtpStreamStats.bitrate_bps`) and per subtype aggregate (`StreamStats.bytes_total`) from Ethernet frame sizes
 - MSRP parsing (`parse_msrp` in parser.rs): walks MRP message list, extracts TalkerAdvertise (stream reserved, bandwidth, VLAN, priority), TalkerFailed (failure code), Listener (ready/failed state); `msrp_state: HashMap<[u8;8], MsrpDeclaration>` keyed by stream_id
 - MVRP parsing (`parse_mvrp` in parser.rs): extracts VLAN IDs; `mvrp_vlans: HashSet<u16>` — presence confirms L2 VLAN QoS is active
 - `avtp_streams` pruned after each report (2×timeout); `msrp_state` and `mvrp_vlans` not pruned (declarations persist until superseded)

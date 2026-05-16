@@ -44,6 +44,14 @@ pub struct StreamStats {
     pub last_packet_time:   Option<Instant>,
     // Flag: avoids repeating the "stream dead" alert in each report
     pub dead_alerted:       bool,
+    // Payload type validation (from SDP a=rtpmap)
+    pub expected_pt:        Option<u8>,  // declared by SDP; None = no SDP received yet
+    pub pt_mismatches:      u64,         // packets with payload type ≠ expected
+    // Clock rate confirmation
+    pub clock_hz_confirmed: bool,        // true when clock_hz came from SDP (not default 48kHz)
+    // IAT burst detection (EEE / switch queuing fingerprint)
+    pub gap_events:         u64,         // IAT > 50ms in the current 5s window
+    pub max_iat_ms:         f64,         // worst-case inter-arrival time (ms)
 }
 
 impl StreamStats {
@@ -76,6 +84,11 @@ impl StreamStats {
             ssrc_changes:        0,
             last_packet_time:    None,
             dead_alerted:        false,
+            expected_pt:         None,
+            pt_mismatches:       0,
+            clock_hz_confirmed:  false,
+            gap_events:          0,
+            max_iat_ms:          0.0,
         }
     }
     // Constructor with enhanced info — useful when SDP is available at stream start
@@ -102,26 +115,39 @@ impl StreamStats {
         self.last_seq = Some(seq);
 
         // ── Timestamp discontinuity detection ────────
-        if let Some(last_ts) = self.last_rtp_ts {
-            let expected_diff = if self.clock_hz > 0.0 {
-                let ptime_ms = if self.ptime_ms > 0.0 { self.ptime_ms } else { 1.0 };
-                (self.clock_hz * ptime_ms / 1000.0) as i64
-            } else {
-                48 // fallback : 1 ms @ 48 kHz
-            };
-            let actual_diff = rtp_ts.wrapping_sub(last_ts) as i64;
-            // Tolerance ±50% around expected ptime
-            if expected_diff > 0 &&
-               ((actual_diff as f64) < (expected_diff as f64 * 0.5) ||
-                (actual_diff as f64) > (expected_diff as f64 * 1.5))
-            {
-                self.ts_discontinuities += 1;
+        // Only runs when clock rate is confirmed from SDP — default 48 kHz would produce
+        // false positives on 96 kHz or 44.1 kHz streams.
+        if self.clock_hz_confirmed {
+            if let Some(last_ts) = self.last_rtp_ts {
+                let expected_diff = if self.clock_hz > 0.0 {
+                    let ptime_ms = if self.ptime_ms > 0.0 { self.ptime_ms } else { 1.0 };
+                    (self.clock_hz * ptime_ms / 1000.0) as i64
+                } else {
+                    48 // fallback: 1 ms @ 48 kHz
+                };
+                let actual_diff = rtp_ts.wrapping_sub(last_ts) as i64;
+                if expected_diff > 0 &&
+                   ((actual_diff as f64) < (expected_diff as f64 * 0.5) ||
+                    (actual_diff as f64) > (expected_diff as f64 * 1.5))
+                {
+                    self.ts_discontinuities += 1;
+                }
+                self.last_ts_diff = Some(actual_diff);
             }
-            self.last_ts_diff = Some(actual_diff);
         }
 
-        // ── RFC 3550 §6.4.1 Jitter ────────────────────
+        // ── RFC 3550 §6.4.1 Jitter + IAT burst detection ──────────
         let now = Instant::now();
+
+        // IAT burst: ptime_ms > 0 means SDP confirmed the expected packet interval
+        if self.ptime_ms > 0.0 {
+            if let Some(last_time) = self.last_arrival {
+                let iat_ms = now.duration_since(last_time).as_secs_f64() * 1000.0;
+                if iat_ms > self.max_iat_ms { self.max_iat_ms = iat_ms; }
+                if iat_ms > 50.0 { self.gap_events += 1; }
+            }
+        }
+
         if let (Some(last_ts), Some(last_time)) = (self.last_rtp_ts, self.last_arrival) {
             let arrival_diff = now.duration_since(last_time).as_secs_f64();
             let rtp_diff     = rtp_ts.wrapping_sub(last_ts) as f64 / self.clock_hz;
@@ -167,15 +193,48 @@ impl StreamStats {
 
 #[derive(Debug, Clone)]
 pub struct AvtpStreamStats {
-    pub stream_id: [u8; 8],
-    pub subtype:   u8,
-    pub packets:   u64,
-    pub last_seen: Instant,
+    pub stream_id:          [u8; 8],
+    pub subtype:            u8,
+    pub packets:            u64,
+    pub lost_frames:        u64,         // AVTP sequence counter drops
+    pub last_seq:           Option<u8>,  // last AVTP sequence byte (byte 2 of header)
+    pub last_seen:          Instant,
+    pub bytes_total:        u64,
+    pub bytes_at_check:     u64,
+    pub bitrate_bps:        u64,
+    pub last_bitrate_check: Instant,
 }
 
 impl AvtpStreamStats {
     pub fn new(stream_id: [u8; 8], subtype: u8) -> Self {
-        Self { stream_id, subtype, packets: 0, last_seen: Instant::now() }
+        Self {
+            stream_id,
+            subtype,
+            packets:            0,
+            lost_frames:        0,
+            last_seq:           None,
+            last_seen:          Instant::now(),
+            bytes_total:        0,
+            bytes_at_check:     0,
+            bitrate_bps:        0,
+            last_bitrate_check: Instant::now(),
+        }
+    }
+
+    pub fn update_bitrate(&mut self, frame_bytes: u64, now: Instant) {
+        self.bytes_total += frame_bytes;
+        let elapsed = self.last_bitrate_check.elapsed();
+        if elapsed > Duration::from_secs(1) {
+            let delta = self.bytes_total.saturating_sub(self.bytes_at_check);
+            self.bitrate_bps = (delta as f64 * 8.0 / elapsed.as_secs_f64()) as u64;
+            self.bytes_at_check = self.bytes_total;
+            self.last_bitrate_check = now;
+        }
+    }
+
+    pub fn loss_pct(&self) -> f64 {
+        let total = self.packets + self.lost_frames;
+        if total == 0 { 0.0 } else { 100.0 * self.lost_frames as f64 / total as f64 }
     }
 
     pub fn stream_id_str(&self) -> String {

@@ -49,7 +49,7 @@ pub fn select_interface() -> Device {
         println!("  {}: {}{}", i, d.name, info);
     }
 
-    println!("\n👉 Choose an interface by its number:");
+    println!("\n👉 Choose an interface by its number [default: 0]:");
     let index: usize = loop {
         print!("> ");
         io::stdout().flush().unwrap();
@@ -57,7 +57,9 @@ pub fn select_interface() -> Device {
         let mut input = String::new();
         io::stdin().read_line(&mut input).unwrap();
 
-        match input.trim().parse::<usize>() {
+        let trimmed = input.trim();
+        if trimmed.is_empty() { break 0; }
+        match trimmed.parse::<usize>() {
             Ok(n) if n < filtered.len() => break n,
             Ok(_) => println!("❌ Invalid selection. Must be between 0 and {}.", filtered.len() - 1),
             Err(_) => println!("❌ Invalid input. Please enter a number."),

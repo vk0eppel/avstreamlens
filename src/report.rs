@@ -78,7 +78,7 @@ pub fn print_report(
         ("ST2110", |p| p.starts_with("2110-")),
         ("Dante",  |p| p == "Dante"),
         ("NDI",    |p| p == "NDI"),
-        ("AVB",    |p| p == "AVB"),
+        ("AVB",    |p| p == "AVB" || p.starts_with("AVB ")),
     ];
 
     let mut proto_parts: Vec<String> = protocol_groups.iter()
@@ -222,6 +222,37 @@ pub fn print_report(
             println!("\x1b[33m{}\x1b[0m", alert);
         }
 
+        // Gap 2: payload type mismatch
+        if s.pt_mismatches > 0 {
+            let alert = format!("    ⚠  RTP payload type mismatch ({} packet(s)) — encoder/SDP misconfiguration", s.pt_mismatches);
+            logger.log(&alert);
+            println!("\x1b[33m{}\x1b[0m", alert);
+        }
+
+        // Gap 3: stream not yet announced via SAP
+        if !s.clock_hz_confirmed && s.packets > 10 {
+            let alert = "    ⚑  Stream not announced (no SAP) — audio glitch detection unavailable";
+            logger.log(alert);
+            println!("{}", alert);
+        }
+
+        // ST2110 unclassified stream type
+        if s.protocol == "2110-??" {
+            let alert = "    ⚠  Stream type unknown — SDP required to classify as video/audio/ancillary";
+            logger.log(alert);
+            println!("\x1b[33m{}\x1b[0m", alert);
+        }
+
+        // Gap 4: signal gap events (IAT > 50ms)
+        if s.gap_events > 0 {
+            let alert = format!(
+                "    ⚠  Signal gap detected ({} in last 5s, worst {:.1} ms) — stream interrupted",
+                s.gap_events, s.max_iat_ms
+            );
+            logger.log(&alert);
+            println!("\x1b[33m{}\x1b[0m", alert);
+        }
+
         if let Some(last_time) = s.last_packet_time {
             if last_time.elapsed() > Duration::from_secs(STREAM_TIMEOUT_SECS) {
                 let alert = format!("    💀 No signal for {:.0}s", last_time.elapsed().as_secs_f64());
@@ -295,8 +326,23 @@ pub fn print_report(
             for s in sorted {
                 let dead = s.last_seen.elapsed() > Duration::from_secs(STREAM_TIMEOUT_SECS);
                 let icon = if dead { "💀" } else { "▸" };
-                let line = format!("  {} AVTP stream {}  ({} pkts)", icon, s.stream_id_str(), s.packets);
+                let loss_str = if s.lost_frames > 0 {
+                    format!("  loss: {:.1}%", s.loss_pct())
+                } else {
+                    String::new()
+                };
+                let rate_str = if s.bitrate_bps > 0 {
+                    format!("  {:.1} Mbps", s.bitrate_bps as f64 / 1_000_000.0)
+                } else {
+                    String::new()
+                };
+                let line = format!("  {} {}{}{}",
+                    icon, s.stream_id_str(), loss_str, rate_str);
                 logger.log(&line); println!("{}", line);
+                if s.lost_frames > 0 {
+                    let alert = format!("      ⚠  {} dropped AVTP frame(s)", s.lost_frames);
+                    logger.log(&alert); println!("\x1b[33m{}\x1b[0m", alert);
+                }
             }
         }
 
@@ -396,9 +442,18 @@ pub fn print_report(
 
             if let Some(offset_ns) = stats.last_offset_ns {
                 if offset_ns != 0 {
-                    let offset_line = format!("      offset: {} ns", offset_ns);
+                    let offset_line = if offset_ns.unsigned_abs() >= 1_000 {
+                        format!("      correction: {:.1} µs", offset_ns as f64 / 1_000.0)
+                    } else {
+                        format!("      correction: {} ns", offset_ns)
+                    };
                     logger.log(&offset_line);
                     println!("{}", offset_line);
+                    if offset_ns.unsigned_abs() > 1_000 {
+                        let alert = "      ⚠  Large PTP correction field — transparent clock or path issue";
+                        logger.log(alert);
+                        println!("\x1b[33m{}\x1b[0m", alert);
+                    }
                 }
             }
 

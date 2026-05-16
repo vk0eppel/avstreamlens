@@ -61,6 +61,38 @@ pub fn mdns_contains(payload: &[u8], service: &[u8]) -> bool {
     payload.windows(service.len()).any(|w| w == service)
 }
 
+/// Extract an mDNS service instance name — the label immediately preceding a given
+/// DNS-encoded service label (e.g. `\x04_ndi` for NDI, `\x09_netaudio` for Dante).
+fn extract_mdns_instance_name(payload: &[u8], service_needle: &[u8]) -> Option<String> {
+    let pos = payload.windows(service_needle.len())
+        .position(|w| w == service_needle)?;
+    if pos == 0 { return None; }
+    let mut best: Option<String> = None;
+    for name_len in 1usize..=63 {
+        if pos < name_len + 1 { break; }
+        let len_pos = pos - name_len - 1;
+        if payload[len_pos] as usize != name_len { continue; }
+        let name_bytes = &payload[len_pos + 1..pos];
+        if let Ok(s) = std::str::from_utf8(name_bytes) {
+            let s = s.trim();
+            if !s.is_empty() && s.chars().all(|c| c.is_ascii_graphic() || c == ' ') {
+                best = Some(s.to_string());
+            }
+        }
+    }
+    best
+}
+
+/// Extract the Dante device instance name from an mDNS payload.
+pub fn extract_dante_name(payload: &[u8]) -> Option<String> {
+    extract_mdns_instance_name(payload, b"\x09_netaudio")
+}
+
+/// Extract the NDI source instance name from an mDNS payload.
+pub fn extract_ndi_name(payload: &[u8]) -> Option<String> {
+    extract_mdns_instance_name(payload, b"\x04_ndi")
+}
+
 // ═════════════════════════════════════════════════════════════════
 // SECTION 2 — SDP PARSING (RFC 4566/2974)
 // ══════════════════════════════════════════════════════════
@@ -487,10 +519,12 @@ pub fn detect_protocol(eth: &EthernetPacket) -> Option<AvProtocol> {
     // ── mDNS (port 5353) ────────────────────────────────
     if dst_port == crate::protocols::MDNS_PORT || src_port == crate::protocols::MDNS_PORT {
         if mdns_contains(payload, b"_netaudio._udp") {
-            return Some(AvProtocol::Dante { kind: DanteKind::Discovery, src: src_ip, dst_port });
+            let device_name = extract_dante_name(payload);
+            return Some(AvProtocol::Dante { kind: DanteKind::Discovery { device_name }, src: src_ip, dst_port });
         }
         if mdns_contains(payload, b"_ndi._tcp") {
-            return Some(AvProtocol::Ndi { kind: NdiKind::Discovery, src: src_ip });
+            let source_name = extract_ndi_name(payload);
+            return Some(AvProtocol::Ndi { kind: NdiKind::Discovery { source_name }, src: src_ip });
         }
         return None;
     }
@@ -624,6 +658,30 @@ fn map_ptpv1_subdomain(s: &[u8]) -> u8 {
     else                      { 0 }  // "_DFLT" and anything else → 0
 }
 
+fn ptp_class_str(class: u8) -> String {
+    match class {
+        6   => "Primary reference — locked".to_string(),
+        7   => "Primary reference — free-running".to_string(),
+        52  => "Application-specific".to_string(),
+        135 => "Primary reference — holdover".to_string(),
+        165 => "Default".to_string(),
+        187 | 255 => "Slave-only".to_string(),
+        _   => format!("class={}", class),
+    }
+}
+
+fn ptp_accuracy_str(acc: u8) -> &'static str {
+    match acc {
+        0x20..=0x21 => "< 100 ns",
+        0x22..=0x23 => "< 1 µs",
+        0x24..=0x25 => "< 10 µs",
+        0x26..=0x27 => "< 100 µs",
+        0x28..=0x29 => "< 1 ms",
+        0xFE        => "unknown precision",
+        _           => "other",
+    }
+}
+
 /// Parse a PTPv1 (IEEE 1588-2002) UDP payload.
 ///
 /// Two wire encodings exist, distinguished by `hdr_shift`:
@@ -699,8 +757,19 @@ fn parse_ptp_v1(payload: &[u8], hdr_shift: usize) -> Option<PtpInfo> {
             let stratum = payload[61];
             let ident   = std::str::from_utf8(&payload[62..66])
                 .unwrap_or("????")
-                .trim_end_matches('\0');
-            (Some(gm), Some(format!("stratum={} ident={}", stratum, ident)))
+                .trim_end_matches('\0')
+                .trim();
+            let class_str = match stratum {
+                1 => "Primary reference".to_string(),
+                2 => "Secondary reference".to_string(),
+                n => format!("Stratum {}", n),
+            };
+            let quality = if ident.is_empty() {
+                class_str
+            } else {
+                format!("{}  {}", class_str, ident)
+            };
+            (Some(gm), Some(quality))
         }
     } else {
         (None, None)
@@ -817,25 +886,22 @@ pub fn parse_ptp(payload: &[u8]) -> Option<PtpInfo> {
     };
 
     let clock_quality = if message_type == 0x0B && payload.len() >= 64 {
-        let clock_class = payload[48];
+        let clock_class    = payload[48];
         let clock_accuracy = payload[49];
-        let log_var = u16::from_be_bytes([payload[50], payload[51]]);
-        Some(format!("class={} acc={} var={}", clock_class, clock_accuracy, log_var))
+        Some(format!("{}  {}", ptp_class_str(clock_class), ptp_accuracy_str(clock_accuracy)))
     } else {
         None
     };
 
-    // For Delay_Resp messages, path delay is in correction_field
-    let path_delay_ns = if message_type == 0x9 {
-        Some(correction_field)
-    } else if message_type == 0x3 {
-        Some(correction_field)
-    } else {
-        None
-    };
+    // IEEE 1588-2008 §5.3.3: correctionField is in units of ns × 2^16; shift right to get ns.
+    let correction_field_ns = correction_field >> 16;
 
-    let correction_ns = if message_type != 0x0 && message_type != 0x8 {
-        Some(correction_field)
+    // All PTPv2 messages carry a correction field; store it for every message type.
+    let correction_ns = Some(correction_field_ns);
+
+    // For Delay_Resp / P_Delay_Resp, the correction field represents path delay.
+    let path_delay_ns = if message_type == 0x9 || message_type == 0x3 {
+        Some(correction_field_ns)
     } else {
         None
     };

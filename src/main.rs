@@ -79,6 +79,10 @@ fn main() {
     let mut ndi_sources: std::collections::HashSet<Ipv4Addr> = std::collections::HashSet::new();
     // Deduplicates IGMP Join console output — cleared on Leave so re-joins print again
     let mut igmp_joins_seen: std::collections::HashSet<(Ipv4Addr, Ipv4Addr)> = std::collections::HashSet::new();
+    // Dante device names learned from mDNS TXT records, keyed by transmitter IP
+    let mut dante_names: std::collections::HashMap<Ipv4Addr, String> = std::collections::HashMap::new();
+    // NDI source names learned from mDNS TXT records, keyed by source IP
+    let mut ndi_names: std::collections::HashMap<Ipv4Addr, String> = std::collections::HashMap::new();
     // AVB extended state
     let mut avtp_streams: std::collections::HashMap<[u8; 8], AvtpStreamStats> = std::collections::HashMap::new();
     let mut msrp_state:   std::collections::HashMap<[u8; 8], crate::protocols::MsrpDeclaration> = std::collections::HashMap::new();
@@ -138,11 +142,28 @@ fn main() {
                     }
                 }
             }
+            // Aggregate NDI bitrate from all TCP flows matching the source IP
+            for stream in streams.values_mut() {
+                if stream.protocol == "NDI" {
+                    if let Some(src_ip) = stream.dst_ip {
+                        stream.bitrate_bps = tcp_streams.values()
+                            .filter(|t| t.src_ip == src_ip || t.dst_ip == src_ip)
+                            .map(|t| t.bitrate_bps)
+                            .sum();
+                    }
+                }
+            }
+
             network_health.calculate_score(&streams, &tcp_streams, &ptp_domains, &msrp_state, &eee_ports);
             let requires_valid_ptp = cli::protocol_requires_ptp(&selected_protocols);
             print_report(&streams, &tcp_streams, &ptp_domains, requires_valid_ptp, &mut logger, &network_health, bytes_this_window, &avtp_streams, &msrp_state, &mvrp_vlans, &eee_ports);
             bytes_this_window = 0;
             last_report = Instant::now();
+            // Reset per-cycle gap counters so counts reflect the current 5s window
+            for s in streams.values_mut() {
+                s.gap_events  = 0;
+                s.max_iat_ms  = 0.0;
+            }
             streams.retain(|_, s| {
                 s.last_packet_time
                     .map_or(true, |t| t.elapsed().as_secs() < STREAM_TIMEOUT_SECS * 2)
@@ -176,9 +197,15 @@ fn main() {
                                 if stats.dst_port == m.port && stats.sdp_name.is_none() {
                                     stats.sdp_name   = Some(sdp.session_name.clone());
                                     stats.sdp_rtpmap = Some(m.rtpmap.clone());
-                                    if m.clock_hz > 0.0 { stats.clock_hz = m.clock_hz; }
+                                    if m.clock_hz > 0.0 {
+                                        stats.clock_hz = m.clock_hz;
+                                        stats.clock_hz_confirmed = true;
+                                    }
                                     if m.ptime_ms > 0.0 { stats.ptime_ms = m.ptime_ms; }
                                     if m.channels > 0   { stats.channels = m.channels; }
+                                    if let Some(pt) = m.payload_types.first().copied() {
+                                        stats.expected_pt = Some(pt);
+                                    }
                                     break;
                                 }
                             }
@@ -195,24 +222,30 @@ fn main() {
                     }
 
                     // ── AES67 ────────────────────────────────────
-                    AvProtocol::Aes67 { dst, dst_port, .. } => {
+                    AvProtocol::Aes67 { dst, dst_port, payload_type, .. } => {
                         let key = format!("AES67 {}:{}", dst, dst_port);
                         let stats = streams.entry(key).or_insert_with(|| {
-                            let (clock, rtpmap) = sdp_cache.values()
+                            let sdp_media = sdp_cache.values()
                                 .flat_map(|s| s.media.iter())
-                                .find(|m| m.port == dst_port)
-                                .map(|m| (m.clock_hz, Some(m.rtpmap.clone())))
-                                .unwrap_or((DEFAULT_CLOCK_HZ, None));
+                                .find(|m| m.port == dst_port);
+                            let (clock, rtpmap, exp_pt, confirmed) = sdp_media
+                                .map(|m| (m.clock_hz, Some(m.rtpmap.clone()), m.payload_types.first().copied(), m.clock_hz > 0.0))
+                                .unwrap_or((DEFAULT_CLOCK_HZ, None, None, false));
                             let mut s = StreamStats::new_with_info("AES67", clock, is_aes67_multicast(dst), dst, dst_port);
                             s.sdp_rtpmap = rtpmap;
                             s.media_type = "audio".to_string();
                             s.channels = 1;
+                            s.expected_pt = exp_pt;
+                            s.clock_hz_confirmed = confirmed;
                             s
                         });
                         if let Some(ip) = pnet_packet::ipv4::Ipv4Packet::new(eth.payload()) {
                             if let Some(udp) = pnet_packet::udp::UdpPacket::new(ip.payload()) {
                                 network_health.track_dscp(&ip);
                                 if let Some((seq, ts, ssrc)) = parse_rtp(udp.payload()) {
+                                    if let Some(exp) = stats.expected_pt {
+                                        if payload_type != exp { stats.pt_mismatches += 1; }
+                                    }
                                     stats.update(seq, ts, ssrc, udp.payload().len());
                                 }
                             }
@@ -230,11 +263,12 @@ fn main() {
                         let key = format!("ST {} {}:{}", label, dst, dst_port);
                         let default_clock = if matches!(stream_type, St2110Type::Video) { 90_000.0 } else { DEFAULT_CLOCK_HZ };
                         let stats = streams.entry(key).or_insert_with(|| {
-                            let (clock, rtpmap) = sdp_cache.values()
+                            let sdp_media = sdp_cache.values()
                                 .flat_map(|s| s.media.iter())
-                                .find(|m| m.port == dst_port)
-                                .map(|m| (m.clock_hz, Some(m.rtpmap.clone())))
-                                .unwrap_or((default_clock, None));
+                                .find(|m| m.port == dst_port);
+                            let (clock, rtpmap, exp_pt, confirmed) = sdp_media
+                                .map(|m| (m.clock_hz, Some(m.rtpmap.clone()), m.payload_types.first().copied(), m.clock_hz > 0.0))
+                                .unwrap_or((default_clock, None, None, false));
                             let mut s = StreamStats::new_with_info(label, clock, is_st2110_multicast(dst), dst, dst_port);
                             s.sdp_rtpmap = rtpmap;
                             s.media_type = match stream_type {
@@ -243,12 +277,25 @@ fn main() {
                                 St2110Type::Ancdata => "ancillary".to_string(),
                                 St2110Type::Unknown => "unknown".to_string(),
                             };
+                            s.expected_pt = exp_pt;
+                            // ST2110-20 video always uses 90 kHz per spec — enable TS
+                            // discontinuity detection even without SDP.
+                            // ST2110-30 audio: default 1 ms ptime enables burst detection.
+                            s.clock_hz_confirmed = confirmed || matches!(stream_type, St2110Type::Video);
+                            if !confirmed && matches!(stream_type, St2110Type::Audio) {
+                                s.ptime_ms = 1.0;
+                            }
                             s
                         });
                         if let Some(ip) = pnet_packet::ipv4::Ipv4Packet::new(eth.payload()) {
                             if let Some(udp) = pnet_packet::udp::UdpPacket::new(ip.payload()) {
                                 network_health.track_dscp(&ip);
                                 if let Some((seq, ts, ssrc)) = parse_rtp(udp.payload()) {
+                                    // Payload type is byte 1 (& 0x7F) of the RTP payload
+                                    let rtp_pt = udp.payload()[1] & 0x7F;
+                                    if let Some(exp) = stats.expected_pt {
+                                        if rtp_pt != exp { stats.pt_mismatches += 1; }
+                                    }
                                     stats.update(seq, ts, ssrc, udp.payload().len());
                                 }
                             }
@@ -258,8 +305,12 @@ fn main() {
                     // ── Dante ────────────────────────────────────
                     AvProtocol::Dante { kind, src, dst_port } => {
                         match kind {
-                            DanteKind::Discovery => {
-                                let msg = format!("🔍 Dante discovered: {}", src);
+                            DanteKind::Discovery { device_name } => {
+                                if let Some(ref name) = device_name {
+                                    dante_names.insert(src, name.clone());
+                                }
+                                let label = device_name.as_deref().unwrap_or("unknown device");
+                                let msg = format!("🔍 Dante discovered: {}  \"{}\"", src, label);
                                 println!("{}", msg);
                                 logger.log(&msg);
                             }
@@ -267,9 +318,15 @@ fn main() {
                             DanteKind::AudioStream => {
                                 let key   = format!("Dante {}:{}", src, dst_port);
                                 let stats = streams.entry(key)
-                                    .or_insert_with(|| StreamStats::new("Dante", DEFAULT_CLOCK_HZ));
+                                    .or_insert_with(|| {
+                                        let mut s = StreamStats::new("Dante", DEFAULT_CLOCK_HZ);
+                                        s.ptime_ms = 1.0; // Dante standard: 48 samples @ 48kHz = 1ms
+                                        s.sdp_name = dante_names.get(&src).cloned();
+                                        s
+                                    });
                                 if let Some(ip) = pnet_packet::ipv4::Ipv4Packet::new(eth.payload()) {
                                     if let Some(udp) = pnet_packet::udp::UdpPacket::new(ip.payload()) {
+                                        network_health.track_dscp(&ip); // fix: DSCP was missing for Dante
                                         if let Some((seq, ts, ssrc)) = parse_rtp(udp.payload()) {
                                             stats.update(seq, ts, ssrc, udp.payload().len());
                                         }
@@ -282,9 +339,13 @@ fn main() {
                     // ── NDI ──────────────────────────────────────
                     AvProtocol::Ndi { kind, src } => {
                         match kind {
-                            NdiKind::Discovery => {
+                            NdiKind::Discovery { source_name } => {
                                 ndi_sources.insert(src);
-                                let msg = format!("🔍 NDI source: {}", src);
+                                if let Some(ref name) = source_name {
+                                    ndi_names.insert(src, name.clone());
+                                }
+                                let label = source_name.as_deref().unwrap_or("unknown source");
+                                let msg = format!("🔍 NDI source: {}  \"{}\"", src, label);
                                 println!("{}", msg);
                                 logger.log(&msg);
                             }
@@ -294,15 +355,38 @@ fn main() {
 
                     // ── AVB ──────────────────────────────────────
                     AvProtocol::Avb { subtype, stream_id } => {
-                        let stats = streams.entry(format!("AVB subtype=0x{:02X}", subtype))
+                        let label = protocols::avtp_subtype_name(subtype);
+                        let frame_bytes = eth.packet().len() as u64;
+                        let stats = streams.entry(format!("AVB {}", label))
                             .or_insert_with(|| StreamStats::new("AVB", 0.0));
                         stats.packets += 1;
                         stats.last_packet_time = Some(now);
+                        // Aggregate bitrate from Ethernet frame size
+                        stats.bytes_total += frame_bytes;
+                        let elapsed = stats.last_bitrate_check.elapsed();
+                        if elapsed > Duration::from_secs(1) {
+                            let delta = stats.bytes_total.saturating_sub(stats.bytes_at_check);
+                            stats.bitrate_bps = (delta as f64 * 8.0 / elapsed.as_secs_f64()) as u64;
+                            stats.bytes_at_check = stats.bytes_total;
+                            stats.packets_at_check = stats.packets;
+                            stats.last_bitrate_check = now;
+                        }
                         if let Some(sid) = stream_id {
+                            // AVTP sequence counter is byte 2 of the AVTP payload
+                            let avtp_seq = eth.payload().get(2).copied();
                             let entry = avtp_streams.entry(sid)
                                 .or_insert_with(|| AvtpStreamStats::new(sid, subtype));
                             entry.packets += 1;
                             entry.last_seen = now;
+                            entry.update_bitrate(frame_bytes, now);
+                            // Sequence loss detection (8-bit wrapping counter)
+                            if let (Some(seq), Some(last)) = (avtp_seq, entry.last_seq) {
+                                let expected = last.wrapping_add(1);
+                                if seq != expected {
+                                    entry.lost_frames += seq.wrapping_sub(expected) as u64;
+                                }
+                            }
+                            if let Some(s) = avtp_seq { entry.last_seq = Some(s); }
                         }
                     }
 
@@ -417,7 +501,11 @@ fn main() {
                             else { None };
                 if let Some(sender_ip) = sender {
                     let stats = streams.entry(format!("NDI {}", sender_ip))
-                        .or_insert_with(|| StreamStats::new("NDI", 0.0));
+                        .or_insert_with(|| {
+                            let mut s = StreamStats::new_with_info("NDI", 0.0, false, sender_ip, 0);
+                            s.sdp_name = ndi_names.get(&sender_ip).cloned();
+                            s
+                        });
                     stats.packets += 1;
                     stats.last_packet_time = Some(now);
                 }

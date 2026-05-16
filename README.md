@@ -10,11 +10,11 @@ AVStreamLens reads the network passively using pcap, identifies streams and cloc
 
 | Protocol | Transport | What is monitored |
 |---|---|---|
-| **AES67** | UDP multicast (239.69.*) | Streams, jitter, packet loss, PTPv2 clock, ts-refclk validation |
-| **SMPTE ST 2110** | UDP multicast (239.x.x.x) | Video (2110-20), audio (2110-30), ancillary (2110-40), PTPv2 clock |
-| **Dante** | UDP unicast / mDNS | Audio streams, device discovery, PTPv1 clock |
-| **NDI** | TCP (dynamic ports) | Sources discovered via mDNS, stream activity, connection quality |
-| **AVB / IEEE 802.1** | L2 Ethernet | gPTP grandmaster (802.1AS), MSRP bandwidth reservations (802.1Qat), MVRP VLAN registrations (802.1Q) |
+| **AES67** | UDP multicast (239.69.*) | Loss, jitter, SSRC changes, timing discontinuities, payload type, burst detection, PTPv2 clock, ts-refclk validation, DSCP |
+| **SMPTE ST 2110** | UDP multicast (239.x.x.x) | Video (2110-20), audio (2110-30), ancillary (2110-40) — same RTP metrics as AES67; video clock rate confirmed without SDP |
+| **Dante** | UDP unicast or multicast / mDNS | Device names from mDNS, audio stream RTP metrics, burst detection, DSCP, PTPv1 clock |
+| **NDI** | TCP (dynamic ports) | Source names from mDNS, bitrate, TCP quality, retransmissions, RST/FIN |
+| **AVB / IEEE 802.1** | L2 Ethernet | gPTP grandmaster (802.1AS), MSRP bandwidth reservations (802.1Qat), MVRP VLAN registrations (802.1Q), AVTP stream IDs |
 
 **Always monitored regardless of selection:** PTP (IEEE 1588 / gPTP), IGMP, and LLDP (for EEE detection).
 
@@ -97,7 +97,7 @@ Choose the protocols to monitor:
   ▸ AES67  "Stage Mix"  [L24/48000/2]  —  239.69.0.1:5004
     loss: 0.0%  |  jitter: 0.18 ms  |  2.3 Mbps
 
-  ▸ Dante  —  192.168.1.45:5010
+  ▸ Dante  "Stage Box"  —  192.168.1.45:5010
     loss: 0.0%  |  jitter: 0.04 ms  |  0.8 Mbps
 
 🔗 AVB:
@@ -107,6 +107,9 @@ Choose the protocols to monitor:
 
 🕐 Clock Sources:
   ✓  PTPv2  —  grandmaster 00:1a:e5:ff:fe:78:9a:bc  (192.168.1.1)
+      clock quality: Primary reference — locked  < 1 µs
+  ✓  PTPv1  —  grandmaster 00:1a:e5:ff:fe:12:34:56
+      clock quality: Primary reference  GPS
   ✓  AVB  —  grandmaster 00:1a:e5:ff:fe:ab:cd:ef
 
    QoS: ✓ DSCP EF (1247 pkts)  |  IGMP: ✓ querier 42s ago
@@ -119,9 +122,14 @@ Choose the protocols to monitor:
 **Alerts** appear inline when problems are detected:
 - `⚠  Audio glitch risk — timing discontinuity detected`
 - `⚠  Packet loss detected`
+- `⚠  Signal gap detected (N in last 5s, worst X.X ms) — stream interrupted`
+- `⚠  RTP payload type mismatch — encoder/SDP misconfiguration`
 - `⚠  Dante clock or subscription issue`
 - `⚠  No clock source — streams requiring PTP may lose sync`
+- `⚠  Large PTP correction field — transparent clock or path issue`
 - `⚠  EEE active on switch port — disable EEE for AV reliability`
+- `⚑  Stream not announced (no SAP) — audio glitch detection unavailable`
+- `⚠  Stream type unknown — SDP required to classify as video/audio/ancillary`
 - `💀 No signal for 12s`
 
 ---

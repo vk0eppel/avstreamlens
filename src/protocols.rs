@@ -198,6 +198,20 @@ impl AvProtocol {
     }
 }
 
+/// Human-readable name for an AVTP subtype byte (IEEE 1722-2016 Table 6).
+pub fn avtp_subtype_name(subtype: u8) -> &'static str {
+    match subtype {
+        0x00 => "IEC 61883",  // audio/video (most common AVB stream)
+        0x01 => "MMA Streams",
+        0x02 => "CRF",        // Clock Reference Format
+        0x03 => "CVF",        // Compressed Video Format
+        0x04 => "CEF",        // Control/Encrypted Format
+        0x7E => "MAAP",       // MAC Address Acquisition Protocol
+        0x7F => "Experimental",
+        _    => "AVTP",
+    }
+}
+
 // ── Stream Protocol Types ──
 
 #[derive(Debug, Clone, PartialEq)]
@@ -221,9 +235,16 @@ pub struct MsrpDeclaration {
     pub listener_state:      Option<u8>,     // Listener only: 0=Ignore 1=AskingFailed 2=Ready 3=ReadyFailed
 }
 #[derive(Debug, Clone, PartialEq)]
-pub enum DanteKind  { Discovery, AudioStream, Control }
+pub enum DanteKind {
+    Discovery { device_name: Option<String> },
+    AudioStream,
+    Control,
+}
 #[derive(Debug, Clone, PartialEq)]
-pub enum NdiKind    { Discovery, Stream }
+pub enum NdiKind {
+    Discovery { source_name: Option<String> },
+    Stream,
+}
 
 // ── SDP metadata (from SAP/SDP parser) ──
 
