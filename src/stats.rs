@@ -424,6 +424,9 @@ impl NetworkHealth {
             if stats.last_packet_time.map_or(false, |t| t.elapsed() > Duration::from_secs(crate::protocols::STREAM_TIMEOUT_SECS)) {
                 score -= 30.0;
             }
+            if stats.gap_events > 0 {
+                score -= 10.0;  // at least one 50ms+ interruption in the current 5s window
+            }
         }
 
         // ── TCP quality ───────────────────────────────────────────────────────
