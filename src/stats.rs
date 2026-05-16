@@ -109,7 +109,11 @@ impl StreamStats {
         if let Some(last) = self.last_seq {
             let expected = last.wrapping_add(1);
             if seq != expected {
-                self.lost_packets += seq.wrapping_sub(expected) as u64;
+                // RFC 3550 §A.3: treat large negative delta as reorder/reset, not loss
+                let delta = seq.wrapping_sub(expected) as i16;
+                if delta > 0 {
+                    self.lost_packets += delta as u64;
+                }
             }
         }
         self.last_seq = Some(seq);
@@ -314,7 +318,7 @@ impl TcpStreamStats {
     }
 
     pub fn update_quality(&mut self) {
-        if self.rst_packets > 0 || self.fin_packets >= 1 {
+        if self.rst_packets > 0 || self.fin_packets >= 2 {
             self.stream_quality = StreamQuality::Terminated;
         } else if self.retransmissions > 10 {
             self.stream_quality = StreamQuality::Critical;

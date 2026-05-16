@@ -542,13 +542,22 @@ fn main() {
 
                 if !has_syn {
                     if let Some(last_seq) = tcp_stat.last_seq {
-                        if seq <= last_seq && tcp_stat.packets > 2 {
+                        // Wrap-aware: negative delta means seq went backward → retransmission
+                        let delta = seq.wrapping_sub(last_seq) as i32;
+                        if delta < 0 && tcp_stat.packets > 2 {
                             tcp_stat.retransmissions += 1;
                             network_health.tcp_retransmissions += 1;
                         }
                     }
                 }
-                tcp_stat.last_seq = Some(seq.max(tcp_stat.last_seq.unwrap_or(0)));
+                // Advance last_seq only when seq moves forward (wrap-aware)
+                if let Some(last_seq) = tcp_stat.last_seq {
+                    if (seq.wrapping_sub(last_seq) as i32) > 0 {
+                        tcp_stat.last_seq = Some(seq);
+                    }
+                } else {
+                    tcp_stat.last_seq = Some(seq);
+                }
                 tcp_stat.last_ack = Some(ack);
 
                 tcp_stat.update_bitrate();
