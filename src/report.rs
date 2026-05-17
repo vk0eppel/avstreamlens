@@ -53,7 +53,7 @@ pub fn print_report(
     streams: &HashMap<String, StreamStats>,
     tcp_streams: &HashMap<String, TcpStreamStats>,
     ptp_domains: &HashMap<(u8, u8), PtpStats>,
-    requires_valid_ptp: bool,
+    ptp_ok: bool,
     logger: &mut Logger,
     health: &NetworkHealth,
     bytes_this_window: u64,
@@ -117,7 +117,7 @@ pub fn print_report(
             || s.ssrc_changes > 0
             || s.last_packet_time.is_some_and(|t| t.elapsed() > Duration::from_secs(STREAM_TIMEOUT_SECS))
     }).count();
-    let ptp_issue = requires_valid_ptp && !ptp_domains.values().any(|s| s.clock_valid);
+    let ptp_issue = !ptp_ok;
     let mut parts = Vec::new();
     if stream_issues > 0 { parts.push(format!("{} stream issue(s)", stream_issues)); }
     if ptp_issue { parts.push("no clock source".to_string()); }
@@ -453,7 +453,7 @@ pub fn print_report(
     }
 
     // ── Clock source required but absent ───────────────────────────────────
-    if requires_valid_ptp && !ptp_domains.values().any(|s| s.clock_valid) {
+    if !ptp_ok {
         let alert = "⚠  No clock source — streams requiring PTP may lose sync";
         logger.log(alert);
         println!("\x1b[31m{}\x1b[0m", alert);

@@ -156,8 +156,32 @@ fn main() {
             }
 
             network_health.calculate_score(&streams, &tcp_streams, &ptp_domains, &msrp_state, &eee_ports);
-            let requires_valid_ptp = cli::protocol_requires_ptp(&selected_protocols);
-            print_report(&streams, &tcp_streams, &ptp_domains, requires_valid_ptp, &mut logger, &network_health, bytes_this_window, &avtp_streams, &msrp_state, &mvrp_vlans, &eee_ports);
+
+            // Version-aware PTP clock check:
+            //   AES67/ST2110 require PTPv2 (a PTPv1 clock is not sufficient)
+            //   Dante accepts PTPv1 or PTPv2
+            //   AVB requires L2 gPTP (protocol_kind = "AVB")
+            let ptp_ok = !cli::protocol_requires_ptp(&selected_protocols) || {
+                let needs_ptpv2 = expanded_protocols.iter().any(|c|
+                    matches!(c, protocols::ProtocolChoice::AES67 | protocols::ProtocolChoice::ST2110));
+                let needs_ptp_any = expanded_protocols.iter().any(|c|
+                    matches!(c, protocols::ProtocolChoice::Dante));
+                let needs_gptp = expanded_protocols.iter().any(|c|
+                    matches!(c, protocols::ProtocolChoice::AVB));
+
+                let has_ptpv2 = ptp_domains.values().any(|s|
+                    s.clock_valid && s.version == protocols::PTP_VERSION_V2
+                    && s.protocol_kind.as_deref() != Some("AVB"));
+                let has_ptp = ptp_domains.values().any(|s| s.clock_valid);
+                let has_gptp = ptp_domains.values().any(|s|
+                    s.clock_valid && s.protocol_kind.as_deref() == Some("AVB"));
+
+                (!needs_ptpv2 || has_ptpv2)
+                && (!needs_ptp_any || has_ptp)
+                && (!needs_gptp || has_gptp)
+            };
+
+            print_report(&streams, &tcp_streams, &ptp_domains, ptp_ok, &mut logger, &network_health, bytes_this_window, &avtp_streams, &msrp_state, &mvrp_vlans, &eee_ports);
             bytes_this_window = 0;
             last_report = Instant::now();
             // Reset per-cycle gap counters so counts reflect the current 5s window
