@@ -66,7 +66,7 @@ pub enum IgmpType {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct PtpInfo {
-    pub version:           u8,                      // PTPv1=0, PTPv2=1
+    pub version:           u8,                      // wire value: PTPv1=1, PTPv2=2
     pub message_type:      u8,
     pub domain:            u8,
     pub clock_id:          Option<String>,

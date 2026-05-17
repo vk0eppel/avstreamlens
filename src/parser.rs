@@ -7,7 +7,7 @@
 /// (SDP, PTP, RTP, TCP, etc.)
 
 use pnet_packet::{
-    ethernet::{EthernetPacket, EtherTypes},
+    ethernet::EthernetPacket,
     ipv4::Ipv4Packet,
     udp::UdpPacket,
     tcp::TcpPacket,
@@ -429,13 +429,32 @@ pub fn parse_mvrp(payload: &[u8]) -> Vec<u16> {
 // SECTION 3 — PROTOCOL DETECTION (ETHERNET/IP/UDP)
 // ══════════════════════════════════════════════════════════
 
+/// Peel off any 802.1Q / 802.1ad VLAN tags and return the inner EtherType
+/// together with the slice of bytes that follows it (the L2 payload).
+///
+/// Handles single and stacked (QinQ) tags. Returns None if the frame is
+/// truncated mid-tag.
+pub fn unwrap_vlan<'a>(eth: &'a EthernetPacket<'a>) -> Option<(u16, &'a [u8])> {
+    let raw = eth.packet();
+    if raw.len() < 14 { return None; }
+    let mut et   = u16::from_be_bytes([raw[12], raw[13]]);
+    let mut off  = 14usize;
+    // 0x8100 = 802.1Q,  0x88A8 = 802.1ad (QinQ),  0x9100 = legacy QinQ
+    while et == 0x8100 || et == 0x88A8 || et == 0x9100 {
+        if raw.len() < off + 4 { return None; }
+        et  = u16::from_be_bytes([raw[off + 2], raw[off + 3]]);
+        off += 4;
+    }
+    Some((et, &raw[off..]))
+}
+
 /// Analyzes an Ethernet frame to determine the encapsulated AV protocol.
 pub fn detect_protocol(eth: &EthernetPacket) -> Option<AvProtocol> {
-    let raw_et = u16::from_be_bytes([eth.packet()[12], eth.packet()[13]]);
+    let (raw_et, l2_payload) = unwrap_vlan(eth)?;
 
     // ── MSRP : L2 (EtherType 0x22EA) ────────────────────
     if raw_et == crate::protocols::ETHERTYPE_MSRP {
-        let decls = parse_msrp(eth.payload());
+        let decls = parse_msrp(l2_payload);
         if !decls.is_empty() {
             return Some(AvProtocol::Msrp { declarations: decls });
         }
@@ -444,12 +463,12 @@ pub fn detect_protocol(eth: &EthernetPacket) -> Option<AvProtocol> {
 
     // ── LLDP : L2 (EtherType 0x88CC) — scan for EEE TLV ─
     if raw_et == crate::protocols::ETHERTYPE_LLDP {
-        return parse_lldp_eee(eth.payload());
+        return parse_lldp_eee(l2_payload);
     }
 
     // ── MVRP : L2 (EtherType 0x88F5) ────────────────────
     if raw_et == crate::protocols::ETHERTYPE_MVRP {
-        let vlan_ids = parse_mvrp(eth.payload());
+        let vlan_ids = parse_mvrp(l2_payload);
         if !vlan_ids.is_empty() {
             return Some(AvProtocol::Mvrp { vlan_ids });
         }
@@ -458,50 +477,49 @@ pub fn detect_protocol(eth: &EthernetPacket) -> Option<AvProtocol> {
 
     // ── AVB / AVTP : L2 pure (EtherType 0x22F0) ─────────
     if raw_et == crate::protocols::ETHERTYPE_AVTP {
-        let subtype   = eth.payload().first().copied().unwrap_or(0);
-        let stream_id = parse_avtp_stream_id(eth.payload());
+        let subtype   = l2_payload.first().copied().unwrap_or(0);
+        let stream_id = parse_avtp_stream_id(l2_payload);
         return Some(AvProtocol::Avb { subtype, stream_id });
     }
 
     // ── gPTP / AVB : L2 (EtherType 0x88F7) ──────────────────────
     // L2 PTP frames carry the PTP payload directly after the Ethernet header — no IP layer.
     if raw_et == crate::protocols::ETHERTYPE_PTP {
-        if let Some(mut info) = parse_ptp(eth.payload()) {
+        if let Some(mut info) = parse_ptp(l2_payload) {
             info.protocol_kind = Some("AVB".to_string());
             return Some(AvProtocol::Ptp { info });
         }
         return None;
     }
 
+    // Non-IPv4 frames are not relevant past this point.
+    if raw_et != 0x0800 { return None; }
+
     // ── IGMP (IP protocol 0x02, no UDP layer) ────────────
-    if eth.get_ethertype() == EtherTypes::Ipv4 {
-        if let Some(ip) = Ipv4Packet::new(eth.payload()) {
-            if ip.get_next_level_protocol().0 == crate::protocols::IP_PROTO_IGMP {
-                let src = ip.get_source();
-                let group = ip.get_destination();
-                let igmp_payload = ip.payload();
-                let igmp_type = if igmp_payload.is_empty() {
-                    crate::protocols::IgmpType::Unknown(0)
-                } else {
-                    match igmp_payload[0] {
-                        0x11 => crate::protocols::IgmpType::Query,   // Membership Query
-                        0x16 | 0x22 => crate::protocols::IgmpType::Join,   // v2 Report / v3 Report
-                        0x17 => crate::protocols::IgmpType::Leave,
-                        t    => crate::protocols::IgmpType::Unknown(t),
-                    }
-                };
-                return Some(AvProtocol::Igmp { src, group, igmp_type });
-            }
+    if let Some(ip) = Ipv4Packet::new(l2_payload) {
+        if ip.get_next_level_protocol().0 == crate::protocols::IP_PROTO_IGMP {
+            let src = ip.get_source();
+            let group = ip.get_destination();
+            let igmp_payload = ip.payload();
+            let igmp_type = if igmp_payload.is_empty() {
+                crate::protocols::IgmpType::Unknown(0)
+            } else {
+                match igmp_payload[0] {
+                    0x11 => crate::protocols::IgmpType::Query,   // Membership Query
+                    0x16 | 0x22 => crate::protocols::IgmpType::Join,   // v2 Report / v3 Report
+                    0x17 => crate::protocols::IgmpType::Leave,
+                    t    => crate::protocols::IgmpType::Unknown(t),
+                }
+            };
+            return Some(AvProtocol::Igmp { src, group, igmp_type });
         }
     }
 
     // NDI stream detection is handled in main.rs via IP-based matching (ndi_sources set
     // populated from mDNS discovery). A port-range check here would cause double-counting.
 
-    if eth.get_ethertype() != EtherTypes::Ipv4 { return None; }
-
     // Try to extract IPv4/UDP layers
-    let ip  = Ipv4Packet::new(eth.payload())?;
+    let ip  = Ipv4Packet::new(l2_payload)?;
     let udp = UdpPacket::new(ip.payload())?;
 
     let src_ip   = ip.get_source();
@@ -581,8 +599,9 @@ pub type TcpData = (Ipv4Addr, Ipv4Addr, u16, u16, bool, bool, bool, u32, u32);
 
 /// Parses a TCP packet to extract flow details (IP addresses, ports, and flags).
 pub fn parse_tcp_packet(eth: &EthernetPacket) -> Option<TcpData> {
-    if eth.get_ethertype() != EtherTypes::Ipv4 { return None; }
-    let ip = Ipv4Packet::new(eth.payload())?;
+    let (et, payload) = unwrap_vlan(eth)?;
+    if et != 0x0800 { return None; }
+    let ip = Ipv4Packet::new(payload)?;
     if ip.get_next_level_protocol() != pnet_packet::ip::IpNextHeaderProtocols::Tcp { return None; }
 
     let tcp = TcpPacket::new(ip.payload())?;
@@ -803,12 +822,12 @@ pub fn parse_ptp(payload: &[u8]) -> Option<PtpInfo> {
     // Anything that doesn't match is PTPv1 (we are already in a PTP context: port 319/320
     // or EtherType 0x88F7, so non-PTP traffic is not a concern here).
     if payload[1] & 0x0F != PTP_VERSION_V2 {
-        // Auto-detect PTPv1 layout by checking the subdomain start:
-        //   nibble-packed (byte[0]=0x11): subdomain at byte 4  → hdr_shift = 2
-        //   separate-byte (byte[0]=0x01): subdomain at byte 2  → hdr_shift = 0
-        // All standard PTPv1 subdomains begin with '_' (0x5F), making payload[4]=='_'
-        // a reliable indicator of the nibble-packed layout.
-        let hdr_shift = if payload.len() >= 5 && payload[4] == b'_' { 2 } else { 0 };
+        // PTPv1 layout selection by header byte 0:
+        //   0x11 = nibble-packed (versionPTP<<4 | versionNetwork) → hdr_shift = 2
+        //   0x01 = separate-byte (versionPTP only)                → hdr_shift = 0
+        // Falling back to subdomain-byte sniffing (payload[4]=='_') breaks for custom
+        // subdomain names that don't start with '_'. Byte 0 is unambiguous per spec.
+        let hdr_shift = if payload[0] == 0x11 { 2 } else { 0 };
         return parse_ptp_v1(payload, hdr_shift);
     }
 
@@ -924,4 +943,443 @@ pub fn parse_ptp(payload: &[u8]) -> Option<PtpInfo> {
         protocol_kind:     None,  // set by caller
         src_ip:            None,  // set by caller
     })
+}
+
+// ═════════════════════════════════════════════════════════════════
+// TESTS
+// ═════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pnet_packet::ethernet::EthernetPacket;
+    use std::net::Ipv4Addr;
+
+    // ── helpers ──────────────────────────────────────────────────────────────
+
+    /// Build a raw Ethernet frame: 12-byte dst+src prefix, then ethertype bytes,
+    /// optional extra bytes (VLAN tags), then payload.
+    fn eth_frame(ethertype: &[u8], extra: &[u8], payload: &[u8]) -> Vec<u8> {
+        let mut f = vec![0u8; 12];
+        f.extend_from_slice(ethertype);
+        f.extend_from_slice(extra);
+        f.extend_from_slice(payload);
+        f
+    }
+
+    /// Build a minimal valid PTPv2 Announce payload (64 bytes).
+    fn ptpv2_announce(gm: [u8; 8], domain: u8, clock_class: u8, clock_acc: u8) -> Vec<u8> {
+        let mut p = vec![0u8; 64];
+        p[0]  = 0x0B;       // messageType = Announce
+        p[1]  = 0x02;       // versionPTP = 2
+        p[4]  = domain;
+        p[20..28].copy_from_slice(&[0xAA,0xBB,0xCC,0xDD,0xEE,0xFF,0x11,0x22]); // clock_id
+        p[30] = 0x00; p[31] = 0x07; // sequenceId = 7
+        p[48] = clock_class;
+        p[49] = clock_acc;
+        p[53..61].copy_from_slice(&gm);
+        p
+    }
+
+    /// Build a minimal PTPv1 nibble-packed Sync payload (66 bytes).
+    fn ptpv1_nibble_sync(gm_uuid: [u8; 6], stratum: u8, ident: &[u8; 4]) -> Vec<u8> {
+        let mut p = vec![0u8; 66];
+        p[0] = 0x11;                        // nibble-packed marker → hdr_shift=2
+        p[4..9].copy_from_slice(b"_DFLT"); // subdomain → domain 0
+        p[32] = 0x00;                       // control = Sync
+        p[50..56].copy_from_slice(&gm_uuid);
+        p[61] = stratum;
+        p[62..66].copy_from_slice(ident);
+        p
+    }
+
+    // ── parse_rtp ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn rtp_valid_extracts_fields() {
+        let p = [
+            0x80, 0x60,              // V=2, PT=96
+            0x00, 0x05,              // seq = 5
+            0x00, 0x00, 0xBB, 0x80, // ts = 48000
+            0xDE, 0xAD, 0xBE, 0xEF, // ssrc
+        ];
+        let (seq, ts, ssrc) = parse_rtp(&p).unwrap();
+        assert_eq!(seq,  5);
+        assert_eq!(ts,   48_000);
+        assert_eq!(ssrc, 0xDEADBEEF);
+    }
+
+    #[test]
+    fn rtp_wrong_version_returns_none() {
+        let mut p = [0u8; 12];
+        p[0] = 0x40; // V=1
+        assert!(parse_rtp(&p).is_none());
+    }
+
+    #[test]
+    fn rtp_too_short_returns_none() {
+        assert!(parse_rtp(&[0x80, 0x60, 0x00]).is_none());
+    }
+
+    // ── parse_ptp — PTPv2 ────────────────────────────────────────────────────
+
+    #[test]
+    fn ptpv2_announce_extracts_grandmaster() {
+        let gm = [0x00, 0x1A, 0xE5, 0xFF, 0xFE, 0x12, 0x34, 0x56];
+        let p  = ptpv2_announce(gm, 0, 6, 0x20);
+        let info = parse_ptp(&p).unwrap();
+        assert_eq!(info.version, 2);
+        assert_eq!(info.domain,  0);
+        assert_eq!(info.grandmaster_id.as_deref(), Some("00:1a:e5:ff:fe:12:34:56"));
+        let q = info.clock_quality.unwrap();
+        assert!(q.contains("Primary reference — locked"), "got: {}", q);
+        assert!(q.contains("< 100 ns"),                  "got: {}", q);
+    }
+
+    #[test]
+    fn ptpv2_announce_domain_preserved() {
+        let p = ptpv2_announce([0; 8], 3, 6, 0x20);
+        assert_eq!(parse_ptp(&p).unwrap().domain, 3);
+    }
+
+    #[test]
+    fn ptpv2_sync_has_no_grandmaster() {
+        let mut p = vec![0u8; 44];
+        p[0] = 0x00; p[1] = 0x02; // Sync, v2
+        let info = parse_ptp(&p).unwrap();
+        assert_eq!(info.message_type, 0x00);
+        assert!(info.grandmaster_id.is_none());
+    }
+
+    #[test]
+    fn ptpv2_too_short_returns_none() {
+        assert!(parse_ptp(&[0x0B, 0x02, 0x00]).is_none());
+    }
+
+    // ── parse_ptp — PTPv1 ────────────────────────────────────────────────────
+
+    #[test]
+    fn ptpv1_nibble_packed_extracts_grandmaster() {
+        let p = ptpv1_nibble_sync([0xAA,0xBB,0xCC,0xDD,0xEE,0xFF], 1, b"GPS ");
+        let info = parse_ptp(&p).unwrap();
+        assert_eq!(info.version, 1);
+        assert_eq!(info.domain,  0);
+        assert_eq!(info.grandmaster_id.as_deref(), Some("aa:bb:cc:dd:ee:ff"));
+        let q = info.clock_quality.unwrap();
+        assert!(q.contains("Primary reference"), "got: {}", q);
+        assert!(q.contains("GPS"),               "got: {}", q);
+    }
+
+    #[test]
+    fn ptpv1_separate_byte_detected() {
+        let mut p = vec![0u8; 40];
+        p[0]  = 0x01; // separate-byte marker → hdr_shift=0
+        p[1]  = 0x01;
+        p[30] = 0x00; // control = Sync
+        let info = parse_ptp(&p).unwrap();
+        assert_eq!(info.version,      1);
+        assert_eq!(info.message_type, 0x00);
+    }
+
+    #[test]
+    fn ptpv1_alt1_subdomain_maps_to_domain_1() {
+        let mut p = vec![0u8; 40];
+        p[0] = 0x01;
+        p[1] = 0x01;
+        p[2..7].copy_from_slice(b"_ALT1"); // hdr_shift=0, sd=2
+        p[30] = 0x01; // Delay_Req
+        let info = parse_ptp(&p).unwrap();
+        assert_eq!(info.domain, 1);
+    }
+
+    // ── unwrap_vlan ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn vlan_untagged_passthrough() {
+        let frame = eth_frame(&[0x22, 0xF0], &[], &[0x01, 0x02]);
+        let eth = EthernetPacket::new(&frame).unwrap();
+        let (et, payload) = unwrap_vlan(&eth).unwrap();
+        assert_eq!(et, 0x22F0);
+        assert_eq!(payload, &[0x01, 0x02]);
+    }
+
+    #[test]
+    fn vlan_single_802_1q_tag_stripped() {
+        // 0x8100 | TCI(2) | inner-ET | payload
+        let frame = eth_frame(&[0x81, 0x00], &[0x00, 0x64, 0x22, 0xF0], &[0xAA, 0xBB]);
+        let eth = EthernetPacket::new(&frame).unwrap();
+        let (et, payload) = unwrap_vlan(&eth).unwrap();
+        assert_eq!(et, 0x22F0);
+        assert_eq!(payload, &[0xAA, 0xBB]);
+    }
+
+    #[test]
+    fn vlan_qinq_both_tags_stripped() {
+        // 0x88A8(outer) | TCI | 0x8100(inner) | TCI | ET | payload
+        let frame = eth_frame(
+            &[0x88, 0xA8],
+            &[0x00, 0x0A, 0x81, 0x00, 0x00, 0x64, 0x22, 0xF0],
+            &[0xCC, 0xDD],
+        );
+        let eth = EthernetPacket::new(&frame).unwrap();
+        let (et, payload) = unwrap_vlan(&eth).unwrap();
+        assert_eq!(et, 0x22F0);
+        assert_eq!(payload, &[0xCC, 0xDD]);
+    }
+
+    // ── parse_sdp ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn sdp_single_media_section_parsed() {
+        let sdp = "v=0\r\no=- 12345 1 IN IP4 192.168.1.1\r\ns=Stage Mix\r\n\
+                   m=audio 5004 RTP/AVP 96\r\nc=IN IP4 239.69.0.1\r\n\
+                   a=rtpmap:96 L24/48000/2\r\na=ptime:1\r\n";
+        let s = parse_sdp(sdp);
+        assert_eq!(s.session_id,   "12345");
+        assert_eq!(s.session_name, "Stage Mix");
+        assert_eq!(s.media.len(), 1);
+        let m = &s.media[0];
+        assert_eq!(m.port,     5004);
+        assert_eq!(m.channels, 2);
+        assert!((m.clock_hz - 48_000.0).abs() < 1.0);
+        assert!((m.ptime_ms - 1.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn sdp_multiple_media_sections_all_captured() {
+        // Verifies the fix that pushes the final media section after the loop.
+        let sdp = "v=0\r\no=- 1 1 IN IP4 1.2.3.4\r\ns=Multi\r\n\
+                   m=audio 5004 RTP/AVP 96\r\na=rtpmap:96 L24/48000/2\r\n\
+                   m=video 5006 RTP/AVP 103\r\na=rtpmap:103 raw/90000\r\n";
+        let s = parse_sdp(sdp);
+        assert_eq!(s.media.len(), 2);
+        assert_eq!(s.media[0].port, 5004);
+        assert_eq!(s.media[1].port, 5006);
+    }
+
+    #[test]
+    fn sdp_ts_refclk_attribute_captured() {
+        let sdp = "v=0\r\no=- 1 1 IN IP4 1.2.3.4\r\ns=X\r\n\
+                   m=audio 5004 RTP/AVP 96\r\na=rtpmap:96 L24/48000\r\n\
+                   a=ts-refclk:ptp=IEEE1588-2008:00-1a-e5-ff-fe-12-34-56:0\r\n";
+        let s = parse_sdp(sdp);
+        assert_eq!(s.media[0].ts_refclk,
+                   "ptp=IEEE1588-2008:00-1a-e5-ff-fe-12-34-56:0");
+    }
+
+    // ── parse_ts_refclk ──────────────────────────────────────────────────────
+
+    #[test]
+    fn ts_refclk_ptpv2_dashes_normalised() {
+        let (id, domain) = parse_ts_refclk(
+            "ptp=IEEE1588-2008:00-1a-e5-ff-fe-12-34-56:0").unwrap();
+        assert_eq!(id,     "00:1a:e5:ff:fe:12:34:56");
+        assert_eq!(domain, 0);
+    }
+
+    #[test]
+    fn ts_refclk_ptpv2_colons_domain_3() {
+        let (id, domain) = parse_ts_refclk(
+            "ptp=IEEE1588-2008:00:1a:e5:ff:fe:12:34:56:3").unwrap();
+        assert_eq!(id,     "00:1a:e5:ff:fe:12:34:56");
+        assert_eq!(domain, 3);
+    }
+
+    #[test]
+    fn ts_refclk_ptpv1_uuid_parsed() {
+        let (id, domain) = parse_ts_refclk(
+            "ptp=IEEE1588-2002:00-1a-e5-ff-fe-12:0").unwrap();
+        assert_eq!(id,     "00:1a:e5:ff:fe:12");
+        assert_eq!(domain, 0);
+    }
+
+    #[test]
+    fn ts_refclk_localmac_returns_none() {
+        assert!(parse_ts_refclk("localmac=00-1a-e5-ff-fe-12-34-56").is_none());
+    }
+
+    // ── parse_msrp ───────────────────────────────────────────────────────────
+
+    fn msrp_talker_advertise_pdu() -> Vec<u8> {
+        // Header: version(1) + type(1) + attr_len(1) + list_len(2)
+        // Then: VectorHeader(2) + FirstValue(25)
+        let mut p = vec![
+            0x00,       // MSRP version
+            0x01,       // attr_type = TalkerAdvertise
+            0x19,       // attr_len = 25
+            0x00, 0x1B, // list_len = 27 (= 2 VectorHeader + 25 FirstValue)
+            0x00, 0x01, // VectorHeader (NumberOfValues=1)
+        ];
+        p.extend_from_slice(&[0xAA,0xBB,0xCC,0xDD,0xEE,0xFF,0x00,0x01]); // stream_id
+        p.extend_from_slice(&[0x01,0x02,0x03,0x04,0x05,0x06]);            // dest_mac
+        p.extend_from_slice(&[0x00, 0x64]);  // vlan_id = 100
+        p.extend_from_slice(&[0x05, 0xDC]);  // max_frame_size = 1500
+        p.extend_from_slice(&[0x00, 0x08]);  // max_interval_frames = 8
+        p.push(0x60);                         // priority byte: (0x60 >> 5) & 7 = 3
+        p.extend_from_slice(&[0x00; 4]);     // padding to reach attr_len=25
+        p
+    }
+
+    #[test]
+    fn msrp_talker_advertise_parsed() {
+        let decls = parse_msrp(&msrp_talker_advertise_pdu());
+        assert_eq!(decls.len(), 1);
+        let d = &decls[0];
+        assert!(matches!(d.decl_type, crate::protocols::MsrpDeclType::TalkerAdvertise));
+        assert_eq!(d.stream_id,           [0xAA,0xBB,0xCC,0xDD,0xEE,0xFF,0x00,0x01]);
+        assert_eq!(d.vlan_id,             Some(100));
+        assert_eq!(d.max_frame_size,      Some(1500));
+        assert_eq!(d.max_interval_frames, Some(8));
+        assert_eq!(d.priority,            Some(3));
+    }
+
+    #[test]
+    fn msrp_empty_payload_returns_empty() {
+        assert!(parse_msrp(&[]).is_empty());
+    }
+
+    #[test]
+    fn msrp_wrong_version_returns_empty() {
+        assert!(parse_msrp(&[0x01, 0x00]).is_empty());
+    }
+
+    // ── parse_mvrp ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn mvrp_single_vlan_id_parsed() {
+        let p = [
+            0x00,       // version
+            0x01,       // attr_type = VLAN member
+            0x02,       // attr_len = 2
+            0x00, 0x04, // list_len = 4
+            0x00, 0x01, // VectorHeader
+            0x00, 0x64, // FirstValue = VLAN 100
+        ];
+        assert_eq!(parse_mvrp(&p), vec![100]);
+    }
+
+    #[test]
+    fn mvrp_empty_returns_empty() {
+        assert!(parse_mvrp(&[]).is_empty());
+    }
+
+    // ── parse_lldp_eee ───────────────────────────────────────────────────────
+
+    fn lldp_with_eee(tx: u16, rx: u16) -> Vec<u8> {
+        let mut p = Vec::new();
+        // Chassis ID TLV: type=1, len=7 → header = (1<<9)|7 = 0x0207
+        p.extend_from_slice(&[0x02, 0x07, 0x04, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF]);
+        // Port ID TLV: type=2, len=7 → header = (2<<9)|7 = 0x0407
+        p.extend_from_slice(&[0x04, 0x07, 0x03, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66]);
+        // EEE TLV: type=127, len=14 → header = (127<<9)|14 = 0xFE0E
+        // Value: OUI(3) + subtype(1) + Tw_sys_tx(2) + Tw_sys_rx(2) + zeros(8)
+        p.extend_from_slice(&[0xFE, 0x0E, 0x00, 0x12, 0x0F, 0x05]);
+        p.extend_from_slice(&tx.to_be_bytes());
+        p.extend_from_slice(&rx.to_be_bytes());
+        p.extend_from_slice(&[0x00; 8]);
+        // End of LLDPDU
+        p.extend_from_slice(&[0x00, 0x00]);
+        p
+    }
+
+    #[test]
+    fn lldp_eee_detected_with_wake_times() {
+        let proto = parse_lldp_eee(&lldp_with_eee(16, 16)).unwrap();
+        match proto {
+            crate::protocols::AvProtocol::LldpEee { tx_wake_us, rx_wake_us, .. } => {
+                assert_eq!(tx_wake_us, 16);
+                assert_eq!(rx_wake_us, 16);
+            }
+            _ => panic!("expected LldpEee variant"),
+        }
+    }
+
+    #[test]
+    fn lldp_eee_zero_wake_times_ignored() {
+        // EEE TLV present but both wake times are 0 — should not report as EEE
+        assert!(parse_lldp_eee(&lldp_with_eee(0, 0)).is_none());
+    }
+
+    #[test]
+    fn lldp_no_eee_tlv_returns_none() {
+        let p = [
+            0x02, 0x07, 0x04, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, // chassis
+            0x04, 0x07, 0x03, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, // port
+            0x00, 0x00, // end
+        ];
+        assert!(parse_lldp_eee(&p).is_none());
+    }
+
+    // ── is_likely_dante_audio ────────────────────────────────────────────────
+
+    #[test]
+    fn dante_audio_both_ports_in_range_even() {
+        assert!(is_likely_dante_audio(5002, 5004, 96));
+    }
+
+    #[test]
+    fn dante_audio_ephemeral_src_port_rejected() {
+        assert!(!is_likely_dante_audio(50000, 5004, 96));
+    }
+
+    #[test]
+    fn dante_audio_odd_dst_port_rejected() {
+        assert!(!is_likely_dante_audio(5002, 5005, 96));
+    }
+
+    #[test]
+    fn dante_audio_dst_out_of_range_rejected() {
+        assert!(!is_likely_dante_audio(5002, 6002, 96));
+    }
+
+    // ── multicast helpers ────────────────────────────────────────────────────
+
+    #[test]
+    fn aes67_multicast_address_recognised() {
+        assert!( is_aes67_multicast( Ipv4Addr::new(239, 69, 0, 1)));
+        assert!(!is_aes67_multicast( Ipv4Addr::new(239,  0, 0, 1)));
+        assert!(!is_aes67_multicast( Ipv4Addr::new(192,168, 1, 1)));
+    }
+
+    #[test]
+    fn st2110_multicast_address_recognised() {
+        assert!( is_st2110_multicast(Ipv4Addr::new(239,  0, 0, 1)));
+        assert!(!is_st2110_multicast(Ipv4Addr::new(239, 69, 0, 1))); // AES67, not ST2110
+        assert!(!is_st2110_multicast(Ipv4Addr::new(192,168, 1, 1)));
+    }
+
+    // ── mDNS name extraction ─────────────────────────────────────────────────
+
+    #[test]
+    fn dante_name_extracted_from_mdns_label() {
+        // DNS label encoding: \x05Stage + \x09_netaudio
+        let mut p = vec![0x05, b'S', b't', b'a', b'g', b'e'];
+        p.extend_from_slice(b"\x09_netaudio");
+        assert_eq!(extract_dante_name(&p), Some("Stage".to_string()));
+    }
+
+    #[test]
+    fn ndi_name_extracted_from_mdns_label() {
+        // DNS label encoding: \x06Source + \x04_ndi
+        let mut p = vec![0x06, b'S', b'o', b'u', b'r', b'c', b'e'];
+        p.extend_from_slice(b"\x04_ndi");
+        assert_eq!(extract_ndi_name(&p), Some("Source".to_string()));
+    }
+
+    #[test]
+    fn dante_name_absent_returns_none() {
+        assert!(extract_dante_name(b"no matching service here").is_none());
+    }
+
+    // ── map_ptpv1_subdomain ──────────────────────────────────────────────────
+
+    #[test]
+    fn ptpv1_subdomain_maps_to_domain_number() {
+        let make = |s: &[u8]| { let mut a = [0u8; 16]; a[..s.len()].copy_from_slice(s); a };
+        assert_eq!(map_ptpv1_subdomain(&make(b"_DFLT")), 0);
+        assert_eq!(map_ptpv1_subdomain(&make(b"_ALT1")), 1);
+        assert_eq!(map_ptpv1_subdomain(&make(b"_ALT2")), 2);
+        assert_eq!(map_ptpv1_subdomain(&make(b"_ALT3")), 3);
+        assert_eq!(map_ptpv1_subdomain(&make(b"custom")), 0); // unknown → default 0
+    }
 }

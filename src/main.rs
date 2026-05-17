@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 // Import types from modules
 use crate::protocols::{AvProtocol, SdpSession, DanteKind, NdiKind, St2110Type, IgmpType, MsrpDeclType};
 use crate::stats::{StreamStats, TcpStreamStats, NetworkHealth, PtpStats, StreamQuality, AvtpStreamStats};
-use crate::parser::{detect_protocol, parse_tcp_packet, parse_rtp, parse_ts_refclk, is_multicast, is_aes67_multicast, is_st2110_multicast};
+use crate::parser::{detect_protocol, parse_tcp_packet, parse_rtp, parse_ts_refclk, is_multicast, is_aes67_multicast, is_st2110_multicast, unwrap_vlan};
 use crate::report::{create_logger, print_report};
 
 // Constants from protocols module
@@ -77,8 +77,9 @@ fn main() {
     // NDI sender IPs learned from mDNS — used for IP-based stream detection
     // (official NDI SDK assigns ports dynamically, port-range matching is unreliable)
     let mut ndi_sources: std::collections::HashSet<Ipv4Addr> = std::collections::HashSet::new();
-    // Deduplicates IGMP Join console output — cleared on Leave so re-joins print again
-    let mut igmp_joins_seen: std::collections::HashSet<(Ipv4Addr, Ipv4Addr)> = std::collections::HashSet::new();
+    // Deduplicates IGMP Join console output — cleared on Leave so re-joins print again.
+    // Stores last-seen Instant so abandoned entries (host crash, no Leave) can be purged.
+    let mut igmp_joins_seen: std::collections::HashMap<(Ipv4Addr, Ipv4Addr), Instant> = std::collections::HashMap::new();
     // Dante device names learned from mDNS TXT records, keyed by transmitter IP
     let mut dante_names: std::collections::HashMap<Ipv4Addr, String> = std::collections::HashMap::new();
     // NDI source names learned from mDNS TXT records, keyed by source IP
@@ -175,11 +176,16 @@ fn main() {
             avtp_streams.retain(|_, s| {
                 s.last_seen.elapsed().as_secs() < STREAM_TIMEOUT_SECS * 2
             });
+            // Drop IGMP Join entries from hosts that vanished without sending a Leave
+            // (cable pull, crash). 5 minutes is well above the IGMPv2 query interval.
+            igmp_joins_seen.retain(|_, t| t.elapsed() < Duration::from_secs(300));
         }
 
         let packet = match cap.next_packet() { Ok(p) => p, Err(_) => continue };
         let eth    = match EthernetPacket::new(packet.data) { Some(e) => e, _ => continue };
         let now    = Instant::now();
+        // VLAN-unwrapped L2 payload (handles 802.1Q / QinQ tagged frames).
+        let (l2_et, l2_payload) = unwrap_vlan(&eth).unwrap_or((0, &[][..]));
 
         if let Some(proto) = detect_protocol(&eth) {
             let should_process = match &proto {
@@ -239,7 +245,7 @@ fn main() {
                             s.clock_hz_confirmed = confirmed;
                             s
                         });
-                        if let Some(ip) = pnet_packet::ipv4::Ipv4Packet::new(eth.payload()) {
+                        if let Some(ip) = pnet_packet::ipv4::Ipv4Packet::new(l2_payload) {
                             if let Some(udp) = pnet_packet::udp::UdpPacket::new(ip.payload()) {
                                 network_health.track_dscp(&ip);
                                 if let Some((seq, ts, ssrc)) = parse_rtp(udp.payload()) {
@@ -287,7 +293,7 @@ fn main() {
                             }
                             s
                         });
-                        if let Some(ip) = pnet_packet::ipv4::Ipv4Packet::new(eth.payload()) {
+                        if let Some(ip) = pnet_packet::ipv4::Ipv4Packet::new(l2_payload) {
                             if let Some(udp) = pnet_packet::udp::UdpPacket::new(ip.payload()) {
                                 network_health.track_dscp(&ip);
                                 if let Some((seq, ts, ssrc)) = parse_rtp(udp.payload()) {
@@ -324,7 +330,7 @@ fn main() {
                                         s.sdp_name = dante_names.get(&src).cloned();
                                         s
                                     });
-                                if let Some(ip) = pnet_packet::ipv4::Ipv4Packet::new(eth.payload()) {
+                                if let Some(ip) = pnet_packet::ipv4::Ipv4Packet::new(l2_payload) {
                                     if let Some(udp) = pnet_packet::udp::UdpPacket::new(ip.payload()) {
                                         network_health.track_dscp(&ip); // fix: DSCP was missing for Dante
                                         if let Some((seq, ts, ssrc)) = parse_rtp(udp.payload()) {
@@ -380,10 +386,14 @@ fn main() {
                             entry.last_seen = now;
                             entry.update_bitrate(frame_bytes, now);
                             // Sequence loss detection (8-bit wrapping counter)
+                            // Negative signed delta = reorder/reset, not loss (mirrors RTP fix).
                             if let (Some(seq), Some(last)) = (avtp_seq, entry.last_seq) {
                                 let expected = last.wrapping_add(1);
                                 if seq != expected {
-                                    entry.lost_frames += seq.wrapping_sub(expected) as u64;
+                                    let delta = seq.wrapping_sub(expected) as i8;
+                                    if delta > 0 {
+                                        entry.lost_frames += delta as u64;
+                                    }
                                 }
                             }
                             if let Some(s) = avtp_seq { entry.last_seq = Some(s); }
@@ -443,7 +453,9 @@ fn main() {
                     AvProtocol::Igmp { src, group, igmp_type } => {
                         match &igmp_type {
                             IgmpType::Join => {
-                                if igmp_joins_seen.insert((src, group)) {
+                                let first_time = !igmp_joins_seen.contains_key(&(src, group));
+                                igmp_joins_seen.insert((src, group), now);
+                                if first_time {
                                     let msg = format!("➕ IGMP Join: {} → group {}", src, group);
                                     println!("{}", msg);
                                     logger.log(&msg);
@@ -482,7 +494,11 @@ fn main() {
         }
 
         // ── Hoist IPv4 parse — shared by NDI detection and health tracking ───
-        let outer_ip = pnet_packet::ipv4::Ipv4Packet::new(eth.payload());
+        let outer_ip = if l2_et == 0x0800 {
+            pnet_packet::ipv4::Ipv4Packet::new(l2_payload)
+        } else {
+            None
+        };
 
         // ── NDI stream via known source IP ───────────────────────────────────
         // The official NDI SDK uses dynamically assigned ports advertised in mDNS.

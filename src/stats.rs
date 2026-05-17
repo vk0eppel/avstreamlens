@@ -129,7 +129,9 @@ impl StreamStats {
                 } else {
                     48 // fallback: 1 ms @ 48 kHz
                 };
-                let actual_diff = rtp_ts.wrapping_sub(last_ts) as i64;
+                // Cast through i32 first to preserve sign — u32::wrapping_sub
+                // returns u32, and `as i64` would always be non-negative.
+                let actual_diff = rtp_ts.wrapping_sub(last_ts) as i32 as i64;
                 if expected_diff > 0 &&
                    ((actual_diff as f64) < (expected_diff as f64 * 0.5) ||
                     (actual_diff as f64) > (expected_diff as f64 * 1.5))
@@ -154,7 +156,8 @@ impl StreamStats {
 
         if let (Some(last_ts), Some(last_time)) = (self.last_rtp_ts, self.last_arrival) {
             let arrival_diff = now.duration_since(last_time).as_secs_f64();
-            let rtp_diff     = rtp_ts.wrapping_sub(last_ts) as f64 / self.clock_hz;
+            // Preserve sign on wrap: RTP timestamps may rarely go backward (reorder).
+            let rtp_diff     = (rtp_ts.wrapping_sub(last_ts) as i32) as f64 / self.clock_hz;
             let d            = (arrival_diff - rtp_diff).abs();
             self.jitter     += (d - self.jitter) / 16.0;
         }
@@ -360,8 +363,13 @@ pub struct NetworkHealth {
 impl NetworkHealth {
     pub fn track_dscp(&mut self, ip: &pnet_packet::ipv4::Ipv4Packet) {
         self.dscp_total += 1;
-        if ip.get_dscp() != 46 { self.dscp_violations += 1; }
-        if ip.get_ecn() == 3   { self.ecn_congestion_marks += 1; }
+        // Accepted markings for AV traffic:
+        //   EF (46) — standard AES67/ST2110 audio + control
+        //   CS5 (40) — Cisco IP-NGN video
+        //   AF41 (34) — alternative video class
+        let dscp = ip.get_dscp();
+        if !matches!(dscp, 46 | 40 | 34) { self.dscp_violations += 1; }
+        if ip.get_ecn() == 3 { self.ecn_congestion_marks += 1; }
     }
 
     pub fn new() -> Self {
@@ -622,5 +630,123 @@ impl PtpStats {
             return true;
         }
         false
+    }
+}
+// ═════════════════════════════════════════════════════════════════
+// TESTS
+// ═════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn aes67() -> StreamStats {
+        StreamStats::new("AES67", 48_000.0)
+    }
+
+    // ── Loss counter ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn no_loss_on_sequential_packets() {
+        let mut s = aes67();
+        s.update(0, 0,  1, 100);
+        s.update(1, 48, 1, 100);
+        s.update(2, 96, 1, 100);
+        assert_eq!(s.lost_packets, 0);
+        assert_eq!(s.packets, 3);
+    }
+
+    #[test]
+    fn loss_counted_on_seq_gap() {
+        let mut s = aes67();
+        s.update(0, 0,   1, 100);
+        s.update(3, 144, 1, 100); // skipped seq 1 and 2 → 2 lost
+        assert_eq!(s.lost_packets, 2);
+    }
+
+    #[test]
+    fn no_loss_on_seq_number_wrap() {
+        // 0xFFFF → 0x0000 is the normal 16-bit wrap, not a loss
+        let mut s = aes67();
+        s.update(0xFFFE, 0,  1, 100);
+        s.update(0xFFFF, 48, 1, 100);
+        s.update(0x0000, 96, 1, 100);
+        assert_eq!(s.lost_packets, 0);
+    }
+
+    #[test]
+    fn backward_seq_not_counted_as_loss() {
+        // Out-of-order / reordered packet — should be ignored, not add 65000+ to lost_packets
+        let mut s = aes67();
+        s.update(10, 0, 1, 100);
+        s.update(5,  0, 1, 100); // backward
+        assert_eq!(s.lost_packets, 0);
+    }
+
+    // ── SSRC tracking ────────────────────────────────────────────────────────
+
+    #[test]
+    fn ssrc_change_increments_counter() {
+        let mut s = aes67();
+        s.update(0, 0,  0xAAAA, 100);
+        s.update(1, 48, 0xBBBB, 100); // source changed
+        assert_eq!(s.ssrc_changes, 1);
+    }
+
+    #[test]
+    fn stable_ssrc_no_change_counted() {
+        let mut s = aes67();
+        s.update(0, 0,  0xAAAA, 100);
+        s.update(1, 48, 0xAAAA, 100);
+        s.update(2, 96, 0xAAAA, 100);
+        assert_eq!(s.ssrc_changes, 0);
+    }
+
+    // ── loss_pct ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn loss_pct_zero_when_no_packets() {
+        assert_eq!(aes67().loss_pct(), 0.0);
+    }
+
+    #[test]
+    fn loss_pct_correct_with_gap() {
+        let mut s = aes67();
+        s.update(0, 0,   1, 100); // received
+        s.update(3, 144, 1, 100); // received — but 2 lost
+        // received=2, lost=2, total=4 → 50%
+        let pct = s.loss_pct();
+        assert!((pct - 50.0).abs() < 0.1, "expected 50%, got {:.1}%", pct);
+    }
+
+    // ── TS discontinuity sign fix ─────────────────────────────────────────────
+
+    #[test]
+    fn ts_discontinuity_not_fired_on_first_packet() {
+        let mut s = aes67();
+        s.clock_hz_confirmed = true;
+        s.ptime_ms = 1.0;
+        s.update(0, 0, 1, 100); // baseline — no previous ts to compare
+        assert_eq!(s.ts_discontinuities, 0);
+    }
+
+    #[test]
+    fn ts_discontinuity_fired_on_double_interval() {
+        let mut s = aes67();
+        s.clock_hz_confirmed = true;
+        s.ptime_ms = 1.0; // expected diff = 48 samples
+        s.update(0, 0,   1, 100);
+        s.update(1, 96,  1, 100); // diff=96 = 2× expected → discontinuity
+        assert_eq!(s.ts_discontinuities, 1);
+    }
+
+    #[test]
+    fn ts_discontinuity_not_fired_on_normal_increment() {
+        let mut s = aes67();
+        s.clock_hz_confirmed = true;
+        s.ptime_ms = 1.0;
+        s.update(0, 0,  1, 100);
+        s.update(1, 48, 1, 100); // exactly on time
+        assert_eq!(s.ts_discontinuities, 0);
     }
 }

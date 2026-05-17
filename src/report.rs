@@ -26,10 +26,12 @@ impl Logger {
         Ok(Logger { file })
     }
 
-    /// Log a message to the file.
+    /// Log a message to the file. Flushes immediately so the last lines
+    /// survive a crash or SIGINT.
     pub fn log(&mut self, message: &str) {
         use std::io::Write;
         let _ = writeln!(self.file, "{}", message);
+        let _ = self.file.flush();
     }
 
 }
@@ -210,7 +212,9 @@ pub fn print_report(
             println!("\x1b[33m{}\x1b[0m", alert);
         }
 
-        if s.protocol == "Dante" && (s.loss_pct() > 0.0 || s.jitter_ms() > 15.0) {
+        // 0.1% loss ≈ ~3 dropped packets per 5s window at 1ms ptime — below that is
+        // usually capture jitter, not a real subscription/clock fault.
+        if s.protocol == "Dante" && (s.loss_pct() > 0.1 || s.jitter_ms() > 15.0) {
             let alert = "    ⚠  Dante clock or subscription issue";
             logger.log(alert);
             println!("\x1b[33m{}\x1b[0m", alert);
@@ -230,7 +234,12 @@ pub fn print_report(
         }
 
         // Gap 3: stream not yet announced via SAP
-        if !s.clock_hz_confirmed && s.packets > 10 {
+        // Only applies to RTP-based protocols that carry SDP (AES67, ST2110, Dante).
+        // AVB and NDI never publish SDP — skip the warning.
+        let expects_sdp = s.protocol == "AES67"
+            || s.protocol == "Dante"
+            || s.protocol.starts_with("2110-");
+        if expects_sdp && !s.clock_hz_confirmed && s.packets > 10 {
             let alert = "    ⚑  Stream not announced (no SAP) — audio glitch detection unavailable";
             logger.log(alert);
             println!("{}", alert);
@@ -482,7 +491,7 @@ pub fn print_report(
     let qos_str = if health.dscp_total == 0 {
         "QoS: – (no AV streams)".to_string()
     } else if health.dscp_violations == 0 {
-        format!("QoS: ✓ DSCP EF ({} pkts)", health.dscp_total)
+        format!("QoS: ✓ DSCP marked ({} pkts)", health.dscp_total)
     } else {
         let pct = health.dscp_violations * 100 / health.dscp_total;
         let pct_str = if pct == 0 { "<1".to_string() } else { pct.to_string() };
