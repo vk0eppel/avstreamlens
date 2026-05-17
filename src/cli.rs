@@ -116,15 +116,14 @@ pub fn build_bpf_filter(selected: &[ProtocolChoice]) -> String {
     let needs_udp = expanded.iter().any(|c| c.needs_udp());
     let needs_tcp = expanded.iter().any(|c| c.needs_tcp());
     let needs_avb = expanded.iter().any(|c| c.needs_avb());
-    let needs_ptp = expanded.iter().any(|c| c.needs_ptp_filter());
 
     let mut filters = vec!["igmp".to_string()];
     if needs_udp { filters.push("udp".to_string()); }
     if needs_tcp { filters.push("tcp".to_string()); }
     if needs_avb { filters.push("(ether proto 0x22f0) or (ether proto 0x22ea) or (ether proto 0x88f5)".to_string()); }
-    // LLDP is always included — EEE detection is infrastructure-level, not protocol-specific
+    // LLDP and gPTP are always included — PTP/EEE are monitored regardless of protocol selection
     filters.push("(ether proto 0x88cc)".to_string());
-    if needs_ptp { filters.push("(ether proto 0x88f7)".to_string()); }
+    filters.push("(ether proto 0x88f7)".to_string());
 
     if filters.len() == 1 {
         all_protocols_filter()
