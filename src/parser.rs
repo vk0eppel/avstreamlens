@@ -1,10 +1,5 @@
 // AVStreamLens — src/parser.rs
-// Contains all functions responsible for detecting the type of network traffic
-// and parsing the metadata packets (SDP, PTP, RTP, TCP, etc.).
-
-/// AVStreamLens — parser.rs
-/// Functions for network traffic detection and protocol parsing
-/// (SDP, PTP, RTP, TCP, etc.)
+// Protocol detection and packet parsing (SDP, RTP, PTP, AVTP, LLDP, etc.)
 
 use pnet_packet::{
     ethernet::EthernetPacket,
@@ -17,11 +12,6 @@ use pnet_packet::{
 use crate::protocols::{AvProtocol, St2110Type, DanteKind, NdiKind, SdpSession, SdpMedia, PtpInfo, MsrpDeclaration, MsrpDeclType, DEFAULT_CLOCK_HZ, PTP_VERSION_V1, PTP_VERSION_V2};
 use std::net::Ipv4Addr;
 
-// Constants for network filtering and detection
-// BPF filter string for default monitoring
-// Multicast detection for AV/PTP streams
-// BPF filter string for default monitoring
-pub const DEFAULT_BPF_FILTER: &str = "udp or (ether proto 0x22F0) or (ether proto 0x88F7)";
 // Class D: 224.0.0.0 to 239.255.255.255
 pub fn is_multicast(ip: Ipv4Addr) -> bool {
     ip.octets()[0] >= 224 && ip.octets()[0] <= 239
@@ -52,8 +42,8 @@ pub fn is_likely_dante_audio(src: u16, dst: u16, pt: u8) -> bool {
     // Dante requires BOTH endpoints to use even ports in 5000-6000 (transmitter and receiver
     // are both allocated from this range). OR logic produces false positives when any app
     // uses a Dante-range source port while sending to a high ephemeral destination port.
-    let port_ok = ((5000..=6000).contains(&dst) && dst % 2 == 0)
-               && ((5000..=6000).contains(&src) && src % 2 == 0);
+    let port_ok = ((5000..=6000).contains(&dst) && dst.is_multiple_of(2))
+               && ((5000..=6000).contains(&src) && src.is_multiple_of(2));
     (pt == 0 || pt == 8 || pt >= 96) && port_ok
 }
 // Check if mDNS payload contains a specific service string (e.g., "_netaudio._udp" or "_ndi._tcp")
@@ -119,10 +109,10 @@ pub fn parse_sap_packet(payload: &[u8]) -> Option<SdpSession> {
     let mut body = &payload[header..];
 
     // Optional: MIME type "application/sdp\0" before SDP body
-    if body.starts_with(b"application/sdp") {
-        if let Some(pos) = body.iter().position(|&b| b == 0) {
-            body = &body[pos + 1..];
-        }
+    if body.starts_with(b"application/sdp")
+        && let Some(pos) = body.iter().position(|&b| b == 0)
+    {
+        body = &body[pos + 1..];
     }
 
     let sdp_text = std::str::from_utf8(body).ok()?;
@@ -150,22 +140,22 @@ pub fn parse_sdp(sdp: &str) -> SdpSession {
 
             's' => { session.session_name = value.to_string(); }
 
-            'i' => { if cur_media.is_none() { session.info = value.to_string(); } }
+            'i' if cur_media.is_none() => { session.info = value.to_string(); }
 
             'm' => {
                 if let Some(m) = cur_media.take() { session.media.push(m); }
                 // m=<type> <port> <proto> <fmt...>
                 let parts: Vec<&str> = value.split_whitespace().collect();
                 if parts.len() >= 4 {
-                    let mut media       = SdpMedia::default();
-                    media.media_type    = parts[0].to_string();
-                    media.port          = parts[1].parse().unwrap_or(0);
-                    for pt_str in &parts[3..] {
-                        if let Ok(pt) = pt_str.parse::<u8>() {
-                            media.payload_types.push(pt);
-                        }
-                    }
-                    cur_media = Some(media);
+                    let payload_types = parts[3..].iter()
+                        .filter_map(|s| s.parse::<u8>().ok())
+                        .collect();
+                    cur_media = Some(SdpMedia {
+                        media_type: parts[0].to_string(),
+                        port: parts[1].parse().unwrap_or(0),
+                        payload_types,
+                        ..SdpMedia::default()
+                    });
                 }
             }
 
@@ -194,10 +184,10 @@ pub fn parse_sdp(sdp: &str) -> SdpSession {
 
                 } else if let Some(rest) = value.strip_prefix("framecount:") {
                     // a=framecount:<n>  (ST 2110) → converted to ptime
-                    if let Ok(fc) = rest.trim().parse::<u32>() {
-                        if media.clock_hz > 0.0 {
-                            media.ptime_ms = fc as f64 / media.clock_hz * 1000.0;
-                        }
+                    if let Ok(fc) = rest.trim().parse::<u32>()
+                        && media.clock_hz > 0.0
+                    {
+                        media.ptime_ms = fc as f64 / media.clock_hz * 1000.0;
                     }
                 } else if let Some(rest) = value.strip_prefix("ts-refclk:") {
                     // a=ts-refclk:ptp=IEEE1588-2008:<eui64>:<domain>
@@ -250,16 +240,8 @@ pub fn parse_lldp_eee(payload: &[u8]) -> Option<crate::protocols::AvProtocol> {
         let value = &payload[pos..pos + tlv_len];
 
         match tlv_type {
-            1 => { // Chassis ID
-                if tlv_len >= 2 {
-                    chassis_id = format_lldp_id(&value[1..]);
-                }
-            }
-            2 => { // Port ID
-                if tlv_len >= 2 {
-                    port_id = format_lldp_id(&value[1..]);
-                }
-            }
+            1 if tlv_len >= 2 => { chassis_id = format_lldp_id(&value[1..]); } // Chassis ID
+            2 if tlv_len >= 2 => { port_id    = format_lldp_id(&value[1..]); } // Port ID
             127 if tlv_len >= 4 => { // Organizationally Specific
                 let oui     = (value[0] as u32) << 16 | (value[1] as u32) << 8 | value[2] as u32;
                 let subtype = value[3];
@@ -290,10 +272,10 @@ pub fn parse_lldp_eee(payload: &[u8]) -> Option<crate::protocols::AvProtocol> {
 
 fn format_lldp_id(bytes: &[u8]) -> String {
     // Try UTF-8 first (port descriptions are often ASCII)
-    if let Ok(s) = std::str::from_utf8(bytes) {
-        if s.chars().all(|c| c.is_ascii_graphic() || c == ' ') {
-            return s.trim().to_string();
-        }
+    if let Ok(s) = std::str::from_utf8(bytes)
+        && s.chars().all(|c| c.is_ascii_graphic() || c == ' ')
+    {
+        return s.trim().to_string();
     }
     // Fall back to colon-separated hex
     bytes.iter().map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join(":")
@@ -496,23 +478,23 @@ pub fn detect_protocol(eth: &EthernetPacket) -> Option<AvProtocol> {
     if raw_et != 0x0800 { return None; }
 
     // ── IGMP (IP protocol 0x02, no UDP layer) ────────────
-    if let Some(ip) = Ipv4Packet::new(l2_payload) {
-        if ip.get_next_level_protocol().0 == crate::protocols::IP_PROTO_IGMP {
-            let src = ip.get_source();
-            let group = ip.get_destination();
-            let igmp_payload = ip.payload();
-            let igmp_type = if igmp_payload.is_empty() {
-                crate::protocols::IgmpType::Unknown(0)
-            } else {
-                match igmp_payload[0] {
-                    0x11 => crate::protocols::IgmpType::Query,   // Membership Query
-                    0x16 | 0x22 => crate::protocols::IgmpType::Join,   // v2 Report / v3 Report
-                    0x17 => crate::protocols::IgmpType::Leave,
-                    t    => crate::protocols::IgmpType::Unknown(t),
-                }
-            };
-            return Some(AvProtocol::Igmp { src, group, igmp_type });
-        }
+    if let Some(ip) = Ipv4Packet::new(l2_payload)
+        && ip.get_next_level_protocol().0 == crate::protocols::IP_PROTO_IGMP
+    {
+        let src = ip.get_source();
+        let group = ip.get_destination();
+        let igmp_payload = ip.payload();
+        let igmp_type = if igmp_payload.is_empty() {
+            crate::protocols::IgmpType::Unknown(0)
+        } else {
+            match igmp_payload[0] {
+                0x11 => crate::protocols::IgmpType::Query,
+                0x16 | 0x22 => crate::protocols::IgmpType::Join,
+                0x17 => crate::protocols::IgmpType::Leave,
+                t    => crate::protocols::IgmpType::Unknown(t),
+            }
+        };
+        return Some(AvProtocol::Igmp { src, group, igmp_type });
     }
 
     // NDI stream detection is handled in main.rs via IP-based matching (ndi_sources set
@@ -554,16 +536,20 @@ pub fn detect_protocol(eth: &EthernetPacket) -> Option<AvProtocol> {
 
     // ── PTP over UDP (ports 319/320) ─────────────────────
     // Must come before the RTP gate: PTP payloads don't have RTP version bits set.
-    if dst_port == crate::protocols::PTP_EVENT_PORT || dst_port == crate::protocols::PTP_GENERAL_PORT || src_port == crate::protocols::PTP_EVENT_PORT || src_port == crate::protocols::PTP_GENERAL_PORT {
-        if let Some(mut info) = parse_ptp(payload) {
-            info.protocol_kind = Some(if info.version == crate::protocols::PTP_VERSION_V1 {
-                "PTPv1".to_string()
-            } else {
-                "PTPv2".to_string()
-            });
-            info.src_ip = Some(src_ip);
-            return Some(AvProtocol::Ptp { info });
-        }
+    let is_ptp_port = dst_port == crate::protocols::PTP_EVENT_PORT
+        || dst_port == crate::protocols::PTP_GENERAL_PORT
+        || src_port == crate::protocols::PTP_EVENT_PORT
+        || src_port == crate::protocols::PTP_GENERAL_PORT;
+    if is_ptp_port
+        && let Some(mut info) = parse_ptp(payload)
+    {
+        info.protocol_kind = Some(if info.version == crate::protocols::PTP_VERSION_V1 {
+            "PTPv1".to_string()
+        } else {
+            "PTPv2".to_string()
+        });
+        info.src_ip = Some(src_ip);
+        return Some(AvProtocol::Ptp { info });
     }
 
     // ── RTP Streams ─────────────────────────────────────────
@@ -643,13 +629,8 @@ pub fn parse_rtp(payload: &[u8]) -> Option<(u16, u32, u32)> {
 /// Returns `None` for non-PTP types (`localmac=...`, etc.).
 /// The returned ID uses lowercase colon-separated bytes, matching `PtpStats::last_grandmaster`.
 pub fn parse_ts_refclk(s: &str) -> Option<(String, u8)> {
-    let rest = if let Some(r) = s.strip_prefix("ptp=IEEE1588-2008:") {
-        r
-    } else if let Some(r) = s.strip_prefix("ptp=IEEE1588-2002:") {
-        r
-    } else {
-        return None;
-    };
+    let rest = s.strip_prefix("ptp=IEEE1588-2008:")
+        .or_else(|| s.strip_prefix("ptp=IEEE1588-2002:"))?;
 
     // The last colon-separated token is the domain number; everything before is the clock ID.
     // EUI-64 example: "00-1d-c1-ff-fe-12-34-56:0"  or  "00:1d:c1:ff:fe:12:34:56:0"

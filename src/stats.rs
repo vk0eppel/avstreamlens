@@ -121,37 +121,37 @@ impl StreamStats {
         // ── Timestamp discontinuity detection ────────
         // Only runs when clock rate is confirmed from SDP — default 48 kHz would produce
         // false positives on 96 kHz or 44.1 kHz streams.
-        if self.clock_hz_confirmed {
-            if let Some(last_ts) = self.last_rtp_ts {
-                let expected_diff = if self.clock_hz > 0.0 {
-                    let ptime_ms = if self.ptime_ms > 0.0 { self.ptime_ms } else { 1.0 };
-                    (self.clock_hz * ptime_ms / 1000.0) as i64
-                } else {
-                    48 // fallback: 1 ms @ 48 kHz
-                };
-                // Cast through i32 first to preserve sign — u32::wrapping_sub
-                // returns u32, and `as i64` would always be non-negative.
-                let actual_diff = rtp_ts.wrapping_sub(last_ts) as i32 as i64;
-                if expected_diff > 0 &&
-                   ((actual_diff as f64) < (expected_diff as f64 * 0.5) ||
-                    (actual_diff as f64) > (expected_diff as f64 * 1.5))
-                {
-                    self.ts_discontinuities += 1;
-                }
-                self.last_ts_diff = Some(actual_diff);
+        if self.clock_hz_confirmed
+            && let Some(last_ts) = self.last_rtp_ts
+        {
+            let expected_diff = if self.clock_hz > 0.0 {
+                let ptime_ms = if self.ptime_ms > 0.0 { self.ptime_ms } else { 1.0 };
+                (self.clock_hz * ptime_ms / 1000.0) as i64
+            } else {
+                48 // fallback: 1 ms @ 48 kHz
+            };
+            // Cast through i32 first to preserve sign — u32::wrapping_sub
+            // returns u32, and `as i64` would always be non-negative.
+            let actual_diff = rtp_ts.wrapping_sub(last_ts) as i32 as i64;
+            if expected_diff > 0 &&
+               ((actual_diff as f64) < (expected_diff as f64 * 0.5) ||
+                (actual_diff as f64) > (expected_diff as f64 * 1.5))
+            {
+                self.ts_discontinuities += 1;
             }
+            self.last_ts_diff = Some(actual_diff);
         }
 
         // ── RFC 3550 §6.4.1 Jitter + IAT burst detection ──────────
         let now = Instant::now();
 
         // IAT burst: ptime_ms > 0 means SDP confirmed the expected packet interval
-        if self.ptime_ms > 0.0 {
-            if let Some(last_time) = self.last_arrival {
-                let iat_ms = now.duration_since(last_time).as_secs_f64() * 1000.0;
-                if iat_ms > self.max_iat_ms { self.max_iat_ms = iat_ms; }
-                if iat_ms > 50.0 { self.gap_events += 1; }
-            }
+        if self.ptime_ms > 0.0
+            && let Some(last_time) = self.last_arrival
+        {
+            let iat_ms = now.duration_since(last_time).as_secs_f64() * 1000.0;
+            if iat_ms > self.max_iat_ms { self.max_iat_ms = iat_ms; }
+            if iat_ms > 50.0 { self.gap_events += 1; }
         }
 
         if let (Some(last_ts), Some(last_time)) = (self.last_rtp_ts, self.last_arrival) {
@@ -165,10 +165,8 @@ impl StreamStats {
         self.last_arrival = Some(now);
 
         // ── SSRC tracking ────────────────────────────
-        if let Some(prev_ssrc) = self.last_ssrc {
-            if prev_ssrc != ssrc {
-                self.ssrc_changes += 1;
-            }
+        if self.last_ssrc.is_some_and(|prev| prev != ssrc) {
+            self.ssrc_changes += 1;
         }
         self.last_ssrc = Some(ssrc);
         self.last_packet_time = Some(now);
@@ -201,7 +199,6 @@ impl StreamStats {
 #[derive(Debug, Clone)]
 pub struct AvtpStreamStats {
     pub stream_id:          [u8; 8],
-    pub subtype:            u8,
     pub packets:            u64,
     pub lost_frames:        u64,         // AVTP sequence counter drops
     pub last_seq:           Option<u8>,  // last AVTP sequence byte (byte 2 of header)
@@ -213,10 +210,9 @@ pub struct AvtpStreamStats {
 }
 
 impl AvtpStreamStats {
-    pub fn new(stream_id: [u8; 8], subtype: u8) -> Self {
+    pub fn new(stream_id: [u8; 8]) -> Self {
         Self {
             stream_id,
-            subtype,
             packets:            0,
             lost_frames:        0,
             last_seq:           None,
@@ -260,9 +256,7 @@ impl AvtpStreamStats {
 pub struct TcpStreamStats {
     pub key: String,
     pub src_ip: Ipv4Addr,
-    pub src_port: u16,
     pub dst_ip: Ipv4Addr,
-    pub dst_port: u16,
     pub packets: u64,
     pub bytes: u64,
     pub retransmissions: u64,
@@ -292,9 +286,7 @@ impl TcpStreamStats {
         Self {
             key,
             src_ip,
-            src_port,
             dst_ip,
-            dst_port,
             packets: 0,
             bytes: 0,
             retransmissions: 0,
@@ -345,19 +337,15 @@ pub struct NetworkHealth {
     pub packet_loss_streams: u64,
     pub high_jitter_streams: u64,
     pub aes67_discontinuities: u64,
-    pub timestamp_errors: u64,
     pub tcp_retransmissions: u64,
-    pub congestion_events: u64,
-    pub saturation_warnings: u64,
     pub network_score: f64,
     // QoS / DSCP tracking
-    pub dscp_total: u64,                 // AV packets checked for DSCP marking
-    pub dscp_violations: u64,            // AV packets without DSCP EF (46)
+    pub dscp_total: u64,
+    pub dscp_violations: u64,
     // Congestion (ECN)
-    pub ecn_congestion_marks: u64,       // IP ECN=CE packets (congestion signalled by router)
+    pub ecn_congestion_marks: u64,
     // IGMP / snooping
-    pub last_igmp_query: Option<Instant>, // last IGMP Membership Query seen
-    pub igmp_leave_events: u64,          // Leave events on active multicast groups
+    pub last_igmp_query: Option<Instant>,
 }
 
 impl NetworkHealth {
@@ -380,16 +368,12 @@ impl NetworkHealth {
             packet_loss_streams: 0,
             high_jitter_streams: 0,
             aes67_discontinuities: 0,
-            timestamp_errors: 0,
             tcp_retransmissions: 0,
-            congestion_events: 0,
-            saturation_warnings: 0,
             network_score: 100.0,
             dscp_total: 0,
             dscp_violations: 0,
             ecn_congestion_marks: 0,
             last_igmp_query: None,
-            igmp_leave_events: 0,
         }
     }
 
@@ -433,7 +417,7 @@ impl NetworkHealth {
             if stats.ssrc_changes > 0 {
                 score -= 10.0 * (stats.ssrc_changes as f64).min(3.0);
             }
-            if stats.last_packet_time.map_or(false, |t| t.elapsed() > Duration::from_secs(crate::protocols::STREAM_TIMEOUT_SECS)) {
+            if stats.last_packet_time.is_some_and(|t| t.elapsed() > Duration::from_secs(crate::protocols::STREAM_TIMEOUT_SECS)) {
                 score -= 30.0;
             }
             if stats.gap_events > 0 {

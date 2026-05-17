@@ -145,13 +145,13 @@ fn main() {
             }
             // Aggregate NDI bitrate from all TCP flows matching the source IP
             for stream in streams.values_mut() {
-                if stream.protocol == "NDI" {
-                    if let Some(src_ip) = stream.dst_ip {
-                        stream.bitrate_bps = tcp_streams.values()
-                            .filter(|t| t.src_ip == src_ip || t.dst_ip == src_ip)
-                            .map(|t| t.bitrate_bps)
-                            .sum();
-                    }
+                if stream.protocol == "NDI"
+                    && let Some(src_ip) = stream.dst_ip
+                {
+                    stream.bitrate_bps = tcp_streams.values()
+                        .filter(|t| t.src_ip == src_ip || t.dst_ip == src_ip)
+                        .map(|t| t.bitrate_bps)
+                        .sum();
                 }
             }
 
@@ -167,7 +167,7 @@ fn main() {
             }
             streams.retain(|_, s| {
                 s.last_packet_time
-                    .map_or(true, |t| t.elapsed().as_secs() < STREAM_TIMEOUT_SECS * 2)
+                    .is_none_or(|t| t.elapsed().as_secs() < STREAM_TIMEOUT_SECS * 2)
             });
             tcp_streams.retain(|_, s| {
                 s.last_seen.elapsed().as_secs() < STREAM_TIMEOUT_SECS * 2
@@ -245,15 +245,15 @@ fn main() {
                             s.clock_hz_confirmed = confirmed;
                             s
                         });
-                        if let Some(ip) = pnet_packet::ipv4::Ipv4Packet::new(l2_payload) {
-                            if let Some(udp) = pnet_packet::udp::UdpPacket::new(ip.payload()) {
-                                network_health.track_dscp(&ip);
-                                if let Some((seq, ts, ssrc)) = parse_rtp(udp.payload()) {
-                                    if let Some(exp) = stats.expected_pt {
-                                        if payload_type != exp { stats.pt_mismatches += 1; }
-                                    }
-                                    stats.update(seq, ts, ssrc, udp.payload().len());
+                        if let Some(ip) = pnet_packet::ipv4::Ipv4Packet::new(l2_payload)
+                            && let Some(udp) = pnet_packet::udp::UdpPacket::new(ip.payload())
+                        {
+                            network_health.track_dscp(&ip);
+                            if let Some((seq, ts, ssrc)) = parse_rtp(udp.payload()) {
+                                if stats.expected_pt.is_some_and(|exp| payload_type != exp) {
+                                    stats.pt_mismatches += 1;
                                 }
+                                stats.update(seq, ts, ssrc, udp.payload().len());
                             }
                         }
                     }
@@ -293,17 +293,16 @@ fn main() {
                             }
                             s
                         });
-                        if let Some(ip) = pnet_packet::ipv4::Ipv4Packet::new(l2_payload) {
-                            if let Some(udp) = pnet_packet::udp::UdpPacket::new(ip.payload()) {
-                                network_health.track_dscp(&ip);
-                                if let Some((seq, ts, ssrc)) = parse_rtp(udp.payload()) {
-                                    // Payload type is byte 1 (& 0x7F) of the RTP payload
-                                    let rtp_pt = udp.payload()[1] & 0x7F;
-                                    if let Some(exp) = stats.expected_pt {
-                                        if rtp_pt != exp { stats.pt_mismatches += 1; }
-                                    }
-                                    stats.update(seq, ts, ssrc, udp.payload().len());
+                        if let Some(ip) = pnet_packet::ipv4::Ipv4Packet::new(l2_payload)
+                            && let Some(udp) = pnet_packet::udp::UdpPacket::new(ip.payload())
+                        {
+                            network_health.track_dscp(&ip);
+                            if let Some((seq, ts, ssrc)) = parse_rtp(udp.payload()) {
+                                let rtp_pt = udp.payload()[1] & 0x7F;
+                                if stats.expected_pt.is_some_and(|exp| rtp_pt != exp) {
+                                    stats.pt_mismatches += 1;
                                 }
+                                stats.update(seq, ts, ssrc, udp.payload().len());
                             }
                         }
                     }
@@ -330,12 +329,12 @@ fn main() {
                                         s.sdp_name = dante_names.get(&src).cloned();
                                         s
                                     });
-                                if let Some(ip) = pnet_packet::ipv4::Ipv4Packet::new(l2_payload) {
-                                    if let Some(udp) = pnet_packet::udp::UdpPacket::new(ip.payload()) {
-                                        network_health.track_dscp(&ip); // fix: DSCP was missing for Dante
-                                        if let Some((seq, ts, ssrc)) = parse_rtp(udp.payload()) {
-                                            stats.update(seq, ts, ssrc, udp.payload().len());
-                                        }
+                                if let Some(ip) = pnet_packet::ipv4::Ipv4Packet::new(l2_payload)
+                                    && let Some(udp) = pnet_packet::udp::UdpPacket::new(ip.payload())
+                                {
+                                    network_health.track_dscp(&ip);
+                                    if let Some((seq, ts, ssrc)) = parse_rtp(udp.payload()) {
+                                        stats.update(seq, ts, ssrc, udp.payload().len());
                                     }
                                 }
                             }
@@ -343,20 +342,15 @@ fn main() {
                     }
 
                     // ── NDI ──────────────────────────────────────
-                    AvProtocol::Ndi { kind, src } => {
-                        match kind {
-                            NdiKind::Discovery { source_name } => {
-                                ndi_sources.insert(src);
-                                if let Some(ref name) = source_name {
-                                    ndi_names.insert(src, name.clone());
-                                }
-                                let label = source_name.as_deref().unwrap_or("unknown source");
-                                let msg = format!("🔍 NDI source: {}  \"{}\"", src, label);
-                                println!("{}", msg);
-                                logger.log(&msg);
-                            }
-                            _ => {}
+                    AvProtocol::Ndi { kind: NdiKind::Discovery { source_name }, src } => {
+                        ndi_sources.insert(src);
+                        if let Some(ref name) = source_name {
+                            ndi_names.insert(src, name.clone());
                         }
+                        let label = source_name.as_deref().unwrap_or("unknown source");
+                        let msg = format!("🔍 NDI source: {}  \"{}\"", src, label);
+                        println!("{}", msg);
+                        logger.log(&msg);
                     }
 
                     // ── AVB ──────────────────────────────────────
@@ -381,7 +375,7 @@ fn main() {
                             // AVTP sequence counter is byte 2 of the AVTP payload
                             let avtp_seq = eth.payload().get(2).copied();
                             let entry = avtp_streams.entry(sid)
-                                .or_insert_with(|| AvtpStreamStats::new(sid, subtype));
+                                .or_insert_with(|| AvtpStreamStats::new(sid));
                             entry.packets += 1;
                             entry.last_seen = now;
                             entry.update_bitrate(frame_bytes, now);
@@ -488,7 +482,6 @@ fn main() {
                         }
                     }
 
-                    _ => {}
                 }
             }
         }
@@ -505,38 +498,37 @@ fn main() {
         // Port-range matching is unreliable; we identify NDI traffic by the sender
         // IP learned from mDNS discovery instead.
         let ndi_selected = expanded_protocols.iter().any(|c| matches!(c, protocols::ProtocolChoice::NDI | protocols::ProtocolChoice::All));
-        if ndi_selected {
-        if let Some(ref ip) = outer_ip {
-            if !ndi_sources.is_empty()
-                && ip.get_next_level_protocol() == pnet_packet::ip::IpNextHeaderProtocols::Tcp
-            {
-                let s = ip.get_source();
-                let d = ip.get_destination();
-                let sender = if ndi_sources.contains(&s) { Some(s) }
-                            else if ndi_sources.contains(&d) { Some(d) }
-                            else { None };
-                if let Some(sender_ip) = sender {
-                    let stats = streams.entry(format!("NDI {}", sender_ip))
-                        .or_insert_with(|| {
-                            let mut s = StreamStats::new_with_info("NDI", 0.0, false, sender_ip, 0);
-                            s.sdp_name = ndi_names.get(&sender_ip).cloned();
-                            s
-                        });
-                    stats.packets += 1;
-                    stats.last_packet_time = Some(now);
-                }
+        if ndi_selected
+            && let Some(ref ip) = outer_ip
+            && !ndi_sources.is_empty()
+            && ip.get_next_level_protocol() == pnet_packet::ip::IpNextHeaderProtocols::Tcp
+        {
+            let s = ip.get_source();
+            let d = ip.get_destination();
+            let sender = if ndi_sources.contains(&s) { Some(s) }
+                        else if ndi_sources.contains(&d) { Some(d) }
+                        else { None };
+            if let Some(sender_ip) = sender {
+                let stats = streams.entry(format!("NDI {}", sender_ip))
+                    .or_insert_with(|| {
+                        let mut s = StreamStats::new_with_info("NDI", 0.0, false, sender_ip, 0);
+                        s.sdp_name = ndi_names.get(&sender_ip).cloned();
+                        s
+                    });
+                stats.packets += 1;
+                stats.last_packet_time = Some(now);
             }
         }
-        } // ndi_selected
 
         // ── TCP Monitoring — NDI ports only ──────────────────
         // Only track TCP flows on NDI ports (5960-5980). Unrelated TCP (HTTP, SSH, etc.)
         // is ignored even when `tcp` is in the BPF filter, keeping the report clean.
-        let is_tcp = outer_ip.as_ref().map_or(false, |ip| {
+        let is_tcp = outer_ip.as_ref().is_some_and(|ip| {
             ip.get_next_level_protocol() == pnet_packet::ip::IpNextHeaderProtocols::Tcp
         });
-        if is_tcp {
-        if let Some((src_ip, dst_ip, src_port, dst_port, has_fin, has_syn, has_rst, seq, ack)) = parse_tcp_packet(&eth) {
+        if is_tcp
+            && let Some((src_ip, dst_ip, src_port, dst_port, has_fin, has_syn, has_rst, seq, ack)) = parse_tcp_packet(&eth)
+        {
             let ndi_range = protocols::NDI_PORT_MIN..=protocols::NDI_PORT_MAX;
             let is_ndi = ndi_range.contains(&src_port) || ndi_range.contains(&dst_port)
                       || ndi_sources.contains(&src_ip) || ndi_sources.contains(&dst_ip);
@@ -546,8 +538,7 @@ fn main() {
                 tcp_stat.packets += 1;
                 tcp_stat.last_seen = now;
 
-                let frame_size = eth.packet().len() as u64;
-                let estimated_payload = if frame_size > 40 { frame_size - 40 } else { 0 };
+                let estimated_payload = (eth.packet().len() as u64).saturating_sub(40);
                 tcp_stat.bytes += estimated_payload;
 
                 if has_fin { tcp_stat.fin_packets += 1; }
@@ -556,15 +547,14 @@ fn main() {
                     network_health.tcp_retransmissions += 1;
                 }
 
-                if !has_syn {
-                    if let Some(last_seq) = tcp_stat.last_seq {
-                        // Wrap-aware: negative delta means seq went backward → retransmission
-                        let delta = seq.wrapping_sub(last_seq) as i32;
-                        if delta < 0 && tcp_stat.packets > 2 {
-                            tcp_stat.retransmissions += 1;
-                            network_health.tcp_retransmissions += 1;
-                        }
-                    }
+                // Wrap-aware: negative delta means seq went backward → retransmission
+                if !has_syn
+                    && let Some(last_seq) = tcp_stat.last_seq
+                    && (seq.wrapping_sub(last_seq) as i32) < 0
+                    && tcp_stat.packets > 2
+                {
+                    tcp_stat.retransmissions += 1;
+                    network_health.tcp_retransmissions += 1;
                 }
                 // Advance last_seq only when seq moves forward (wrap-aware)
                 if let Some(last_seq) = tcp_stat.last_seq {
@@ -579,7 +569,6 @@ fn main() {
                 tcp_stat.update_bitrate();
                 tcp_stat.update_quality();
             }
-        } // end is_tcp guard
         }
 
         // ── Network health tracking ───────────────────────────

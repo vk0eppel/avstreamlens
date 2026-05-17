@@ -87,34 +87,31 @@ pub struct PtpInfo {
 }
 
 // Protocol choice enumeration
+#[allow(clippy::upper_case_acronyms)]
 #[derive(Debug, Clone, PartialEq)]
 pub enum ProtocolChoice {
-    All,            // Monitor all standard AV protocols (PTP/IGMP always active)
-    AES67,          // Audio over RTP
-    Audio,          // Audio streams (AES67 + Dante + AVB)
-    Video,          // Video streams (ST2110 + NDI)
-    ST2110,         // SMPTE ST 2110
-    Dante,          // Dante digital audio
-    NDI,            // NDI (NewTek/Vizrt)
-    AVB,            // Audio Video Bridging
-    PTP,            // Precision Time Protocol
-    IGMP,           // IGMP membership
+    All,    // Monitor all standard AV protocols (PTP/IGMP always active)
+    AES67,  // Audio over RTP
+    Audio,  // Audio streams (AES67 + Dante + AVB)
+    Video,  // Video streams (ST2110 + NDI)
+    ST2110, // SMPTE ST 2110
+    Dante,  // Dante digital audio
+    NDI,    // NDI (NewTek/Vizrt)
+    AVB,    // Audio Video Bridging
 }
 
 impl ProtocolChoice {
     /// Human-readable name for protocol choice
     pub fn name(&self) -> &'static str {
         match self {
-            ProtocolChoice::All   => "All",
-            ProtocolChoice::AES67 => "AES67",
-            ProtocolChoice::Audio => "Audio (AES67 + Dante + AVB)",
-            ProtocolChoice::Video => "Video (ST2110 + NDI)",
+            ProtocolChoice::All    => "All",
+            ProtocolChoice::AES67  => "AES67",
+            ProtocolChoice::Audio  => "Audio (AES67 + Dante + AVB)",
+            ProtocolChoice::Video  => "Video (ST2110 + NDI)",
             ProtocolChoice::ST2110 => "ST2110",
-            ProtocolChoice::Dante => "Dante",
-            ProtocolChoice::NDI   => "NDI",
-            ProtocolChoice::AVB   => "AVB",
-            ProtocolChoice::PTP   => "PTP",
-            ProtocolChoice::IGMP  => "IGMP",
+            ProtocolChoice::Dante  => "Dante",
+            ProtocolChoice::NDI    => "NDI",
+            ProtocolChoice::AVB    => "AVB",
         }
     }
 
@@ -129,10 +126,6 @@ impl ProtocolChoice {
         matches!(self, ProtocolChoice::NDI)
     }
 
-    pub fn needs_ptp(&self) -> bool {
-        self.needs_ptp_filter() || self.requires_valid_ptp_clock()
-    }
-
     /// Does this protocol require AVB (Ethernet AV) filtering?
     pub fn needs_avb(&self) -> bool {
         matches!(self, ProtocolChoice::AVB)
@@ -140,7 +133,7 @@ impl ProtocolChoice {
 
     /// Does this protocol require PTP filter in BPF?
     pub fn needs_ptp_filter(&self) -> bool {
-        matches!(self, ProtocolChoice::PTP)
+        false // PTP/IGMP are always captured via the all_protocols_filter path
     }
 
     /// Does this protocol require a valid PTP clock?
@@ -243,7 +236,6 @@ pub enum DanteKind {
 #[derive(Debug, Clone, PartialEq)]
 pub enum NdiKind {
     Discovery { source_name: Option<String> },
-    Stream,
 }
 
 // ── SDP metadata (from SAP/SDP parser) ──

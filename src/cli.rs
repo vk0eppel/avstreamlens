@@ -116,7 +116,7 @@ pub fn build_bpf_filter(selected: &[ProtocolChoice]) -> String {
     let needs_udp = expanded.iter().any(|c| c.needs_udp());
     let needs_tcp = expanded.iter().any(|c| c.needs_tcp());
     let needs_avb = expanded.iter().any(|c| c.needs_avb());
-    let needs_ptp = expanded.iter().any(|c| c.needs_ptp());
+    let needs_ptp = expanded.iter().any(|c| c.needs_ptp_filter());
 
     let mut filters = vec!["igmp".to_string()];
     if needs_udp { filters.push("udp".to_string()); }

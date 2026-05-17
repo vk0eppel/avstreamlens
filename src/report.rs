@@ -48,6 +48,7 @@ pub fn create_logger(prefix: &str) -> std::io::Result<Logger> {
 /// - TCP stream quality and diagnostics
 /// - PTP domain synchronization status
 /// - Protocol-specific warnings and alerts
+#[allow(clippy::too_many_arguments)]
 pub fn print_report(
     streams: &HashMap<String, StreamStats>,
     tcp_streams: &HashMap<String, TcpStreamStats>,
@@ -75,7 +76,8 @@ pub fn print_report(
 
     let mbps = bytes_this_window as f64 * 8.0 / 5_000_000.0;
 
-    let protocol_groups: &[(&str, fn(&str) -> bool)] = &[
+    type ProtocolGroup = (&'static str, fn(&str) -> bool);
+    let protocol_groups: &[ProtocolGroup] = &[
         ("AES67",  |p| p == "AES67"),
         ("ST2110", |p| p.starts_with("2110-")),
         ("Dante",  |p| p == "Dante"),
@@ -114,7 +116,7 @@ pub fn print_report(
             || s.jitter_ms() > 20.0
             || s.ts_discontinuities > 0
             || s.ssrc_changes > 0
-            || s.last_packet_time.map_or(false, |t| t.elapsed() > Duration::from_secs(STREAM_TIMEOUT_SECS))
+            || s.last_packet_time.is_some_and(|t| t.elapsed() > Duration::from_secs(STREAM_TIMEOUT_SECS))
     }).count();
     let ptp_issue = requires_valid_ptp && !ptp_domains.values().any(|s| s.clock_valid);
     let mut parts = Vec::new();
@@ -137,7 +139,7 @@ pub fn print_report(
     }
 
     // ── RTP Streams Report ──────────────────────────────────────────────────
-    let group_order = vec!["AES67", "AVB", "Dante", "NDI", "ST"];
+    let group_order = ["AES67", "AVB", "Dante", "NDI", "ST"];
     let mut keys: Vec<&String> = streams.keys().collect();
     keys.sort_by(|a, b| {
         let a_group = group_order
@@ -262,12 +264,12 @@ pub fn print_report(
             println!("\x1b[33m{}\x1b[0m", alert);
         }
 
-        if let Some(last_time) = s.last_packet_time {
-            if last_time.elapsed() > Duration::from_secs(STREAM_TIMEOUT_SECS) {
-                let alert = format!("    💀 No signal for {:.0}s", last_time.elapsed().as_secs_f64());
-                logger.log(&alert);
-                println!("\x1b[31m{}\x1b[0m", alert);
-            }
+        if let Some(last_time) = s.last_packet_time
+            && last_time.elapsed() > Duration::from_secs(STREAM_TIMEOUT_SECS)
+        {
+            let alert = format!("    💀 No signal for {:.0}s", last_time.elapsed().as_secs_f64());
+            logger.log(&alert);
+            println!("\x1b[31m{}\x1b[0m", alert);
         }
     }
 
@@ -303,9 +305,8 @@ pub fn print_report(
                 println!("\x1b[31m{}\x1b[0m", alert);
             }
             if tcp_stat.retransmissions > 5 {
-                let alert = format!("    ⚠  High retransmission rate detected");
-                logger.log(&alert);
-                println!("\x1b[33m{}\x1b[0m", alert);
+                logger.log("    ⚠  High retransmission rate detected");
+                println!("\x1b[33m    ⚠  High retransmission rate detected\x1b[0m");
             }
         }
     }
@@ -449,20 +450,20 @@ pub fn print_report(
                 println!("{}", quality_line);
             }
 
-            if let Some(offset_ns) = stats.last_offset_ns {
-                if offset_ns != 0 {
-                    let offset_line = if offset_ns.unsigned_abs() >= 1_000 {
-                        format!("      correction: {:.1} µs", offset_ns as f64 / 1_000.0)
-                    } else {
-                        format!("      correction: {} ns", offset_ns)
-                    };
-                    logger.log(&offset_line);
-                    println!("{}", offset_line);
-                    if offset_ns.unsigned_abs() > 1_000 {
-                        let alert = "      ⚠  Large PTP correction field — transparent clock or path issue";
-                        logger.log(alert);
-                        println!("\x1b[33m{}\x1b[0m", alert);
-                    }
+            if let Some(offset_ns) = stats.last_offset_ns
+                && offset_ns != 0
+            {
+                let offset_line = if offset_ns.unsigned_abs() >= 1_000 {
+                    format!("      correction: {:.1} µs", offset_ns as f64 / 1_000.0)
+                } else {
+                    format!("      correction: {} ns", offset_ns)
+                };
+                logger.log(&offset_line);
+                println!("{}", offset_line);
+                if offset_ns.unsigned_abs() > 1_000 {
+                    let alert = "      ⚠  Large PTP correction field — transparent clock or path issue";
+                    logger.log(alert);
+                    println!("\x1b[33m{}\x1b[0m", alert);
                 }
             }
 
