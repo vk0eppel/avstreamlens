@@ -64,9 +64,7 @@ pub fn print_report(
 ) {
     let now = Local::now();
     let timestamp = now.format("%Y-%m-%d %H:%M:%S").to_string();
-    let score = format!("{:.0}%", health.network_score);
-    
-    let header_line = format!("{} | AVStreamLens report  |  Health: {}", timestamp, score);
+    let header_line = format!("{} | AVStreamLens report", timestamp);
 
     logger.log(&header_line);
 
@@ -451,8 +449,9 @@ pub fn print_report(
     }
 
     // ── Network health ──────────────────────────────────────────────────────
-    logger.log("\nNetwork Health:");
-    println!("\n\x1b[36m🔬 Network Health:\x1b[0m");
+    let score = format!("{:.0}%", health.network_score);
+    logger.log(&format!("\nNetwork Health — {}:", score));
+    println!("\n\x1b[36m🔬 Network Health — {}:\x1b[0m", score);
 
     let qos_str = if health.dscp_total == 0 {
         "QoS: – (no AV streams)".to_string()
