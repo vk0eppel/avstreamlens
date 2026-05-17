@@ -33,12 +33,16 @@ brew install libpcap   # usually already present
 sudo apt install libpcap-dev
 ```
 
+**Windows**
+
+Install [Npcap](https://npcap.com) (the modern WinPcap replacement). During installation, enable **"Install Npcap in WinPcap API-compatible mode"**.
+
 **Rust toolchain**
 ```
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 ```
 
-Capturing packets requires elevated privileges — run as `sudo` or grant the binary `cap_net_raw`.
+Capturing packets requires elevated privileges — run as `sudo` on macOS/Linux, or as **Administrator** on Windows.
 
 ---
 
@@ -147,7 +151,8 @@ The health percentage reflects the overall network quality. Factors that reduce 
 
 ## Platform Notes
 
-- **macOS and Linux only** — requires libpcap
+- **macOS and Linux** — requires libpcap
+- **Windows** — requires [Npcap](https://npcap.com); run as Administrator; colour output requires Windows Terminal or VS Code (not supported in classic `cmd.exe`)
 - Loopback (`lo`/`lo0`) is excluded — macOS loopback uses a non-Ethernet link layer incompatible with the packet parser
 - Promiscuous mode is enabled automatically on the selected interface
-- Virtual and tunnel interfaces (utun, awdl, docker, vpn…) are filtered from the interface list
+- Virtual and tunnel interfaces (utun, awdl, docker, vpn…) are filtered from the interface list on macOS/Linux; Windows interface names are passed through as-is
