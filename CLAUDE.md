@@ -144,17 +144,19 @@ cargo clippy -- -D warnings  # lint
 
 ## Report Design
 - **Audience**: AV engineers, not network admins — plain English alerts, no raw hex or packet counts
-- **Four sections** (all use cyan `\x1b[36m` header + emoji):
+- **Report header**: cyan rule line + `AVStreamLens  ·  <timestamp>` + rule line — separates successive 5-second reports
+- **Four sections** (all use cyan `\x1b[36m` header + emoji); log file output matches console exactly:
   1. Overview — bandwidth + stream count summary + `✓/⚠/–` status line
-  2. `📡 Streams:` — unified list of all active streams (AES67, Dante, ST2110, NDI, AVB) sorted by protocol
+  2. `📡 Streams:` — unified list of all active streams (AES67, Dante, ST2110, NDI, AVB), no blank lines between entries
   3. `🕐 Clock Sources:` — PTP domains (conditional)
-  4. `🔬 Network Health:` — QoS/DSCP, IGMP querier, EEE
+  4. `🔬 Network Health — X%:` — health score + QoS/DSCP + IGMP querier + EEE
 - Stream entry format: `  ▸ Protocol  "Name"  [codec]  —  IP:port` / `    metrics line` / `    ⚠  alerts`
   - RTP streams (AES67/Dante/ST2110): metrics = `loss: X%  |  jitter: X ms  |  X Mbps`
   - NDI: metrics = `quality  |  X Mbps  |  retrans: N` (TCP quality, no RTP metrics)
   - AVB: metrics = `loss: X%  |  X Mbps` + MSRP/VLAN reservation state inline
 - DSCP: accepts EF (46), CS5 (40), AF41 (34) as valid AV markings — shown as "DSCP marked"
-- ECN congestion marks penalise health score silently (not shown in report)
+- ECN congestion marks: penalise score (−2 each, capped −20) **and** shown as `⚠  ECN: N congestion mark(s)` alert when > 0
+- EEE: shown only when detected — absence is NOT reported (switch may not send LLDP, so absence ≠ disabled)
 - Clock Sources: protocol label prominent; domain number only when multiple domains
 
 ---

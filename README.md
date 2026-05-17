@@ -87,38 +87,32 @@ Choose the protocols to monitor:
 ## Report Layout
 
 ```
-╔═════════════════════════════════════════════════════════════════╗
-║  2026-05-17 14:32:00 | AVStreamLens report  |  Health: 97%
-╚═════════════════════════════════════════════════════════════════╝
+──────────────────────────────────────────────────────────────────
+  AVStreamLens  ·  2026-05-17 14:32:00
+──────────────────────────────────────────────────────────────────
 
 📊 Bandwidth: 12.4 Mbps (last 5s)  |  AES67: 3  |  Dante: 1
 ✓  All streams healthy
 
 📡 Streams:
-
   ▸ AES67  "Stage Mix"  [L24/48000/2]  —  239.69.0.1:5004
     loss: 0.0%  |  jitter: 0.18 ms  |  2.3 Mbps
-
   ▸ Dante  "Stage Box"  —  192.168.1.45:5010
     loss: 0.0%  |  jitter: 0.04 ms  |  0.8 Mbps
-
   ▸ NDI  "Studio Camera"  —  192.168.1.46
     healthy  |  120.3 Mbps  |  retrans: 0
-
   ▸ AVB  IEC 61883  —  00:1a:e5:ff:fe:12:34:56:0001
     loss: 0.0%  |  2.3 Mbps
     ✓  Reserved  VLAN 100  prio 3  ✓  Listener Ready
 
 🕐 Clock Sources:
-
   ✓  PTPv2  —  grandmaster 00:1a:e5:ff:fe:78:9a:bc  (192.168.1.1)
     clock quality: Primary reference — locked  < 100 ns
   ✓  PTPv1  —  grandmaster 00:1a:e5:ff:fe:12:34:56
     clock quality: Primary reference  GPS
   ✓  AVB  —  grandmaster 00:1a:e5:ff:fe:ab:cd:ef
 
-🔬 Network Health:
-
+🔬 Network Health — 97%:
    QoS: ✓ DSCP marked (1247 pkts)  |  IGMP: ✓ querier 42s ago
    ⚠  EEE active on 1 switch port(s) — may cause audio/video glitches
       port "Gi0/1"  chassis 00:1a:2b:3c:4d:5e  Tx wake: 16µs  Rx wake: 16µs

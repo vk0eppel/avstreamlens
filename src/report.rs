@@ -68,9 +68,10 @@ pub fn print_report(
 
     logger.log(&header_line);
 
-    println!("\n\x1b[36m╔═════════════════════════════════════════════════════════════════╗\x1b[0m");
-    println!("\x1b[36m║  {}\x1b[0m", header_line);
-    println!("\x1b[36m╚═════════════════════════════════════════════════════════════════╝\x1b[0m");
+    let rule = "─".repeat(66);
+    println!("\n\x1b[36m{}\x1b[0m", rule);
+    println!("\x1b[36m  AVStreamLens  ·  {}\x1b[0m", timestamp);
+    println!("\x1b[36m{}\x1b[0m", rule);
 
     let mbps = bytes_this_window as f64 * 8.0 / 5_000_000.0;
 
@@ -181,7 +182,7 @@ pub fn print_report(
             None                       => String::new(),
         };
 
-        let stream_line = format!("\n  ▸ {}{}{}{}", proto_label, name_str, codec_str, addr_str);
+        let stream_line = format!("  ▸ {}{}{}{}", proto_label, name_str, codec_str, addr_str);
         logger.log(&stream_line);
         println!("{}", stream_line);
 
@@ -304,7 +305,7 @@ pub fn print_report(
         sorted.sort_by_key(|s| s.stream_id);
         for avtp in sorted {
             let dead = avtp.last_seen.elapsed() > Duration::from_secs(STREAM_TIMEOUT_SECS);
-            let stream_line = format!("\n  ▸ AVB  {}  —  {}",
+            let stream_line = format!("  ▸ AVB  {}  —  {}",
                 avtp_subtype_name(avtp.subtype), avtp.stream_id_str());
             logger.log(&stream_line);
             println!("{}", stream_line);
@@ -444,7 +445,7 @@ pub fn print_report(
     // ── Clock source required but absent ───────────────────────────────────
     if requires_valid_ptp && !ptp_domains.values().any(|s| s.clock_valid) {
         let alert = "⚠  No clock source — streams requiring PTP may lose sync";
-        logger.log(&format!("\n{}", alert));
+        logger.log(alert);
         println!("\x1b[31m{}\x1b[0m", alert);
     }
 
@@ -478,6 +479,15 @@ pub fn print_report(
     let breakdown = format!("   {}  |  {}", qos_str, querier_str);
     logger.log(&breakdown);
     println!("{}", breakdown);
+
+    if health.ecn_congestion_marks > 0 {
+        let alert = format!(
+            "   ⚠  ECN: {} congestion mark(s) — router congestion detected on the path",
+            health.ecn_congestion_marks
+        );
+        logger.log(&alert);
+        println!("\x1b[33m{}\x1b[0m", alert);
+    }
 
     if !eee_ports.is_empty() {
         let eee_alert = format!(
