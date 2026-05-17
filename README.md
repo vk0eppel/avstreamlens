@@ -10,9 +10,9 @@ AVStreamLens reads the network passively using pcap, identifies streams and cloc
 
 | Protocol | Transport | What is monitored |
 |---|---|---|
-| **AES67** | UDP multicast (239.69.*) | Loss, jitter, SSRC changes, timing discontinuities, payload type, burst detection, PTPv2 clock, ts-refclk validation, DSCP |
+| **AES67** | UDP multicast (239.69.*) | Loss, jitter, SSRC changes, timing discontinuities, payload type, signal gap detection, PTPv2 clock, ts-refclk validation, DSCP |
 | **SMPTE ST 2110** | UDP multicast (239.x.x.x) | Video (2110-20), audio (2110-30), ancillary (2110-40) — same RTP metrics as AES67; video clock rate confirmed without SDP |
-| **Dante** | UDP unicast or multicast / mDNS | Device names from mDNS, audio stream RTP metrics, burst detection, DSCP, PTPv1 clock |
+| **Dante** | UDP unicast or multicast / mDNS | Device names from mDNS, audio stream RTP metrics, signal gap detection, DSCP, PTPv1 clock |
 | **NDI** | TCP (dynamic ports) | Source names from mDNS, bitrate, TCP quality, retransmissions, RST/FIN |
 | **AVB / IEEE 802.1** | L2 Ethernet | gPTP grandmaster (802.1AS), MSRP bandwidth reservations (802.1Qat), MVRP VLAN registrations (802.1Q), AVTP stream IDs |
 
@@ -85,7 +85,7 @@ Choose the protocols to monitor:
 ```
 
 - **Audio** and **Video** are convenience groups — selecting Audio captures AES67, Dante, and AVB streams in one step.
-- PTP and IGMP are always captured regardless of selection.
+- PTP, IGMP, and SAP are enabled automatically when the selected protocols require them — see the "Always monitored" note in Supported Protocols above.
 
 ---
 
@@ -118,7 +118,7 @@ Choose the protocols to monitor:
   ✓  AVB  —  grandmaster 00:1a:e5:ff:fe:ab:cd:ef
 
 🔬 Network Health — 97%:
-   QoS: ✓ DSCP marked (1247 pkts)  |  IGMP: ✓ querier 42s ago
+   QoS: ✓ all streams correctly marked  |  IGMP: ✓ querier 42s ago  (interval 125s)
    ⚠  EEE active on 1 switch port(s) — may cause audio/video glitches
       port "Gi0/1"  chassis 00:1a:2b:3c:4d:5e  Tx wake: 16µs  Rx wake: 16µs
 ```

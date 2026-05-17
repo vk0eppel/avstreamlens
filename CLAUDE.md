@@ -61,7 +61,7 @@ cargo clippy -- -D warnings  # lint
 - Filtered: `lo`/`lo0`, `utun*`, `awdl*`, `llw*`, `bridge*`, `vpn*`, `docker*`, `veth*`, `virbr*`, `ap1`, `anpi*` (iPhone USB), `gif*` (IPv6 tunnel), `stf*` (6to4 tunnel)
 - `lo`/`lo0` excluded: macOS loopback uses DLT_NULL (4-byte BSD null header, no Ethernet frame) — incompatible with Ethernet parser; mDNS multicast also does not flow over loopback
 - macOS port names via `macos_port_names()` → `networksetup -listallhardwareports`; IPv4 address shown; Enter selects interface 0 by default
-- Startup banner: `📡 Listening on en0  for AES67, Dante  (+ PTP, IGMP)  streams` via `cli::selected_protocol_display()`
+- Startup banner via `cli::selected_protocol_display()` — e.g. `📡 Listening on en0  for AES67, Dante  (+ PTP, IGMP)  streams`; the `(+ PTP, IGMP)` suffix is shown only when those protocols are relevant to the selection
 
 ---
 
