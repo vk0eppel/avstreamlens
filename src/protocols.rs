@@ -134,10 +134,10 @@ impl ProtocolChoice {
     /// Does this protocol require a valid PTP clock?
     pub fn requires_valid_ptp_clock(&self) -> bool {
         matches!(self, ProtocolChoice::AES67 | ProtocolChoice::Audio | ProtocolChoice::Video
-            | ProtocolChoice::ST2110 | ProtocolChoice::AVB)
+            | ProtocolChoice::ST2110 | ProtocolChoice::AVB | ProtocolChoice::Dante)
     }
 
-    // All available protocol choices (PTP/IGMP always active)
+    // All available protocol choices (LLDP/EEE always active; PTP/IGMP/SAP gated per protocol)
     pub fn all_choices() -> Vec<ProtocolChoice> {
         vec![
             ProtocolChoice::Audio,
@@ -180,8 +180,18 @@ impl AvProtocol {
             AvProtocol::Avb    { .. }
             | AvProtocol::Msrp { .. }
             | AvProtocol::Mvrp { .. } => expanded.iter().any(|c| matches!(c, ProtocolChoice::AVB)),
-            AvProtocol::Ptp { .. } | AvProtocol::Igmp { .. } | AvProtocol::Sap { .. }
-            | AvProtocol::LldpEee { .. } => true,
+            AvProtocol::LldpEee { .. } => true,
+            // PTP is relevant for all clock-dependent protocols; NDI uses its own timing
+            AvProtocol::Ptp { .. } =>
+                expanded.iter().any(|c| matches!(c,
+                    ProtocolChoice::AES67 | ProtocolChoice::ST2110
+                    | ProtocolChoice::Dante | ProtocolChoice::AVB)),
+            // IGMP is only relevant for IP multicast protocols (AES67, ST2110, Dante)
+            AvProtocol::Igmp { .. } =>
+                expanded.iter().any(|c| matches!(c, ProtocolChoice::AES67 | ProtocolChoice::ST2110 | ProtocolChoice::Dante)),
+            // SAP/SDP is only relevant for protocols that use it (AES67 and ST2110)
+            AvProtocol::Sap { .. } =>
+                expanded.iter().any(|c| matches!(c, ProtocolChoice::AES67 | ProtocolChoice::ST2110)),
         }
     }
 }

@@ -52,6 +52,8 @@ pub struct StreamStats {
     // IAT burst detection (EEE / switch queuing fingerprint)
     pub gap_events:         u64,         // IAT > 50ms in the current 5s window
     pub max_iat_ms:         f64,         // worst-case inter-arrival time (ms)
+    // Per-stream DSCP validation
+    pub dscp_violations:    u64,         // packets with wrong DSCP for this protocol
 }
 
 impl StreamStats {
@@ -89,6 +91,7 @@ impl StreamStats {
             clock_hz_confirmed:  false,
             gap_events:          0,
             max_iat_ms:          0.0,
+            dscp_violations:     0,
         }
     }
     // Constructor with enhanced info — useful when SDP is available at stream start
@@ -338,27 +341,14 @@ pub struct NetworkHealth {
     pub aes67_discontinuities: u64,
     pub tcp_retransmissions: u64,
     pub network_score: f64,
-    // QoS / DSCP tracking
-    pub dscp_total: u64,
-    pub dscp_violations: u64,
     // Congestion (ECN)
     pub ecn_congestion_marks: u64,
     // IGMP / snooping
     pub last_igmp_query: Option<Instant>,
+    pub igmp_query_interval_secs: Option<u64>, // computed from last two queries
 }
 
 impl NetworkHealth {
-    pub fn track_dscp(&mut self, ip: &pnet_packet::ipv4::Ipv4Packet) {
-        self.dscp_total += 1;
-        // Accepted markings for AV traffic:
-        //   EF (46) — standard AES67/ST2110 audio + control
-        //   CS5 (40) — Cisco IP-NGN video
-        //   AF41 (34) — alternative video class
-        let dscp = ip.get_dscp();
-        if !matches!(dscp, 46 | 40 | 34) { self.dscp_violations += 1; }
-        if ip.get_ecn() == 3 { self.ecn_congestion_marks += 1; }
-    }
-
     pub fn new() -> Self {
         Self {
             total_packets: 0,
@@ -369,10 +359,9 @@ impl NetworkHealth {
             aes67_discontinuities: 0,
             tcp_retransmissions: 0,
             network_score: 100.0,
-            dscp_total: 0,
-            dscp_violations: 0,
             ecn_congestion_marks: 0,
             last_igmp_query: None,
+            igmp_query_interval_secs: None,
         }
     }
 
@@ -435,16 +424,12 @@ impl NetworkHealth {
         }
         score -= (self.tcp_retransmissions as f64 * 0.5).min(10.0);
 
-        // ── QoS / DSCP ───────────────────────────────────────────────────────
-        if self.dscp_total > 0 {
-            let violation_pct = self.dscp_violations as f64 / self.dscp_total as f64;
-            if violation_pct > 0.5 {
-                score -= 20.0;  // majority of AV traffic untagged
-            } else if violation_pct > 0.1 {
-                score -= 10.0;
-            } else if self.dscp_violations > 0 {
-                score -= 3.0;
-            }
+        // ── QoS / DSCP (per-stream) ──────────────────────────────────────────
+        // Each stream validates DSCP against protocol-appropriate expected values.
+        // Any stream with violations counts as misconfigured.
+        let dscp_bad = streams.values().filter(|s| s.dscp_violations > 0).count();
+        if dscp_bad > 0 {
+            score -= (dscp_bad as f64 * 5.0).min(20.0);
         }
 
         // ── Congestion (ECN Congestion Experienced marks) ─────────────────────

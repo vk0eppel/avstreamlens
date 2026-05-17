@@ -187,13 +187,10 @@ fn main() {
         // VLAN-unwrapped L2 payload (handles 802.1Q / QinQ tagged frames).
         let (l2_et, l2_payload) = unwrap_vlan(&eth).unwrap_or((0, &[][..]));
 
-        if let Some(proto) = detect_protocol(&eth) {
-            let should_process = match &proto {
-                AvProtocol::Ptp { .. } | AvProtocol::Igmp { .. } | AvProtocol::Sap { .. } => true,
-                _ => proto.is_selected(&expanded_protocols),
-            };
-            if should_process {
-                match proto {
+        if let Some(proto) = detect_protocol(&eth)
+            && proto.is_selected(&expanded_protocols)
+        {
+            match proto {
 
                     // ── SAP/SDP ──────────────────────────────────
                     AvProtocol::Sap { src: _, sdp } => {
@@ -248,7 +245,9 @@ fn main() {
                         if let Some(ip) = pnet_packet::ipv4::Ipv4Packet::new(l2_payload)
                             && let Some(udp) = pnet_packet::udp::UdpPacket::new(ip.payload())
                         {
-                            network_health.track_dscp(&ip);
+                            // AES67 requires DSCP EF (46) per spec
+                            if ip.get_dscp() != 46 { stats.dscp_violations += 1; }
+                            if ip.get_ecn() == 3 { network_health.ecn_congestion_marks += 1; }
                             if let Some((seq, ts, ssrc)) = parse_rtp(udp.payload()) {
                                 if stats.expected_pt.is_some_and(|exp| payload_type != exp) {
                                     stats.pt_mismatches += 1;
@@ -296,7 +295,14 @@ fn main() {
                         if let Some(ip) = pnet_packet::ipv4::Ipv4Packet::new(l2_payload)
                             && let Some(udp) = pnet_packet::udp::UdpPacket::new(ip.payload())
                         {
-                            network_health.track_dscp(&ip);
+                            // ST2110-20 video accepts EF/CS5/AF41; audio/anc require EF only
+                            let dscp_ok = if matches!(stream_type, St2110Type::Video) {
+                                matches!(ip.get_dscp(), 46 | 40 | 34)
+                            } else {
+                                ip.get_dscp() == 46
+                            };
+                            if !dscp_ok { stats.dscp_violations += 1; }
+                            if ip.get_ecn() == 3 { network_health.ecn_congestion_marks += 1; }
                             if let Some((seq, ts, ssrc)) = parse_rtp(udp.payload()) {
                                 let rtp_pt = udp.payload()[1] & 0x7F;
                                 if stats.expected_pt.is_some_and(|exp| rtp_pt != exp) {
@@ -332,7 +338,9 @@ fn main() {
                                 if let Some(ip) = pnet_packet::ipv4::Ipv4Packet::new(l2_payload)
                                     && let Some(udp) = pnet_packet::udp::UdpPacket::new(ip.payload())
                                 {
-                                    network_health.track_dscp(&ip);
+                                    // Dante audio requires DSCP EF (46)
+                                    if ip.get_dscp() != 46 { stats.dscp_violations += 1; }
+                                    if ip.get_ecn() == 3 { network_health.ecn_congestion_marks += 1; }
                                     if let Some((seq, ts, ssrc)) = parse_rtp(udp.payload()) {
                                         stats.update(seq, ts, ssrc, udp.payload().len());
                                     }
@@ -469,6 +477,11 @@ fn main() {
                                 }
                             }
                             IgmpType::Query => {
+                                // Track interval between consecutive queries (RFC 3376 default 125s)
+                                if let Some(last) = network_health.last_igmp_query {
+                                    network_health.igmp_query_interval_secs =
+                                        Some(last.elapsed().as_secs());
+                                }
                                 network_health.last_igmp_query = Some(now);
                                 let msg = format!("❓ IGMP Query: {} → group {}", src, group);
                                 println!("{}", msg);
@@ -482,7 +495,6 @@ fn main() {
                         }
                     }
 
-                }
             }
         }
 

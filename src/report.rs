@@ -226,6 +226,16 @@ pub fn print_report(
             println!("\x1b[33m{}\x1b[0m", alert);
         }
 
+        if s.dscp_violations > 0 {
+            let expected = if s.protocol == "2110-20" { "EF (46), AF41 (34), or CS5 (40)" } else { "EF (46)" };
+            let alert = format!(
+                "    ⚠  QoS: {} packet(s) not marked {} — may be deprioritised by switches",
+                s.dscp_violations, expected
+            );
+            logger.log(&alert);
+            println!("\x1b[33m{}\x1b[0m", alert);
+        }
+
         if s.jitter_ms() > 20.0 {
             let alert = "    ⚠  High jitter — stream quality at risk";
             logger.log(alert);
@@ -454,24 +464,26 @@ pub fn print_report(
     logger.log(&format!("\nNetwork Health — {}:", score));
     println!("\n\x1b[36m🔬 Network Health — {}:\x1b[0m", score);
 
-    let qos_str = if health.dscp_total == 0 {
-        "QoS: – (no AV streams)".to_string()
-    } else if health.dscp_violations == 0 {
-        format!("QoS: ✓ DSCP marked ({} pkts)", health.dscp_total)
+    let dscp_bad = streams.values().filter(|s| s.dscp_violations > 0).count();
+    let qos_str = if streams.values().all(|s| s.protocol == "NDI" || s.protocol == "AVB" || s.protocol.starts_with("AVB ")) {
+        "QoS: – (no IP streams)".to_string()
+    } else if dscp_bad == 0 {
+        "QoS: ✓ all streams correctly marked".to_string()
     } else {
-        let pct = health.dscp_violations * 100 / health.dscp_total;
-        let pct_str = if pct == 0 { "<1".to_string() } else { pct.to_string() };
-        format!("QoS: ⚠ {}% untagged ({}/{})", pct_str, health.dscp_violations, health.dscp_total)
+        format!("QoS: ⚠ {} stream(s) with incorrect DSCP", dscp_bad)
     };
 
+    let interval_str = health.igmp_query_interval_secs
+        .map(|i| format!("  (interval {}s)", i))
+        .unwrap_or_default();
     let querier_str = match health.last_igmp_query {
         None => "IGMP: – (no querier seen)".to_string(),
         Some(t) => {
             let secs = t.elapsed().as_secs();
             if secs > 130 {
-                format!("IGMP: ⚠ querier silent {}s", secs)
+                format!("IGMP: ⚠ querier silent {}s{}", secs, interval_str)
             } else {
-                format!("IGMP: ✓ querier {}s ago", secs)
+                format!("IGMP: ✓ querier {}s ago{}", secs, interval_str)
             }
         }
     };

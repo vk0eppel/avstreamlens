@@ -16,7 +16,8 @@ AVStreamLens reads the network passively using pcap, identifies streams and cloc
 | **NDI** | TCP (dynamic ports) | Source names from mDNS, bitrate, TCP quality, retransmissions, RST/FIN |
 | **AVB / IEEE 802.1** | L2 Ethernet | gPTP grandmaster (802.1AS), MSRP bandwidth reservations (802.1Qat), MVRP VLAN registrations (802.1Q), AVTP stream IDs |
 
-**Always monitored regardless of selection:** PTP (IEEE 1588 / gPTP), IGMP, and LLDP (for EEE detection).
+**Always monitored regardless of selection:** LLDP (for EEE detection).
+**Monitored when relevant:** PTP when AES67/ST2110/Dante/AVB selected — IGMP when AES67/ST2110/Dante selected — SAP when AES67/ST2110 selected.
 
 ---
 
@@ -123,12 +124,14 @@ Choose the protocols to monitor:
 **Alerts** appear inline when problems are detected:
 - `⚠  Audio glitch risk — timing discontinuity detected`
 - `⚠  Packet loss detected`
+- `⚠  QoS: N packet(s) not marked EF (46) — may be deprioritised by switches`
 - `⚠  Signal gap detected (N in last 5s, worst X.X ms) — stream interrupted`
 - `⚠  RTP payload type mismatch — encoder/SDP misconfiguration`
 - `⚠  Dante clock or subscription issue`
 - `⚠  No clock source — streams requiring PTP may lose sync`
 - `⚠  Large PTP correction field — transparent clock or path issue`
-- `⚠  EEE active on switch port — disable EEE for AV reliability`
+- `⚠  ECN: N congestion mark(s) — router congestion detected on the path`
+- `⚠  EEE active on switch port(s) — may cause audio/video glitches`
 - `⚠  Stream not announced (no SAP) — audio glitch detection unavailable`
 - `⚠  Stream type unknown — SDP required to classify as video/audio/ancillary`
 - `⚠  No VLAN registration — L2 QoS may not be configured`
