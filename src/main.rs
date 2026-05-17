@@ -375,7 +375,7 @@ fn main() {
                             // AVTP sequence counter is byte 2 of the AVTP payload
                             let avtp_seq = eth.payload().get(2).copied();
                             let entry = avtp_streams.entry(sid)
-                                .or_insert_with(|| AvtpStreamStats::new(sid));
+                                .or_insert_with(|| AvtpStreamStats::new(sid, subtype));
                             entry.packets += 1;
                             entry.last_seen = now;
                             entry.update_bitrate(frame_bytes, now);
@@ -534,7 +534,7 @@ fn main() {
                       || ndi_sources.contains(&src_ip) || ndi_sources.contains(&dst_ip);
             if is_ndi {
                 let key = format!("TCP {}:{} → {}:{}", src_ip, src_port, dst_ip, dst_port);
-                let tcp_stat = tcp_streams.entry(key.clone()).or_insert_with(|| TcpStreamStats::new(src_ip, src_port, dst_ip, dst_port));
+                let tcp_stat = tcp_streams.entry(key.clone()).or_insert_with(|| TcpStreamStats::new(src_ip, dst_ip));
                 tcp_stat.packets += 1;
                 tcp_stat.last_seen = now;
 

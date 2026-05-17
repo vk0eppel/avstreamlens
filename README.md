@@ -87,12 +87,14 @@ Choose the protocols to monitor:
 ## Report Layout
 
 ```
-╔══════════════════════════════════════════════════╗
-║  2026-05-15 14:32:00 | AVStreamLens  |  Health: 97%
-╚══════════════════════════════════════════════════╝
+╔═════════════════════════════════════════════════════════════════╗
+║  2026-05-17 14:32:00 | AVStreamLens report  |  Health: 97%
+╚═════════════════════════════════════════════════════════════════╝
 
 📊 Bandwidth: 12.4 Mbps (last 5s)  |  AES67: 3  |  Dante: 1
 ✓  All streams healthy
+
+📡 Streams:
 
   ▸ AES67  "Stage Mix"  [L24/48000/2]  —  239.69.0.1:5004
     loss: 0.0%  |  jitter: 0.18 ms  |  2.3 Mbps
@@ -100,19 +102,24 @@ Choose the protocols to monitor:
   ▸ Dante  "Stage Box"  —  192.168.1.45:5010
     loss: 0.0%  |  jitter: 0.04 ms  |  0.8 Mbps
 
-🔗 AVB:
-  ✓ VLAN QoS active: 100
-  ✓ Talker 00:1a:e5:ff:fe:12:34:56  2.3 Mbps  VLAN 100  prio 3
-    ✓ Listener Ready
+  ▸ NDI  "Studio Camera"  —  192.168.1.46
+    healthy  |  120.3 Mbps  |  retrans: 0
+
+  ▸ AVB  IEC 61883  —  00:1a:e5:ff:fe:12:34:56:0001
+    loss: 0.0%  |  2.3 Mbps
+    ✓  Reserved  VLAN 100  prio 3  ✓  Listener Ready
 
 🕐 Clock Sources:
+
   ✓  PTPv2  —  grandmaster 00:1a:e5:ff:fe:78:9a:bc  (192.168.1.1)
-      clock quality: Primary reference — locked  < 1 µs
+    clock quality: Primary reference — locked  < 100 ns
   ✓  PTPv1  —  grandmaster 00:1a:e5:ff:fe:12:34:56
-      clock quality: Primary reference  GPS
+    clock quality: Primary reference  GPS
   ✓  AVB  —  grandmaster 00:1a:e5:ff:fe:ab:cd:ef
 
-   QoS: ✓ DSCP EF (1247 pkts)  |  IGMP: ✓ querier 42s ago
+🔬 Network Health:
+
+   QoS: ✓ DSCP marked (1247 pkts)  |  IGMP: ✓ querier 42s ago
    ⚠  EEE active on 1 switch port(s) — may cause audio/video glitches
       port "Gi0/1"  chassis 00:1a:2b:3c:4d:5e  Tx wake: 16µs  Rx wake: 16µs
 ```
@@ -128,8 +135,9 @@ Choose the protocols to monitor:
 - `⚠  No clock source — streams requiring PTP may lose sync`
 - `⚠  Large PTP correction field — transparent clock or path issue`
 - `⚠  EEE active on switch port — disable EEE for AV reliability`
-- `⚑  Stream not announced (no SAP) — audio glitch detection unavailable`
+- `⚠  Stream not announced (no SAP) — audio glitch detection unavailable`
 - `⚠  Stream type unknown — SDP required to classify as video/audio/ancillary`
+- `⚠  No VLAN registration — L2 QoS may not be configured`
 - `💀 No signal for 12s`
 
 ---

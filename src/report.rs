@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use crate::stats::{StreamStats, TcpStreamStats, PtpStats, NetworkHealth, StreamQuality, AvtpStreamStats};
-use crate::protocols::{STREAM_TIMEOUT_SECS, MsrpDeclaration, MsrpDeclType};
+use crate::protocols::{STREAM_TIMEOUT_SECS, MsrpDeclaration, MsrpDeclType, avtp_subtype_name};
 
 /// Logger for writing timestamped messages to both file and console.
 #[derive(Debug)]
@@ -138,8 +138,11 @@ pub fn print_report(
         println!("{}", status_line);
     }
 
-    // ── RTP Streams Report ──────────────────────────────────────────────────
-    let group_order = ["AES67", "AVB", "Dante", "NDI", "ST"];
+    // ── Streams (all protocols unified) ────────────────────────────────────
+    logger.log("\nStreams:");
+    println!("\n\x1b[36m📡 Streams:\x1b[0m");
+
+    let group_order = ["AES67", "Dante", "NDI", "ST", "AVB"];
     let mut keys: Vec<&String> = streams.keys().collect();
     keys.sort_by(|a, b| {
         let a_group = group_order
@@ -155,6 +158,9 @@ pub fn print_report(
 
     for key in keys {
         let s = &streams[key];
+
+        // AVB aggregate entries are superseded by per-AVTP-stream rendering below
+        if s.protocol == "AVB" || s.protocol.starts_with("AVB ") { continue; }
 
         // Protocol label: prefix ST2110 subtypes clearly
         let proto_label = if s.protocol.starts_with("2110-") {
@@ -181,14 +187,33 @@ pub fn print_report(
         logger.log(&stream_line);
         println!("{}", stream_line);
 
-        let status_line = format!(
-            "    loss: {:.1}%  |  jitter: {:.2} ms  |  {:.1} Mbps",
-            s.loss_pct(),
-            s.jitter_ms(),
-            (s.bitrate_bps as f64) / 1_000_000.0
-        );
-        logger.log(&status_line);
-        println!("{}", status_line);
+        // NDI: show TCP connection quality instead of RTP loss/jitter (NDI uses TCP, not RTP)
+        if s.protocol == "NDI" {
+            let tcp = s.dst_ip.and_then(|ip| {
+                tcp_streams.values().find(|t| t.src_ip == ip || t.dst_ip == ip)
+            });
+            let metrics = if let Some(t) = tcp {
+                let quality_str = match t.stream_quality {
+                    StreamQuality::Healthy    => "healthy",
+                    StreamQuality::Degrading  => "degrading",
+                    StreamQuality::Critical   => "critical",
+                    StreamQuality::Terminated => "terminated",
+                };
+                format!("    {}  |  {:.1} Mbps  |  retrans: {}",
+                    quality_str, t.bitrate_bps as f64 / 1_000_000.0, t.retransmissions)
+            } else {
+                format!("    {:.1} Mbps", s.bitrate_bps as f64 / 1_000_000.0)
+            };
+            logger.log(&metrics);
+            println!("{}", metrics);
+        } else {
+            let metrics = format!(
+                "    loss: {:.1}%  |  jitter: {:.2} ms  |  {:.1} Mbps",
+                s.loss_pct(), s.jitter_ms(), s.bitrate_bps as f64 / 1_000_000.0
+            );
+            logger.log(&metrics);
+            println!("{}", metrics);
+        }
 
         if s.ts_discontinuities > 0 {
             let alert = "    ⚠  Audio glitch risk — timing discontinuity detected";
@@ -242,9 +267,9 @@ pub fn print_report(
             || s.protocol == "Dante"
             || s.protocol.starts_with("2110-");
         if expects_sdp && !s.clock_hz_confirmed && s.packets > 10 {
-            let alert = "    ⚑  Stream not announced (no SAP) — audio glitch detection unavailable";
+            let alert = "    ⚠  Stream not announced (no SAP) — audio glitch detection unavailable";
             logger.log(alert);
-            println!("{}", alert);
+            println!("\x1b[33m{}\x1b[0m", alert);
         }
 
         // ST2110 unclassified stream type
@@ -254,8 +279,10 @@ pub fn print_report(
             println!("\x1b[33m{}\x1b[0m", alert);
         }
 
-        // Gap 4: signal gap events (IAT > 50ms)
-        if s.gap_events > 0 {
+        // Gap 4: signal gap events (IAT > 50ms).
+        // Require at least 2 events per 5s window — a single spike is typically
+        // a pcap scheduling artifact on the capture host, not a real interruption.
+        if s.gap_events >= 2 {
             let alert = format!(
                 "    ⚠  Signal gap detected ({} in last 5s, worst {:.1} ms) — stream interrupted",
                 s.gap_events, s.max_iat_ms
@@ -273,133 +300,68 @@ pub fn print_report(
         }
     }
 
-    // ── TCP Streams Report ──────────────────────────────────────────────────
-    if !tcp_streams.is_empty() {
-        logger.log("\nTCP Streams:");
-        println!("\n\x1b[34m🔌 TCP Streams:\x1b[0m");
-        for tcp_stat in tcp_streams.values() {
-            let quality_icon = match tcp_stat.stream_quality {
-                StreamQuality::Healthy => "✓",
-                StreamQuality::Degrading => "⚠",
-                StreamQuality::Critical => "⚠⚠",
-                StreamQuality::Terminated => "✗",
-            };
-            let tcp_line = format!(
-                "  {} {}: {} packets, {} bytes, {} Mbps, retransmissions: {}",
-                quality_icon,
-                tcp_stat.key,
-                tcp_stat.packets,
-                tcp_stat.bytes,
-                (tcp_stat.bitrate_bps as f64) / 1_000_000.0,
-                tcp_stat.retransmissions
+    // ── AVB per-stream entries (AVTP stream IDs with MSRP/VLAN inline) ────────
+    if !avtp_streams.is_empty() {
+        let mut sorted: Vec<&AvtpStreamStats> = avtp_streams.values().collect();
+        sorted.sort_by_key(|s| s.stream_id);
+        for avtp in sorted {
+            let dead = avtp.last_seen.elapsed() > Duration::from_secs(STREAM_TIMEOUT_SECS);
+            let stream_line = format!("\n  ▸ AVB  {}  —  {}",
+                avtp_subtype_name(avtp.subtype), avtp.stream_id_str());
+            logger.log(&stream_line);
+            println!("{}", stream_line);
+
+            let metrics = format!(
+                "    loss: {:.1}%  |  {:.1} Mbps",
+                avtp.loss_pct(), avtp.bitrate_bps as f64 / 1_000_000.0
             );
-            logger.log(&tcp_line);
-            println!("{}", tcp_line);
+            logger.log(&metrics);
+            println!("{}", metrics);
 
-            if tcp_stat.rst_packets > 0 {
-                let alert = format!(
-                    "    ⚠  RST flags: {} (connection reset)",
-                    tcp_stat.rst_packets
-                );
-                logger.log(&alert);
-                println!("\x1b[31m{}\x1b[0m", alert);
-            }
-            if tcp_stat.retransmissions > 5 {
-                logger.log("    ⚠  High retransmission rate detected");
-                println!("\x1b[33m    ⚠  High retransmission rate detected\x1b[0m");
-            }
-        }
-    }
-
-    // ── AVB Extended Report ─────────────────────────────────────────────────
-    let avb_stream_count = streams.values().filter(|s| s.protocol == "AVB").count();
-    if avb_stream_count > 0 || !avtp_streams.is_empty() || !msrp_state.is_empty() || !mvrp_vlans.is_empty() {
-        logger.log("\nAVB:");
-        println!("\n\x1b[32m🔗 AVB:\x1b[0m");
-
-        // MVRP
-        if !mvrp_vlans.is_empty() {
-            let mut vids: Vec<u16> = mvrp_vlans.iter().copied().collect();
-            vids.sort();
-            let vids_str: Vec<String> = vids.iter().map(|v| v.to_string()).collect();
-            let line = format!("  ✓ VLAN QoS active: {}", vids_str.join(", "));
-            logger.log(&line); println!("{}", line);
-        } else if avb_stream_count > 0 {
-            let line = "  ⚠  No VLAN registration detected — L2 QoS may not be configured";
-            logger.log(line); println!("\x1b[33m{}\x1b[0m", line);
-        }
-
-        // AVTP stream IDs
-        if !avtp_streams.is_empty() {
-            let mut sorted: Vec<&AvtpStreamStats> = avtp_streams.values().collect();
-            sorted.sort_by_key(|s| s.stream_id);
-            for s in sorted {
-                let dead = s.last_seen.elapsed() > Duration::from_secs(STREAM_TIMEOUT_SECS);
-                let icon = if dead { "💀" } else { "▸" };
-                let loss_str = if s.lost_frames > 0 {
-                    format!("  loss: {:.1}%", s.loss_pct())
-                } else {
-                    String::new()
-                };
-                let rate_str = if s.bitrate_bps > 0 {
-                    format!("  {:.1} Mbps", s.bitrate_bps as f64 / 1_000_000.0)
-                } else {
-                    String::new()
-                };
-                let line = format!("  {} {}{}{}",
-                    icon, s.stream_id_str(), loss_str, rate_str);
-                logger.log(&line); println!("{}", line);
-                if s.lost_frames > 0 {
-                    let alert = format!("      ⚠  {} dropped AVTP frame(s)", s.lost_frames);
-                    logger.log(&alert); println!("\x1b[33m{}\x1b[0m", alert);
-                }
-            }
-        }
-
-        // MSRP reservations
-        if !msrp_state.is_empty() {
-            let mut sorted: Vec<&MsrpDeclaration> = msrp_state.values().collect();
-            sorted.sort_by_key(|d| d.stream_id);
-            for decl in sorted {
-                let id = &decl.stream_id;
-                let sid = format!("{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:04x}",
-                    id[0], id[1], id[2], id[3], id[4], id[5],
-                    u16::from_be_bytes([id[6], id[7]]));
-                match decl.decl_type {
+            // MSRP reservation state for this stream
+            if let Some(talker) = msrp_state.get(&avtp.stream_id) {
+                match talker.decl_type {
                     MsrpDeclType::TalkerAdvertise => {
-                        let bw = if let (Some(f), Some(n)) = (decl.max_frame_size, decl.max_interval_frames) {
-                            format!("  {:.1} Mbps", f as f64 * n as f64 * 8.0 * 8000.0 / 1_000_000.0)
-                        } else { String::new() };
-                        let vlan = decl.vlan_id.map(|v| format!("  VLAN {}", v)).unwrap_or_default();
-                        let prio = decl.priority.map(|p| format!("  prio {}", p)).unwrap_or_default();
-                        let line = format!("  ✓ Talker {}{}{}{}",  sid, bw, vlan, prio);
-                        logger.log(&line); println!("{}", line);
-                        // Listener state for same stream
-                        if let Some(listener) = msrp_state.values().find(|d| {
-                            d.stream_id == decl.stream_id && matches!(d.decl_type, MsrpDeclType::Listener)
-                        }) {
-                            let lst_str = match listener.listener_state {
-                                Some(2) => "  ✓ Listener Ready",
+                        let vlan = talker.vlan_id.map(|v| format!("  VLAN {}", v)).unwrap_or_default();
+                        let prio = talker.priority.map(|p| format!("  prio {}", p)).unwrap_or_default();
+                        let listener_str = msrp_state.values()
+                            .find(|d| d.stream_id == avtp.stream_id
+                                && matches!(d.decl_type, MsrpDeclType::Listener))
+                            .map(|l| match l.listener_state {
+                                Some(2) => "  ✓  Listener Ready",
                                 Some(1) => "  ⚠  Listener AskingFailed",
                                 Some(3) => "  ⚠  Listener ReadyFailed",
                                 _       => "  Listener Unknown",
-                            };
-                            logger.log(lst_str); println!("{}", lst_str);
-                        }
+                            })
+                            .unwrap_or("");
+                        let res_line = format!("    ✓  Reserved{}{}{}", vlan, prio, listener_str);
+                        logger.log(&res_line);
+                        println!("{}", res_line);
                     }
                     MsrpDeclType::TalkerFailed => {
-                        let code_str = match decl.failure_code {
+                        let code_str = match talker.failure_code {
                             Some(1) => "insufficient bandwidth",
                             Some(2) => "insufficient bridge resources",
                             Some(3) => "insufficient bandwidth for Traffic Class",
                             Some(_) => "unknown failure",
                             None    => "failed",
                         };
-                        let line = format!("  ⚠  Talker Failed {}  ({})", sid, code_str);
-                        logger.log(&line); println!("\x1b[33m{}\x1b[0m", line);
+                        let alert = format!("    ⚠  Reservation failed — {}", code_str);
+                        logger.log(&alert);
+                        println!("\x1b[33m{}\x1b[0m", alert);
                     }
-                    MsrpDeclType::Listener => {} // shown inline above
+                    MsrpDeclType::Listener => {}
                 }
+            } else if mvrp_vlans.is_empty() {
+                let alert = "    ⚠  No VLAN registration — L2 QoS may not be configured";
+                logger.log(alert);
+                println!("\x1b[33m{}\x1b[0m", alert);
+            }
+
+            if dead {
+                let alert = format!("    💀 No signal for {:.0}s", avtp.last_seen.elapsed().as_secs_f64());
+                logger.log(&alert);
+                println!("\x1b[31m{}\x1b[0m", alert);
             }
         }
     }
@@ -407,7 +369,7 @@ pub fn print_report(
     // ── PTP / Clock Sources ─────────────────────────────────────────────────
     if !ptp_domains.is_empty() {
         logger.log("\nClock Sources:");
-        println!("\n\x1b[35m🕐 Clock Sources:\x1b[0m");
+        println!("\n\x1b[36m🕐 Clock Sources:\x1b[0m");
 
         let multi_domain = ptp_domains.len() > 1;
 
@@ -445,7 +407,7 @@ pub fn print_report(
             println!("{}", clock_line);
 
             if let Some(ref q) = stats.last_quality {
-                let quality_line = format!("      clock quality: {}", q);
+                let quality_line = format!("    clock quality: {}", q);
                 logger.log(&quality_line);
                 println!("{}", quality_line);
             }
@@ -454,27 +416,27 @@ pub fn print_report(
                 && offset_ns != 0
             {
                 let offset_line = if offset_ns.unsigned_abs() >= 1_000 {
-                    format!("      correction: {:.1} µs", offset_ns as f64 / 1_000.0)
+                    format!("    correction: {:.1} µs", offset_ns as f64 / 1_000.0)
                 } else {
-                    format!("      correction: {} ns", offset_ns)
+                    format!("    correction: {} ns", offset_ns)
                 };
                 logger.log(&offset_line);
                 println!("{}", offset_line);
                 if offset_ns.unsigned_abs() > 1_000 {
-                    let alert = "      ⚠  Large PTP correction field — transparent clock or path issue";
+                    let alert = "    ⚠  Large PTP correction field — transparent clock or path issue";
                     logger.log(alert);
                     println!("\x1b[33m{}\x1b[0m", alert);
                 }
             }
 
             if stats.protocol_clock_lost {
-                let alert = "      ⚠  Clock lost — grandmaster disappeared";
+                let alert = "    ⚠  Clock lost — grandmaster disappeared";
                 logger.log(alert);
                 println!("\x1b[33m{}\x1b[0m", alert);
             }
 
             if stats.protocol_changes_count > 0 {
-                let alert = format!("      ⚠  Clock source changed {} time(s)", stats.protocol_changes_count);
+                let alert = format!("    ⚠  Clock source changed {} time(s)", stats.protocol_changes_count);
                 logger.log(&alert);
                 println!("\x1b[33m{}\x1b[0m", alert);
             }
@@ -488,7 +450,10 @@ pub fn print_report(
         println!("\x1b[31m{}\x1b[0m", alert);
     }
 
-    // ── Health breakdown ────────────────────────────────────────────────────
+    // ── Network health ──────────────────────────────────────────────────────
+    logger.log("\nNetwork Health:");
+    println!("\n\x1b[36m🔬 Network Health:\x1b[0m");
+
     let qos_str = if health.dscp_total == 0 {
         "QoS: – (no AV streams)".to_string()
     } else if health.dscp_violations == 0 {
@@ -511,7 +476,7 @@ pub fn print_report(
         }
     };
 
-    let breakdown = format!("\n   {}  |  {}", qos_str, querier_str);
+    let breakdown = format!("   {}  |  {}", qos_str, querier_str);
     logger.log(&breakdown);
     println!("{}", breakdown);
 

@@ -199,6 +199,7 @@ impl StreamStats {
 #[derive(Debug, Clone)]
 pub struct AvtpStreamStats {
     pub stream_id:          [u8; 8],
+    pub subtype:            u8,
     pub packets:            u64,
     pub lost_frames:        u64,         // AVTP sequence counter drops
     pub last_seq:           Option<u8>,  // last AVTP sequence byte (byte 2 of header)
@@ -210,9 +211,10 @@ pub struct AvtpStreamStats {
 }
 
 impl AvtpStreamStats {
-    pub fn new(stream_id: [u8; 8]) -> Self {
+    pub fn new(stream_id: [u8; 8], subtype: u8) -> Self {
         Self {
             stream_id,
+            subtype,
             packets:            0,
             lost_frames:        0,
             last_seq:           None,
@@ -254,7 +256,6 @@ impl AvtpStreamStats {
 
 #[derive(Debug, Clone)]
 pub struct TcpStreamStats {
-    pub key: String,
     pub src_ip: Ipv4Addr,
     pub dst_ip: Ipv4Addr,
     pub packets: u64,
@@ -281,10 +282,8 @@ pub enum StreamQuality {
 }
 
 impl TcpStreamStats {
-    pub fn new(src_ip: Ipv4Addr, src_port: u16, dst_ip: Ipv4Addr, dst_port: u16) -> Self {
-        let key = format!("TCP {}:{} → {}:{}", src_ip, src_port, dst_ip, dst_port);
+    pub fn new(src_ip: Ipv4Addr, dst_ip: Ipv4Addr) -> Self {
         Self {
-            key,
             src_ip,
             dst_ip,
             packets: 0,
@@ -420,8 +419,8 @@ impl NetworkHealth {
             if stats.last_packet_time.is_some_and(|t| t.elapsed() > Duration::from_secs(crate::protocols::STREAM_TIMEOUT_SECS)) {
                 score -= 30.0;
             }
-            if stats.gap_events > 0 {
-                score -= 10.0;  // at least one 50ms+ interruption in the current 5s window
+            if stats.gap_events >= 2 {
+                score -= 10.0;  // repeated 50ms+ gaps in the current 5s window
             }
         }
 

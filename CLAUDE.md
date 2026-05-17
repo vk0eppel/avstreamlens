@@ -27,8 +27,8 @@ cargo clippy -- -D warnings  # lint
 ## Architecture
 
 ### General
-- No test harness — new functionality must be verified manually or by adding tests
-- Logging: timestamped `.log` files written on every run in the working directory
+- **Test harness**: 49 unit tests in `#[cfg(test)]` modules inside `parser.rs` and `stats.rs` — run with `cargo test`
+- Logging: timestamped `.log` files written on every run in the working directory; `Logger::log()` flushes after every write so the last report survives SIGINT
 - Bitrate computed as `byte_delta / elapsed_secs` — never assumed 1s exactly
 - All modules follow the same pattern: parse → stats → report
 
@@ -38,7 +38,7 @@ cargo clippy -- -D warnings  # lint
 - **Dante audio runs before AES67/ST2110 IP checks** — Dante multicast (239.255.x.x) would otherwise match `is_st2110_multicast`
 - **Always processed regardless of user selection**: PTP, IGMP, SAP, LLDP (`AvProtocol::is_selected()` returns true unconditionally for these)
 - Protocol selection pre-expanded once: `expanded_protocols: Vec<ProtocolChoice>` computed before the loop
-- BPF always includes `(ether proto 0x88cc)` (LLDP); `tcp` added for NDI; `all_protocols_filter` includes all EtherTypes + tcp
+- BPF always includes `(ether proto 0x88cc)` (LLDP) and `(ether proto 0x88f7)` (gPTP) — PTP/EEE are monitored regardless of protocol selection; `tcp` added for NDI; `all_protocols_filter` includes all EtherTypes + tcp
 - Multicast IP association: 239.69.*=AES67, all other 239.x.x.x=ST2110
 - UDP PTP `protocol_kind` labels: version-based not application-based — PTPv1 → `"PTPv1"`, PTPv2 → `"PTPv2"`, L2 gPTP → `"AVB"`
 
@@ -48,7 +48,8 @@ cargo clippy -- -D warnings  # lint
 - `ptp_domains` and `sdp_cache` never pruned (bounded by design)
 - `gap_events` and `max_iat_ms` reset after each report (per-window counters)
 - All protocol arms set `last_packet_time = Some(now)` so pruning applies uniformly
-- IGMP Join deduplication: `igmp_joins_seen: HashSet<(Ipv4Addr, Ipv4Addr)>` — cleared on Leave; Queries/Unknowns always print
+- IGMP Join deduplication: `igmp_joins_seen: HashMap<(Ipv4Addr, Ipv4Addr), Instant>` — cleared on Leave; entries older than 5 minutes pruned each report cycle (handles hosts that disappear without sending Leave); Queries/Unknowns always print
+- **VLAN-tagged frames**: `unwrap_vlan()` in `parser.rs` peels 802.1Q / 802.1ad / QinQ tags before dispatch — L2 AVB protocols work on tagged networks
 
 ### Interface Listing
 - Filtered: `lo`/`lo0`, `utun*`, `awdl*`, `llw*`, `bridge*`, `vpn*`, `docker*`, `veth*`, `virbr*`, `ap1`, `anpi*` (iPhone USB), `gif*` (IPv6 tunnel), `stf*` (6to4 tunnel)
@@ -64,21 +65,21 @@ cargo clippy -- -D warnings  # lint
 - **Transport**: UDP multicast 239.69.*
 - **Detection**: `is_aes67_multicast(dst_ip)` after RTP version check
 - **Clock**: PTPv2 via UDP ports 319/320; ts-refclk cross-check validates SDP-claimed grandmaster against wire
-- **Health metrics**: loss (RFC 3550 seq), jitter (RFC 3550 EWMA), SSRC changes, TS discontinuities, signal gaps, payload type validation, DSCP EF=46
+- **Health metrics**: loss (RFC 3550 seq, signed-delta — backward/reorder ignored), jitter (RFC 3550 EWMA, sign-preserving), SSRC changes, TS discontinuities, signal gaps, payload type validation, DSCP EF/CS5/AF41
 - `clock_hz_confirmed` gates TS discontinuity detection — set at stream creation if SDP found, or retroactively when SAP arrives
 - `expected_pt` from SDP `a=rtpmap`; `pt_mismatches` counts mismatches per packet
-- Signal gap: `gap_events` fires when IAT > 50ms; `max_iat_ms` tracks worst case; both reset per 5s window
+- Signal gap: `gap_events` fires when IAT > 50ms; alert requires **≥2 events per 5s window** (single spike = pcap scheduling noise); `max_iat_ms` tracks worst case; both reset per 5s window
 - PTP correction field stored as `last_offset_ns` (nanoseconds, after ÷65536); alert if abs > 1µs
-- Alert `⚑ Stream not announced (no SAP)` when >10 packets with no SDP enrichment
+- Alert `⚠ Stream not announced (no SAP)` when >10 packets with no SDP enrichment (AES67/Dante/ST2110 only — AVB/NDI never have SDP)
 
 ### Dante
 - **Transport**: UDP unicast or multicast (239.255.x.x); discovery via mDNS `_netaudio._udp`
 - **Detection**: `is_likely_dante_audio()` requires BOTH src AND dst ports in 5000–6000 (even) — prevents false positives from ephemeral source ports
-- **Clock**: PTPv1 via UDP ports 319/320; grandmaster from Sync body (bytes 50–55 UUID, byte 61 stratum, bytes 62–65 ident); PTPv1 layout auto-detected: `payload[4]=='_'` → nibble-packed (hdr_shift=2), else separate-byte (hdr_shift=0); subdomain → domain: _DFLT=0, _ALT1=1, _ALT2=2, _ALT3=3
+- **Clock**: PTPv1 via UDP ports 319/320; grandmaster from Sync body (bytes 50–55 UUID, byte 61 stratum, bytes 62–65 ident); PTPv1 layout auto-detected by **`payload[0]`**: `0x11` → nibble-packed (hdr_shift=2), else separate-byte (hdr_shift=0); subdomain → domain: _DFLT=0, _ALT1=1, _ALT2=2, _ALT3=3
 - **Device names**: extracted from mDNS DNS labels via `extract_dante_name()` (needle `\x09_netaudio`); stored in `dante_names: HashMap<Ipv4Addr, String>`; `DanteKind::Discovery { device_name }` carries name to dispatch
 - **Health metrics**: all RTP metrics (same as AES67), DSCP checked on every audio packet
 - Default `ptime_ms = 1.0` (48 samples at 48kHz) for TS discontinuity tolerance
-- Alert `⚠ Dante clock or subscription issue` for loss > 0% or jitter > 15ms
+- Alert `⚠ Dante clock or subscription issue` for loss > **0.1%** or jitter > 15ms (0% threshold caused false positives from pcap scheduling noise)
 
 ### NDI
 - **Transport**: TCP (dynamic ports 5960–5980); discovery via mDNS `_ndi._tcp`
@@ -143,11 +144,18 @@ cargo clippy -- -D warnings  # lint
 
 ## Report Design
 - **Audience**: AV engineers, not network admins — plain English alerts, no raw hex or packet counts
-- Stream label: `Protocol  "Name"  [codec]  —  IP:port` (name from SAP/mDNS when available)
-- Top-level status: `✓ All streams healthy` / `⚠ N issue(s)` / `– No streams detected`
-- Per-stream: loss %, jitter ms, bitrate Mbps — no packet count
-- Clock Sources section: protocol label prominent; domain number only when multiple domains
-- Health footer: QoS/DSCP + IGMP querier — ECN removed from display (sysadmin metric; still penalizes score silently)
+- **Four sections** (all use cyan `\x1b[36m` header + emoji):
+  1. Overview — bandwidth + stream count summary + `✓/⚠/–` status line
+  2. `📡 Streams:` — unified list of all active streams (AES67, Dante, ST2110, NDI, AVB) sorted by protocol
+  3. `🕐 Clock Sources:` — PTP domains (conditional)
+  4. `🔬 Network Health:` — QoS/DSCP, IGMP querier, EEE
+- Stream entry format: `  ▸ Protocol  "Name"  [codec]  —  IP:port` / `    metrics line` / `    ⚠  alerts`
+  - RTP streams (AES67/Dante/ST2110): metrics = `loss: X%  |  jitter: X ms  |  X Mbps`
+  - NDI: metrics = `quality  |  X Mbps  |  retrans: N` (TCP quality, no RTP metrics)
+  - AVB: metrics = `loss: X%  |  X Mbps` + MSRP/VLAN reservation state inline
+- DSCP: accepts EF (46), CS5 (40), AF41 (34) as valid AV markings — shown as "DSCP marked"
+- ECN congestion marks penalise health score silently (not shown in report)
+- Clock Sources: protocol label prominent; domain number only when multiple domains
 
 ---
 
@@ -163,7 +171,7 @@ cargo clippy -- -D warnings  # lint
 | Timestamp discontinuities | −3 × count, capped at 5/stream |
 | SSRC change | −10/stream × changes, capped at 3 |
 | Dead stream | −30/stream |
-| Signal gap > 50ms (per 5s window) | −10/stream |
+| Signal gap ≥ 2 events > 50ms (per 5s window) | −10/stream |
 | TCP Degrading | −5/stream |
 | TCP Critical | −15/stream |
 | TCP Terminated | −25/stream |
