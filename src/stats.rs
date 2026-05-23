@@ -42,8 +42,6 @@ pub struct StreamStats {
     pub ssrc_changes:       u64,
     // Last packet received — to detect dead streams (silence)
     pub last_packet_time:   Option<Instant>,
-    // Flag: avoids repeating the "stream dead" alert in each report
-    pub dead_alerted:       bool,
     // Payload type validation (from SDP a=rtpmap)
     pub expected_pt:        Option<u8>,  // declared by SDP; None = no SDP received yet
     pub pt_mismatches:      u64,         // packets with payload type ≠ expected
@@ -85,7 +83,6 @@ impl StreamStats {
             last_ssrc:           None,
             ssrc_changes:        0,
             last_packet_time:    None,
-            dead_alerted:        false,
             expected_pt:         None,
             pt_mismatches:       0,
             clock_hz_confirmed:  false,
@@ -173,7 +170,6 @@ impl StreamStats {
         }
         self.last_ssrc = Some(ssrc);
         self.last_packet_time = Some(now);
-        self.dead_alerted = false; // Stream alive — reset alert flag
             // Accumulate actual bytes (UDP payload) and calculate
             // throughput every second.
             self.bytes_total += udp_payload_len as u64;
@@ -351,9 +347,6 @@ pub struct NetworkHealth {
     pub total_packets: u64,
     pub multicast_packets: u64,
     pub unicast_packets: u64,
-    pub packet_loss_streams: u64,
-    pub high_jitter_streams: u64,
-    pub aes67_discontinuities: u64,
     pub tcp_retransmissions: u64,
     pub network_score: f64,
     // Congestion (ECN)
@@ -369,9 +362,6 @@ impl NetworkHealth {
             total_packets: 0,
             multicast_packets: 0,
             unicast_packets: 0,
-            packet_loss_streams: 0,
-            high_jitter_streams: 0,
-            aes67_discontinuities: 0,
             tcp_retransmissions: 0,
             network_score: 100.0,
             ecn_congestion_marks: 0,
@@ -389,11 +379,6 @@ impl NetworkHealth {
         eee_ports: &std::collections::HashMap<(String, String), (u16, u16)>,
     ) {
         let mut score = 100.0;
-
-        // ── Stream quality — also populate derived counters ───────────────────
-        self.packet_loss_streams = 0;
-        self.high_jitter_streams = 0;
-        self.aes67_discontinuities = 0;
         let mut has_active_multicast = false;
 
         for stats in streams.values() {
@@ -401,21 +386,15 @@ impl NetworkHealth {
                 has_active_multicast = true;
             }
             if stats.loss_pct() > 0.0 {
-                self.packet_loss_streams += 1;
                 score -= stats.loss_pct().min(10.0);
             }
             if stats.jitter_ms() > 20.0 {
-                self.high_jitter_streams += 1;
                 score -= 5.0;
             } else if stats.jitter_ms() > 10.0 {
-                self.high_jitter_streams += 1;
                 score -= 2.0;
             }
             if stats.ts_discontinuities > 0 {
                 score -= 3.0 * (stats.ts_discontinuities as f64).min(5.0);
-                if stats.protocol == "AES67" {
-                    self.aes67_discontinuities += stats.ts_discontinuities;
-                }
             }
             if stats.ssrc_changes > 0 {
                 score -= 10.0 * (stats.ssrc_changes as f64).min(3.0);
@@ -521,6 +500,15 @@ pub struct PtpStats {
     pub last_clock_id:                 Option<String>,             // Source EUI-64 from most recent PTP message
 }
 
+/// Side-effect-free signal emitted by `PtpStats::update` / `check_timeout`.
+/// The caller (main loop) handles printing and logging.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PtpEvent {
+    GrandmasterDetected,
+    GrandmasterChanged { from: String },
+    ClockLost,
+}
+
 impl PtpStats {
     pub fn new(domain: u8, version: u8) -> Self {
         Self {
@@ -544,14 +532,16 @@ impl PtpStats {
         }
     }
 
-    pub fn update(&mut self, info: &crate::protocols::PtpInfo, protocol_kind: &Option<String>) {
+    /// Update from a freshly-parsed PTP message.
+    /// Returns an event when grandmaster state changes, so the caller can print/log it.
+    pub fn update(&mut self, info: &crate::protocols::PtpInfo, protocol_kind: &Option<String>) -> Option<PtpEvent> {
         self.packets += 1;
         self.last_seen = Instant::now();
         self.protocol_kind = protocol_kind.as_ref().map(|s| s.to_string());
         if let Some(ip) = info.src_ip { self.last_src_ip = Some(ip); }
         if let Some(ref id) = info.clock_id { self.last_clock_id = Some(id.clone()); }
 
-        // Note: masters tracking removed - use clock_id/grandmaster_id directly from PtpInfo
+        let mut event = None;
 
         // ── Grandmaster detection (PTPv2: Announce 0x0B, PTPv1: Sync 0x00) ────
         // Fires whenever grandmaster_id is populated, regardless of message type.
@@ -563,23 +553,20 @@ impl PtpStats {
                 Some(current) => {
                     self.grandmaster_changes += 1;
                     self.protocol_changes_count += 1;
-                    println!(
-                        "\x1b[33m⚠️  GRANDMASTER CHANGED (Domain {} v{}): {} → {}\x1b[0m",
-                        self.domain, self.version, current, gm
-                    );
+                    event = Some(PtpEvent::GrandmasterChanged { from: current.clone() });
                     self.last_grandmaster = Some(gm.clone());
                     self.protocol_grandmaster_detected = true;
                 }
                 None => {
-                    println!(
-                        "\x1b[32m✓  GRANDMASTER DETECTED (Domain {} v{}): {}\x1b[0m",
-                        self.domain, self.version, gm
-                    );
+                    event = Some(PtpEvent::GrandmasterDetected);
                     self.last_grandmaster = Some(gm.clone());
                     self.protocol_grandmaster_detected = true;
                 }
             }
             self.clock_valid = true;
+            // Clock is back — clear the "lost" sticky flag so the report stops
+            // showing the stale "grandmaster disappeared" alert after recovery.
+            self.protocol_clock_lost = false;
             self.last_seen = Instant::now();
             if let Some(q) = &info.clock_quality {
                 self.last_quality = Some(q.clone());
@@ -595,24 +582,21 @@ impl PtpStats {
         if info.message_type == 0x09 {
             self.last_path_delay_ns = info.path_delay_ns;
         }
+
+        event
     }
 
     /// Call from the periodic report cycle (not from packet handlers).
-    /// Returns true if the clock just transitioned to LOST this call.
-    pub fn check_timeout(&mut self) -> bool {
+    /// Returns `Some(ClockLost)` if the clock just transitioned to LOST this call.
+    pub fn check_timeout(&mut self) -> Option<PtpEvent> {
         if self.clock_valid && self.last_seen.elapsed() > Duration::from_secs(self.timeout_secs) {
-            println!(
-                "\x1b[31m❌ PTP Clock LOST (Domain {} v{}) [{}]\x1b[0m",
-                self.domain,
-                self.version,
-                self.protocol_kind.as_deref().unwrap_or("?")
-            );
             self.clock_valid = false;
             self.protocol_clock_lost = true;
             self.last_grandmaster = None; // reset so re-detection fires DETECTED again
-            return true;
+            Some(PtpEvent::ClockLost)
+        } else {
+            None
         }
-        false
     }
 }
 // ═════════════════════════════════════════════════════════════════

@@ -23,7 +23,7 @@ use std::time::{Duration, Instant};
 
 // Import types from modules
 use crate::protocols::{AvProtocol, SdpSession, DanteKind, NdiKind, St2110Type, IgmpType, MsrpDeclType};
-use crate::stats::{StreamStats, TcpStreamStats, NetworkHealth, PtpStats, StreamQuality, AvtpStreamStats};
+use crate::stats::{StreamStats, TcpStreamStats, NetworkHealth, PtpStats, PtpEvent, StreamQuality, AvtpStreamStats};
 use crate::parser::{detect_protocol, parse_tcp_packet, parse_rtp, parse_ts_refclk, is_multicast, is_aes67_multicast, is_st2110_multicast, unwrap_vlan};
 use crate::report::{create_logger, print_report};
 
@@ -99,13 +99,15 @@ fn main() {
         // times out (Err path hits `continue` and never reaches code below the read).
         if last_report.elapsed() > Duration::from_secs(5) {
             for stats in ptp_domains.values_mut() {
-                if stats.check_timeout() {
-                    logger.log(&format!(
+                if let Some(PtpEvent::ClockLost) = stats.check_timeout() {
+                    let msg = format!(
                         "❌ PTP Clock LOST (Domain {} v{}) [{}]",
                         stats.domain,
                         stats.version,
                         stats.protocol_kind.as_deref().unwrap_or("?")
-                    ));
+                    );
+                    println!("\x1b[31m{}\x1b[0m", msg);
+                    logger.log(&msg);
                 }
             }
             for sdp in sdp_cache.values() {
@@ -208,7 +210,18 @@ fn main() {
             igmp_joins_seen.retain(|_, t| t.elapsed() < Duration::from_secs(300));
         }
 
-        let packet = match cap.next_packet() { Ok(p) => p, Err(_) => continue };
+        let packet = match cap.next_packet() {
+            Ok(p) => p,
+            Err(pcap::Error::TimeoutExpired) => continue, // expected on quiet networks
+            Err(e) => {
+                // Real capture failure (interface down, permissions revoked, etc.).
+                // Log once and exit — busy-looping on a broken handle helps no one.
+                let msg = format!("❌ Capture error: {} — exiting", e);
+                eprintln!("\x1b[31m{}\x1b[0m", msg);
+                logger.log(&msg);
+                std::process::exit(1);
+            }
+        };
         let eth    = match EthernetPacket::new(packet.data) { Some(e) => e, _ => continue };
         let now    = Instant::now();
         // VLAN-unwrapped L2 payload (handles 802.1Q / QinQ tagged frames).
@@ -248,7 +261,25 @@ fn main() {
                         let stats = ptp_domains
                             .entry((info.domain, info.version))
                             .or_insert_with(|| PtpStats::new(info.domain, info.version));
-                        stats.update(&info, &info.protocol_kind);
+                        if let Some(event) = stats.update(&info, &info.protocol_kind) {
+                            let gm = stats.last_grandmaster.as_deref().unwrap_or("?");
+                            let (msg, color) = match event {
+                                PtpEvent::GrandmasterDetected => (
+                                    format!("✓  GRANDMASTER DETECTED (Domain {} v{}): {}",
+                                        stats.domain, stats.version, gm),
+                                    "32",
+                                ),
+                                PtpEvent::GrandmasterChanged { from } => (
+                                    format!("⚠️  GRANDMASTER CHANGED (Domain {} v{}): {} → {}",
+                                        stats.domain, stats.version, from, gm),
+                                    "33",
+                                ),
+                                // update() does not emit ClockLost — only check_timeout() does.
+                                PtpEvent::ClockLost => unreachable!(),
+                            };
+                            println!("\x1b[{}m{}\x1b[0m", color, msg);
+                            logger.log(&msg);
+                        }
                     }
 
                     // ── AES67 ────────────────────────────────────

@@ -153,6 +153,16 @@ impl ProtocolChoice {
     /// Return list of protocols included in this choice
     pub fn includes(&self) -> Vec<ProtocolChoice> {
         match self {
+            // All expands to every concrete protocol — without this expansion the
+            // per-protocol gating in is_selected / PTP requirement checks falls
+            // through to vacuously-true and silently disables alerts.
+            ProtocolChoice::All => vec![
+                ProtocolChoice::AES67,
+                ProtocolChoice::ST2110,
+                ProtocolChoice::Dante,
+                ProtocolChoice::NDI,
+                ProtocolChoice::AVB,
+            ],
             ProtocolChoice::Audio => vec![
                 ProtocolChoice::AES67,
                 ProtocolChoice::Dante,
