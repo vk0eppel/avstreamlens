@@ -184,10 +184,13 @@ fn main() {
             print_report(&streams, &tcp_streams, &ptp_domains, ptp_ok, &mut logger, &network_health, bytes_this_window, &avtp_streams, &msrp_state, &mvrp_vlans, &eee_ports);
             bytes_this_window = 0;
             last_report = Instant::now();
-            // Reset per-cycle gap counters so counts reflect the current 5s window
+            // Reset per-cycle counters so alerts reflect the current 5s window
             for s in streams.values_mut() {
-                s.gap_events  = 0;
-                s.max_iat_ms  = 0.0;
+                s.gap_events      = 0;
+                s.max_iat_ms      = 0.0;
+                s.pt_mismatches   = 0;
+                s.dscp_violations = 0;
+                s.ssrc_changes    = 0;
             }
             streams.retain(|_, s| {
                 s.last_packet_time
@@ -411,18 +414,7 @@ fn main() {
                             entry.packets += 1;
                             entry.last_seen = now;
                             entry.update_bitrate(frame_bytes, now);
-                            // Sequence loss detection (8-bit wrapping counter)
-                            // Negative signed delta = reorder/reset, not loss (mirrors RTP fix).
-                            if let (Some(seq), Some(last)) = (avtp_seq, entry.last_seq) {
-                                let expected = last.wrapping_add(1);
-                                if seq != expected {
-                                    let delta = seq.wrapping_sub(expected) as i8;
-                                    if delta > 0 {
-                                        entry.lost_frames += delta as u64;
-                                    }
-                                }
-                            }
-                            if let Some(s) = avtp_seq { entry.last_seq = Some(s); }
+                            if let Some(seq) = avtp_seq { entry.update_seq(seq); }
                         }
                     }
 

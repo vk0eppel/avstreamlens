@@ -240,6 +240,21 @@ impl AvtpStreamStats {
         }
     }
 
+    /// Update sequence-loss tracking from the AVTP sequence_num byte (8-bit wrapping).
+    /// Negative signed delta = reorder/reset, not loss (mirrors the RTP fix).
+    pub fn update_seq(&mut self, seq: u8) {
+        if let Some(last) = self.last_seq {
+            let expected = last.wrapping_add(1);
+            if seq != expected {
+                let delta = seq.wrapping_sub(expected) as i8;
+                if delta > 0 {
+                    self.lost_frames += delta as u64;
+                }
+            }
+        }
+        self.last_seq = Some(seq);
+    }
+
     pub fn loss_pct(&self) -> f64 {
         let total = self.packets + self.lost_frames;
         if total == 0 { 0.0 } else { 100.0 * self.lost_frames as f64 / total as f64 }
@@ -649,6 +664,50 @@ mod tests {
         s.update(10, 0, 1, 100);
         s.update(5,  0, 1, 100); // backward
         assert_eq!(s.lost_packets, 0);
+    }
+
+    // ── AVTP 8-bit sequence wrap ────────────────────────────────────────────
+
+    fn avtp() -> AvtpStreamStats {
+        AvtpStreamStats::new([0u8; 8], 0x00)
+    }
+
+    #[test]
+    fn avtp_no_loss_on_seq_wrap() {
+        // 255 → 0 is the normal 8-bit wrap, not a 255-packet loss
+        let mut s = avtp();
+        s.update_seq(254);
+        s.update_seq(255);
+        s.update_seq(0);
+        s.update_seq(1);
+        assert_eq!(s.lost_frames, 0);
+    }
+
+    #[test]
+    fn avtp_backward_seq_not_counted_as_loss() {
+        // Reorder within the 128-frame window: last=100, seq=90 → signed delta < 0, ignored
+        let mut s = avtp();
+        s.update_seq(100);
+        s.update_seq(90);
+        assert_eq!(s.lost_frames, 0);
+    }
+
+    #[test]
+    fn avtp_gap_counted_as_loss() {
+        // Skipped seq 1 and 2 → 2 frames lost
+        let mut s = avtp();
+        s.update_seq(0);
+        s.update_seq(3);
+        assert_eq!(s.lost_frames, 2);
+    }
+
+    #[test]
+    fn avtp_gap_across_wrap_counted_as_loss() {
+        // last=253, seq=1 → expected=254, delta=3 → 3 frames lost across the wrap
+        let mut s = avtp();
+        s.update_seq(253);
+        s.update_seq(1);
+        assert_eq!(s.lost_frames, 3);
     }
 
     // ── SSRC tracking ────────────────────────────────────────────────────────

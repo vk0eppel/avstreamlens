@@ -27,7 +27,7 @@ cargo clippy -- -D warnings  # lint
 ## Architecture
 
 ### General
-- **Test harness**: 49 unit tests in `#[cfg(test)]` modules inside `parser.rs` and `stats.rs` — run with `cargo test`
+- **Test harness**: 53 unit tests in `#[cfg(test)]` modules inside `parser.rs` and `stats.rs` — run with `cargo test`
 - Logging: timestamped `.log` files written on every run in the working directory; `Logger::log()` flushes after every write so the last report survives SIGINT
 - Bitrate computed as `byte_delta / elapsed_secs` — never assumed 1s exactly
 - All modules follow the same pattern: parse → stats → report
@@ -52,7 +52,7 @@ cargo clippy -- -D warnings  # lint
 - **Report block is at the TOP of the loop**, before `cap.next_packet()` — so it fires even when pcap times out on quiet L2-only networks (e.g. AVB-only; `Err(_) => continue` would otherwise skip it)
 - `streams` and `tcp_streams` pruned after each 5s report: silent >20s removed; TCP `Terminated` removed immediately
 - `ptp_domains` and `sdp_cache` never pruned (bounded by design)
-- `gap_events` and `max_iat_ms` reset after each report (per-window counters)
+- Per-window counters reset after each 5s report: `gap_events`, `max_iat_ms`, `pt_mismatches`, `dscp_violations`, `ssrc_changes` — alerts and score penalties reflect the current window, not the stream's lifetime
 - All protocol arms set `last_packet_time = Some(now)` so pruning applies uniformly
 - IGMP Join deduplication: `igmp_joins_seen: HashMap<(Ipv4Addr, Ipv4Addr), Instant>` — cleared on Leave; entries older than 5 minutes pruned each report cycle (handles hosts that disappear without sending Leave); Queries/Unknowns always print
 - **VLAN-tagged frames**: `unwrap_vlan()` in `parser.rs` peels 802.1Q / 802.1ad / QinQ tags before dispatch — L2 AVB protocols work on tagged networks
@@ -73,7 +73,7 @@ cargo clippy -- -D warnings  # lint
 - **Clock**: PTPv2 via UDP ports 319/320; ts-refclk cross-check validates SDP-claimed grandmaster against wire
 - **Health metrics**: loss (RFC 3550 seq, signed-delta — backward/reorder ignored), jitter (RFC 3550 EWMA, sign-preserving), SSRC changes, TS discontinuities, signal gaps, payload type validation, DSCP EF(46) per-stream
 - `clock_hz_confirmed` gates TS discontinuity detection — set at stream creation if SDP found, or retroactively when SAP arrives
-- `expected_pt` from SDP `a=rtpmap`; `pt_mismatches` counts mismatches per packet
+- `expected_pt` from SDP `a=rtpmap`; `pt_mismatches` counts mismatches per packet within the 5s window
 - Signal gap: `gap_events` fires when IAT > 50ms; alert requires **≥2 events per 5s window** (single spike = pcap scheduling noise); `max_iat_ms` tracks worst case; both reset per 5s window
 - PTP correction field stored as `last_offset_ns` (nanoseconds, after ÷65536); alert if abs > 1µs
 - Alert `⚠ Stream not announced (no SAP)` when >10 packets with no SDP enrichment (AES67/Dante/ST2110 only — AVB/NDI never have SDP)
@@ -108,7 +108,7 @@ cargo clippy -- -D warnings  # lint
 
 ### AVB
 - **Transport**: L2 Ethernet — AVTP (0x22F0), MSRP (0x22EA), MVRP (0x88F5), gPTP (0x88F7)
-- **AVTP**: `avtp_streams: HashMap<[u8;8], AvtpStreamStats>` per stream_id (sv=1, bytes 4–11); subtype decoded via `avtp_subtype_name()` (0x00=IEC 61883, 0x02=CRF, 0x7E=MAAP…); sequence loss via byte 2 counter; bitrate from Ethernet frame sizes
+- **AVTP**: `avtp_streams: HashMap<[u8;8], AvtpStreamStats>` per stream_id (sv=1, bytes 4–11); subtype decoded via `avtp_subtype_name()` (0x00=IEC 61883, 0x02=CRF, 0x7E=MAAP…); sequence loss via `AvtpStreamStats::update_seq()` on byte 2 counter (8-bit wrap-safe, signed-i8 reorder filter mirrors the RTP fix); bitrate from Ethernet frame sizes
 - **MSRP**: `parse_msrp()` extracts TalkerAdvertise (bandwidth, VLAN, priority), TalkerFailed (failure code), Listener state; `msrp_state: HashMap<[u8;8], MsrpDeclaration>`; TalkerFailed alert immediate with code (1=bandwidth, 2=bridge resources, 3=traffic class)
 - **MVRP**: `parse_mvrp()` extracts VLAN IDs; `mvrp_vlans: HashSet<u16>` — presence confirms L2 VLAN QoS; alert if AVTP active but no MVRP
 - `avtp_streams` pruned per cycle; `msrp_state` and `mvrp_vlans` not pruned
