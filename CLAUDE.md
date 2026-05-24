@@ -55,7 +55,7 @@ cargo clippy -- -D warnings  # lint
 - Per-window counters reset after each 5s report: `gap_events`, `max_iat_ms`, `pt_mismatches`, `dscp_violations`, `ssrc_changes` — alerts and score penalties reflect the current window, not the stream's lifetime
 - All protocol arms set `last_packet_time = Some(now)` so pruning applies uniformly
 - IGMP Join deduplication: `igmp_joins_seen: HashMap<(Ipv4Addr, Ipv4Addr), Instant>` — cleared on Leave; entries older than 5 minutes pruned each report cycle (handles hosts that disappear without sending Leave); Queries/Unknowns always print
-- **VLAN-tagged frames**: `unwrap_vlan()` in `parser.rs` peels 802.1Q / 802.1ad / QinQ tags before dispatch — L2 AVB protocols work on tagged networks
+- **VLAN-tagged frames**: `unwrap_vlan()` in `parser.rs` peels 802.1Q / 802.1ad / QinQ tags before dispatch — L2 AVB protocols work on tagged networks. No VLAN-ID filtering is implemented; the app processes whatever VLANs the capture interface receives. Operator-facing guidance (trunk vs access vs SPAN, macOS tag-stripping, QinQ caveat) lives in README.md under "Capture Setup — Monitoring One or Multiple VLANs"
 
 ### Interface Listing
 - Filtered: `lo`/`lo0`, `utun*`, `awdl*`, `llw*`, `bridge*`, `vpn*`, `docker*`, `veth*`, `virbr*`, `ap1`, `anpi*` (iPhone USB), `gif*` (IPv6 tunnel), `stf*` (6to4 tunnel)

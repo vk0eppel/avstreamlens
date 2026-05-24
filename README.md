@@ -69,6 +69,27 @@ On startup:
 
 ---
 
+## Capture Setup — Monitoring One or Multiple VLANs
+
+AVStreamLens has no per-VLAN configuration: it parses any VLAN delivered to the capture interface. 802.1Q, 802.1ad, and QinQ tags are stripped transparently before protocol detection, so AVB, PTP, and IP streams are recognised regardless of tagging.
+
+What you actually see is determined by the **switch port** you plug into, not by the app:
+
+| Port type | Visibility |
+|---|---|
+| **Access port** | One VLAN, untagged. You see only the streams on that VLAN. |
+| **Trunk port** | Every VLAN the trunk carries, tagged. AVStreamLens peels the tags and parses normally. |
+| **SPAN / mirror port** | Whatever the switch's mirror session copies. This is the usual way to monitor production AV networks without disturbing live traffic. |
+
+**To monitor multiple VLANs at once**, ask the network team to configure a SPAN/mirror session that copies the trunk(s) carrying AV traffic, or plug the capture host into an existing trunk port.
+
+**Caveats**
+
+- **macOS** — Many macOS drivers strip the 802.1Q tag before pcap sees it. Stream detection still works (the inner payload is intact), but you lose visibility into *which* VLAN a stream rode on. Linux generally preserves the tag.
+- **QinQ** — libpcap's BPF compiler handles a single 802.1Q tag transparently for `ether proto` matches, but stacked QinQ can hide L2 protocols (PTP, AVB) from the kernel filter on some drivers. If AVB or gPTP is missing on a known-good QinQ trunk, that's the first place to look.
+
+---
+
 ## Protocol Selection
 
 ```
