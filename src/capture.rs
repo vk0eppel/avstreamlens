@@ -19,9 +19,9 @@ use pnet_packet::Packet;
 
 use crate::parser::{is_aes67_multicast, is_st2110_multicast, parse_rtp};
 use crate::protocols::{
-    AvProtocol, DanteKind, IgmpType, MsrpDeclType, MsrpDeclaration, NdiKind, ProtocolChoice,
-    PtpInfo, SdpSession, St2110Type, DEFAULT_CLOCK_HZ, PTP_VERSION_V2, STREAM_TIMEOUT_SECS,
-    avtp_subtype_name,
+    AvProtocol, DanteKind, FlowControlKind, IgmpType, MsrpDeclType, MsrpDeclaration, NdiKind,
+    ProtocolChoice, PtpInfo, SdpSession, St2110Type, DEFAULT_CLOCK_HZ, PTP_VERSION_V2,
+    STREAM_TIMEOUT_SECS, avtp_subtype_name,
 };
 use crate::report::Logger;
 use crate::stats::{
@@ -87,6 +87,12 @@ pub struct CaptureState {
     // EEE detection: (chassis_id, port_id) → (tx_wake_us, rx_wake_us)
     pub eee_ports:      HashMap<(String, String), (u16, u16)>,
     pub bytes_this_window: u64,
+    // Link-layer flow-control counters (PAUSE / PFC, EtherType 0x8808).
+    // Many NICs strip these at the MAC layer before pcap sees them; when
+    // they do reach userspace, any non-zero count indicates upstream
+    // congestion that has caused brief tx-side freezes.
+    pub pause_frames_this_window: u64,
+    pub pfc_frames_this_window:   u64,
 }
 
 impl Default for CaptureState {
@@ -110,6 +116,8 @@ impl CaptureState {
             mvrp_vlans: HashSet::new(),
             eee_ports: HashMap::new(),
             bytes_this_window: 0,
+            pause_frames_this_window: 0,
+            pfc_frames_this_window:   0,
         }
     }
 
@@ -117,12 +125,17 @@ impl CaptureState {
     /// Call after each report is printed.
     pub fn reset_window(&mut self) {
         self.bytes_this_window = 0;
+        self.pause_frames_this_window = 0;
+        self.pfc_frames_this_window   = 0;
         for s in self.streams.values_mut() {
             s.gap_events      = 0;
             s.max_iat_ms      = 0.0;
             s.pt_mismatches   = 0;
             s.dscp_violations = 0;
             s.ssrc_changes    = 0;
+            s.lost_this_window               = 0;
+            s.ts_discontinuities_this_window = 0;
+            s.reorders_this_window           = 0;
         }
         self.streams.retain(|_, s| {
             s.last_packet_time
@@ -432,6 +445,15 @@ impl CaptureState {
         alerts
     }
 
+    /// Link-layer flow control (PAUSE or PFC). Just counts — alert text and
+    /// score penalty live in the periodic report.
+    pub fn handle_flow_control(&mut self, kind: FlowControlKind) {
+        match kind {
+            FlowControlKind::Pause                => self.pause_frames_this_window += 1,
+            FlowControlKind::PriorityFlowControl  => self.pfc_frames_this_window   += 1,
+        }
+    }
+
     /// PTP clock-loss check, called from the periodic report cycle.
     /// Returns one ClockLost alert per domain that transitioned to LOST.
     pub fn check_ptp_timeouts(&mut self) -> Vec<Alert> {
@@ -562,6 +584,10 @@ pub fn dispatch(
         }
         AvProtocol::Igmp { src, group, igmp_type } => {
             state.handle_igmp(src, group, igmp_type, now)
+        }
+        AvProtocol::FlowControl { kind } => {
+            state.handle_flow_control(kind);
+            vec![]
         }
     };
     emit(&alerts, logger);
@@ -893,6 +919,83 @@ mod tests {
         let mut state = CaptureState::new();
         state.ndi_sources.insert(Ipv4Addr::new(192,168,1,60));
         assert!(state.ptp_requirement_met(&[ProtocolChoice::NDI]));
+    }
+
+    // ── Flow control (PAUSE / PFC) ──────────────────────────────────────────
+
+    #[test]
+    fn pause_frames_counted_separately_from_pfc() {
+        let mut state = CaptureState::new();
+        state.handle_flow_control(FlowControlKind::Pause);
+        state.handle_flow_control(FlowControlKind::Pause);
+        state.handle_flow_control(FlowControlKind::PriorityFlowControl);
+        assert_eq!(state.pause_frames_this_window, 2);
+        assert_eq!(state.pfc_frames_this_window,   1);
+    }
+
+    #[test]
+    fn flow_control_counters_clear_on_reset_window() {
+        let mut state = CaptureState::new();
+        state.handle_flow_control(FlowControlKind::Pause);
+        state.handle_flow_control(FlowControlKind::PriorityFlowControl);
+        state.reset_window();
+        assert_eq!(state.pause_frames_this_window, 0);
+        assert_eq!(state.pfc_frames_this_window,   0);
+    }
+
+    // ── PTP path-delay tracking ────────────────────────────────────────────
+
+    fn delay_resp(domain: u8, path_delay_ns: i64) -> crate::protocols::PtpInfo {
+        crate::protocols::PtpInfo {
+            version: PTP_VERSION_V2,
+            message_type: 0x09, // Delay_Resp
+            domain,
+            clock_id: None,
+            grandmaster_id: None,
+            clock_quality: None,
+            correction_ns: Some(path_delay_ns),
+            path_delay_ns: Some(path_delay_ns),
+            origin_timestamp_ns: None,
+            message_name: "Delay_Resp".to_string(),
+            port_id: None,
+            sequence_id: 0,
+            log_sync_interval: 0,
+            log_min_pdelay_req_interval: 0,
+            protocol_kind: Some("PTPv2".to_string()),
+            src_ip: None,
+        }
+    }
+
+    #[test]
+    fn ptp_path_delay_min_max_track_observed_range() {
+        let mut state = CaptureState::new();
+        state.handle_ptp(delay_resp(0, 500));
+        state.handle_ptp(delay_resp(0, 1200));
+        state.handle_ptp(delay_resp(0, 800));
+        let stats = state.ptp_domains.get(&(0, PTP_VERSION_V2)).expect("entry created");
+        assert_eq!(stats.min_path_delay_ns, Some(500));
+        assert_eq!(stats.max_path_delay_ns, Some(1200));
+    }
+
+    #[test]
+    fn ptp_path_delay_resets_on_grandmaster_change() {
+        let mut state = CaptureState::new();
+        state.handle_ptp(delay_resp(0, 1000));
+        // Inject an Announce-like update that establishes a grandmaster, then
+        // a second Announce with a different grandmaster to trigger reset.
+        let mut announce = delay_resp(0, 500);
+        announce.message_type = 0x0B; // Announce
+        announce.grandmaster_id = Some("gm-A".to_string());
+        announce.path_delay_ns = None; // Announce doesn't carry path delay
+        state.handle_ptp(announce.clone());
+        // Sanity: path delay still set from the earlier Delay_Resp.
+        assert!(state.ptp_domains.get(&(0, PTP_VERSION_V2)).unwrap().min_path_delay_ns.is_some());
+
+        announce.grandmaster_id = Some("gm-B".to_string());
+        state.handle_ptp(announce);
+        let stats = state.ptp_domains.get(&(0, PTP_VERSION_V2)).unwrap();
+        assert_eq!(stats.min_path_delay_ns, None, "GM change should clear path-delay history");
+        assert_eq!(stats.max_path_delay_ns, None);
     }
 
     #[test]

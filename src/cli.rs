@@ -121,12 +121,15 @@ pub fn build_bpf_filter(selected: &[ProtocolChoice]) -> String {
     if needs_udp { filters.push("udp".to_string()); }
     if needs_tcp { filters.push("tcp".to_string()); }
     if needs_avb { filters.push("(ether proto 0x22f0) or (ether proto 0x22ea) or (ether proto 0x88f5)".to_string()); }
-    // LLDP and gPTP are always included — PTP/EEE are monitored regardless of protocol selection
+    // LLDP, gPTP, and flow control are always included — they are infrastructure
+    // signals (EEE detection, PTP, link-layer congestion) needed regardless of
+    // the user's protocol selection.
     filters.push("(ether proto 0x88cc)".to_string());
     filters.push("(ether proto 0x88f7)".to_string());
+    filters.push("(ether proto 0x8808)".to_string());
 
     // After All/Audio/Video expansion, every concrete ProtocolChoice triggers
-    // one of needs_udp/tcp/avb — so this list always has at least 4 entries.
+    // one of needs_udp/tcp/avb — so this list always has at least 5 entries.
     filters.join(" or ")
 }
 
@@ -179,5 +182,5 @@ fn macos_port_names() -> std::collections::HashMap<String, String> {
 }
 
 fn all_protocols_filter() -> String {
-    "igmp or udp or tcp or (ether proto 0x22f0) or (ether proto 0x22ea) or (ether proto 0x88f5) or (ether proto 0x88f7) or (ether proto 0x88cc)".to_string()
+    "igmp or udp or tcp or (ether proto 0x22f0) or (ether proto 0x22ea) or (ether proto 0x88f5) or (ether proto 0x88f7) or (ether proto 0x88cc) or (ether proto 0x8808)".to_string()
 }

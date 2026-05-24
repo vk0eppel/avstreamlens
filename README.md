@@ -146,21 +146,34 @@ Choose the protocols to monitor:
 
 **Status line** — `✓ All streams healthy` or `⚠ N issue(s)` with a brief description.
 
-**Alerts** appear inline when problems are detected:
-- `⚠  Audio glitch risk — timing discontinuity detected`
-- `⚠  Packet loss detected`
+**Alerts** appear inline when problems are detected. Alerts on cumulative metrics (loss, timing discontinuities) include both a per-window count and the lifetime total, so an old loss does not re-alert forever:
+
+*Per-stream:*
+- `⚠  Audio glitch risk — timing discontinuity detected (N in last 5s)`
+- `⚠  Packet loss detected (N in last 5s, X.XX% cumulative)`
+- `⚠  Packet reorder X.X% (N in last 5s) — possible per-packet load-balancing`
 - `⚠  QoS: N packet(s) not marked EF (46) — may be deprioritised by switches`
 - `⚠  Signal gap detected (N in last 5s, worst X.X ms) — stream interrupted`
 - `⚠  RTP payload type mismatch — encoder/SDP misconfiguration`
 - `⚠  Dante clock or subscription issue`
-- `⚠  No clock source — streams requiring PTP may lose sync`
-- `⚠  Large PTP correction field — transparent clock or path issue`
-- `⚠  ECN: N congestion mark(s) — router congestion detected on the path`
-- `⚠  EEE active on switch port(s) — may cause audio/video glitches`
 - `⚠  Stream not announced (no SAP) — audio glitch detection unavailable`
 - `⚠  Stream type unknown — SDP required to classify as video/audio/ancillary`
-- `⚠  No VLAN registration — L2 QoS may not be configured`
 - `💀 No signal for 12s`
+
+*Clock / PTP:*
+- `⚠  No clock source — streams requiring PTP may lose sync`
+- `⚠  Large PTP correction field — transparent clock or path issue`
+- `⚠  PTP path-delay variance > 10µs — unstable link (EEE, half-duplex, or cable)`
+- `⚠  PTP path delay > 1ms — too many hops between this node and grandmaster`
+
+*Network infrastructure:*
+- `⚠  ECN: N congestion mark(s) — router congestion detected on the path`
+- `⚠  PAUSE frames: N in last 5s — upstream link congestion causing tx-side freezes`
+- `⚠  PFC frames: N in last 5s — priority flow control engaged on upstream link`
+- `⚠  EEE active on switch port(s) — may cause audio/video glitches`
+- `⚠  No VLAN registration — L2 QoS may not be configured`
+
+PAUSE and PFC detection is best-effort: most NICs consume these frames at the MAC layer before pcap sees them. The absence of these alerts therefore does NOT prove no upstream congestion is happening.
 
 ---
 

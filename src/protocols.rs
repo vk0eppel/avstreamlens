@@ -17,6 +17,7 @@ pub const ETHERTYPE_PTP:     u16 = 0x88F7; // PTP (IEEE 1588)
 pub const ETHERTYPE_MSRP:    u16 = 0x22EA; // MSRP — IEEE 802.1Qat stream reservation
 pub const ETHERTYPE_MVRP:    u16 = 0x88F5; // MVRP — IEEE 802.1Q VLAN registration
 pub const ETHERTYPE_LLDP:    u16 = 0x88CC; // LLDP — IEEE 802.1AB link layer discovery
+pub const ETHERTYPE_FLOW_CTRL: u16 = 0x8808; // IEEE 802.3x PAUSE / 802.1Qbb PFC
 
 // IGMP protocol number
 pub const IP_PROTO_IGMP:     u8  = 0x02;
@@ -54,6 +55,13 @@ pub enum AvProtocol {
     Ptp    { info: PtpInfo },
     Igmp   { src: Ipv4Addr, group: Ipv4Addr, igmp_type: IgmpType },
     LldpEee { chassis_id: String, port_id: String, tx_wake_us: u16, rx_wake_us: u16 },
+    FlowControl { kind: FlowControlKind },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum FlowControlKind {
+    Pause,                   // 802.3x global pause
+    PriorityFlowControl,     // 802.1Qbb per-priority pause
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -185,6 +193,8 @@ impl AvProtocol {
             | AvProtocol::Msrp { .. }
             | AvProtocol::Mvrp { .. } => expanded.iter().any(|c| matches!(c, ProtocolChoice::AVB)),
             AvProtocol::LldpEee { .. } => true,
+            // Flow control is universal infrastructure — always relevant.
+            AvProtocol::FlowControl { .. } => true,
             // PTP is relevant for all clock-dependent protocols; NDI uses its own timing
             AvProtocol::Ptp { .. } =>
                 expanded.iter().any(|c| matches!(c,

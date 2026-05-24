@@ -61,6 +61,8 @@ pub fn print_report(
     msrp_state: &HashMap<[u8; 8], MsrpDeclaration>,
     mvrp_vlans: &std::collections::HashSet<u16>,
     eee_ports: &std::collections::HashMap<(String, String), (u16, u16)>,
+    pause_frames: u64,
+    pfc_frames: u64,
 ) {
     let now = Local::now();
     let timestamp = now.format("%Y-%m-%d %H:%M:%S").to_string();
@@ -110,10 +112,13 @@ pub fn print_report(
     println!("{}", net_summary);
 
     // ── Top-level status ────────────────────────────────────────────────────
+    // Stream-issue count uses per-window deltas where applicable so the status
+    // line accurately reflects current conditions instead of accumulating
+    // every problem ever seen in this run.
     let stream_issues = streams.values().filter(|s| {
-        s.loss_pct() > 0.0
+        s.lost_this_window > 0
             || s.jitter_ms() > 20.0
-            || s.ts_discontinuities > 0
+            || s.ts_discontinuities_this_window > 0
             || s.ssrc_changes > 0
             || s.last_packet_time.is_some_and(|t| t.elapsed() > Duration::from_secs(STREAM_TIMEOUT_SECS))
     }).count();
@@ -214,16 +219,39 @@ pub fn print_report(
             println!("{}", metrics);
         }
 
-        if s.ts_discontinuities > 0 {
-            let alert = "    ⚠  Audio glitch risk — timing discontinuity detected";
-            logger.log(alert);
+        // Per-window deltas — these alerts only fire when fresh activity
+        // occurred in the last 5s, so a single old loss does not re-alert forever.
+        if s.ts_discontinuities_this_window > 0 {
+            let alert = format!(
+                "    ⚠  Audio glitch risk — timing discontinuity detected ({} in last 5s)",
+                s.ts_discontinuities_this_window
+            );
+            logger.log(&alert);
             println!("\x1b[33m{}\x1b[0m", alert);
         }
 
-        if s.loss_pct() > 0.0 {
-            let alert = "    ⚠  Packet loss detected";
-            logger.log(alert);
+        if s.lost_this_window > 0 {
+            let alert = format!(
+                "    ⚠  Packet loss detected ({} in last 5s, {:.2}% cumulative)",
+                s.lost_this_window, s.loss_pct()
+            );
+            logger.log(&alert);
             println!("\x1b[33m{}\x1b[0m", alert);
+        }
+
+        // Reorder rate — distinct from loss. >1% suggests per-packet ECMP/LAG
+        // load-balancing, which breaks ordered AV streams even without drops.
+        if s.reorders_this_window > 0 {
+            let total = (s.packets + s.lost_packets).max(1);
+            let pct = 100.0 * s.reorders_this_window as f64 / total as f64;
+            if pct > 1.0 {
+                let alert = format!(
+                    "    ⚠  Packet reorder {:.1}% ({} in last 5s) — possible per-packet load-balancing",
+                    pct, s.reorders_this_window
+                );
+                logger.log(&alert);
+                println!("\x1b[33m{}\x1b[0m", alert);
+            }
         }
 
         if s.dscp_violations > 0 {
@@ -438,6 +466,34 @@ pub fn print_report(
                 }
             }
 
+            // Path-delay tracking: report min..max spread and alert on instability
+            // (>10µs spread = unstable link; >1ms absolute = too many hops).
+            if let (Some(min), Some(max)) = (stats.min_path_delay_ns, stats.max_path_delay_ns) {
+                let spread_ns = max - min;
+                let fmt = |ns: i64| if ns.unsigned_abs() >= 1_000 {
+                    format!("{:.1}µs", ns as f64 / 1_000.0)
+                } else {
+                    format!("{}ns", ns)
+                };
+                let line = if min == max {
+                    format!("    path delay: {}", fmt(max))
+                } else {
+                    format!("    path delay: {} – {}  (spread {})", fmt(min), fmt(max), fmt(spread_ns))
+                };
+                logger.log(&line);
+                println!("{}", line);
+                if spread_ns > 10_000 {
+                    let alert = "    ⚠  PTP path-delay variance > 10µs — unstable link (EEE, half-duplex, or cable)";
+                    logger.log(alert);
+                    println!("\x1b[33m{}\x1b[0m", alert);
+                }
+                if max > 1_000_000 {
+                    let alert = "    ⚠  PTP path delay > 1ms — too many hops between this node and grandmaster";
+                    logger.log(alert);
+                    println!("\x1b[33m{}\x1b[0m", alert);
+                }
+            }
+
             if stats.protocol_clock_lost {
                 let alert = "    ⚠  Clock lost — grandmaster disappeared";
                 logger.log(alert);
@@ -497,6 +553,26 @@ pub fn print_report(
         let alert = format!(
             "   ⚠  ECN: {} congestion mark(s) — router congestion detected on the path",
             health.ecn_congestion_marks
+        );
+        logger.log(&alert);
+        println!("\x1b[33m{}\x1b[0m", alert);
+    }
+
+    // Link-layer flow control (PAUSE / PFC). Most NICs strip these in hardware
+    // and pcap never sees them; when they DO reach userspace, even one frame is
+    // a strong signal of upstream congestion causing tx-side freezes.
+    if pause_frames > 0 {
+        let alert = format!(
+            "   ⚠  PAUSE frames: {} in last 5s — upstream link congestion causing tx-side freezes",
+            pause_frames
+        );
+        logger.log(&alert);
+        println!("\x1b[33m{}\x1b[0m", alert);
+    }
+    if pfc_frames > 0 {
+        let alert = format!(
+            "   ⚠  PFC frames: {} in last 5s — priority flow control engaged on upstream link",
+            pfc_frames
         );
         logger.log(&alert);
         println!("\x1b[33m{}\x1b[0m", alert);

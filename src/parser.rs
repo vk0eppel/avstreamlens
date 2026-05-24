@@ -7,6 +7,7 @@ pub mod ptp;
 pub mod avb;
 pub mod lldp;
 pub mod mdns;
+pub mod flow_control;
 
 // Re-export the public API so consumers (main.rs, capture.rs) can keep using
 // `crate::parser::parse_*` and `crate::parser::extract_*` without churn.
@@ -15,6 +16,7 @@ pub use ptp::parse_ptp;
 pub use avb::{parse_avtp_stream_id, parse_msrp, parse_mvrp};
 pub use lldp::parse_lldp_eee;
 pub use mdns::{extract_dante_name, extract_ndi_name, mdns_contains};
+pub use flow_control::parse_flow_control;
 
 use pnet_packet::{
     ethernet::EthernetPacket,
@@ -119,6 +121,11 @@ pub fn detect_protocol(eth: &EthernetPacket) -> Option<AvProtocol> {
     // ── LLDP : L2 (EtherType 0x88CC) — scan for EEE TLV ─
     if raw_et == crate::protocols::ETHERTYPE_LLDP {
         return parse_lldp_eee(l2_payload);
+    }
+
+    // ── Flow control : L2 (EtherType 0x8808) — PAUSE / PFC
+    if raw_et == crate::protocols::ETHERTYPE_FLOW_CTRL {
+        return parse_flow_control(l2_payload);
     }
 
     // ── MVRP : L2 (EtherType 0x88F5) ────────────────────

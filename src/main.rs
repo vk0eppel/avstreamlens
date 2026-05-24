@@ -91,6 +91,7 @@ fn main() {
                 &state.streams, &state.tcp_streams, &state.ptp_domains, ptp_ok,
                 &mut logger, &state.network_health, state.bytes_this_window,
                 &state.avtp_streams, &state.msrp_state, &state.mvrp_vlans, &state.eee_ports,
+                state.pause_frames_this_window, state.pfc_frames_this_window,
             );
 
             state.reset_window();

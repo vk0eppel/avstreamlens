@@ -52,6 +52,15 @@ pub struct StreamStats {
     pub max_iat_ms:         f64,         // worst-case inter-arrival time (ms)
     // Per-stream DSCP validation
     pub dscp_violations:    u64,         // packets with wrong DSCP for this protocol
+    // Per-window deltas — drive alert deduplication. Cumulative counters above
+    // (lost_packets, ts_discontinuities) keep growing; alerts fire only when
+    // the per-window delta is non-zero, so an old loss does not re-alert every
+    // 5s forever.
+    pub lost_this_window:               u64,
+    pub ts_discontinuities_this_window: u64,
+    // Out-of-order packets (negative seq delta). Distinct from loss: indicates
+    // path instability or per-packet ECMP load-balancing rather than drops.
+    pub reorders_this_window:           u64,
 }
 
 impl StreamStats {
@@ -89,6 +98,9 @@ impl StreamStats {
             gap_events:          0,
             max_iat_ms:          0.0,
             dscp_violations:     0,
+            lost_this_window:               0,
+            ts_discontinuities_this_window: 0,
+            reorders_this_window:           0,
         }
     }
     // Constructor with enhanced info — useful when SDP is available at stream start
@@ -113,6 +125,11 @@ impl StreamStats {
                 let delta = seq.wrapping_sub(expected) as i16;
                 if delta > 0 {
                     self.lost_packets += delta as u64;
+                    self.lost_this_window += delta as u64;
+                } else {
+                    // Negative delta = packet arrived out of order. Distinct from
+                    // loss; high reorder rate suggests per-packet ECMP load-balancing.
+                    self.reorders_this_window += 1;
                 }
             }
         }
@@ -138,6 +155,7 @@ impl StreamStats {
                 (actual_diff as f64) > (expected_diff as f64 * 1.5))
             {
                 self.ts_discontinuities += 1;
+                self.ts_discontinuities_this_window += 1;
             }
             self.last_ts_diff = Some(actual_diff);
         }
@@ -492,6 +510,10 @@ pub struct PtpStats {
     pub last_quality:      Option<String>,
     pub last_offset_ns:    Option<i64>,
     pub last_path_delay_ns: Option<i64>,
+    // Path-delay drift tracking: high spread = unstable link (EEE, half-duplex,
+    // dodgy cable). High absolute value = extra hops. Cumulative since startup.
+    pub min_path_delay_ns: Option<i64>,
+    pub max_path_delay_ns: Option<i64>,
     // Protocol-specific tracking
     pub protocol_grandmaster_detected: bool,         // Was grandmaster detected for this protocol
     pub protocol_clock_lost:           bool,          // Was clock lost for this protocol
@@ -524,6 +546,8 @@ impl PtpStats {
             last_quality: None,
             last_offset_ns: None,
             last_path_delay_ns: None,
+            min_path_delay_ns: None,
+            max_path_delay_ns: None,
             protocol_grandmaster_detected: false,
             protocol_clock_lost: false,
             protocol_changes_count: 0,
@@ -556,6 +580,11 @@ impl PtpStats {
                     event = Some(PtpEvent::GrandmasterChanged { from: current.clone() });
                     self.last_grandmaster = Some(gm.clone());
                     self.protocol_grandmaster_detected = true;
+                    // New grandmaster → path-delay history from the previous
+                    // master is meaningless; reset so the spread metric reflects
+                    // the new clock's stability.
+                    self.min_path_delay_ns = None;
+                    self.max_path_delay_ns = None;
                 }
                 None => {
                     event = Some(PtpEvent::GrandmasterDetected);
@@ -579,8 +608,15 @@ impl PtpStats {
             self.last_offset_ns = info.correction_ns;
         }
 
-        if info.message_type == 0x09 {
+        // Delay_Resp (0x09) and P_Delay_Resp (0x03) carry path_delay in correction field.
+        if info.message_type == 0x09 || info.message_type == 0x03 {
             self.last_path_delay_ns = info.path_delay_ns;
+            if let Some(d) = info.path_delay_ns {
+                // Track absolute value — sign just indicates direction of measurement.
+                let abs_d = d.abs();
+                self.min_path_delay_ns = Some(self.min_path_delay_ns.map_or(abs_d, |m| m.min(abs_d)));
+                self.max_path_delay_ns = Some(self.max_path_delay_ns.map_or(abs_d, |m| m.max(abs_d)));
+            }
         }
 
         event
@@ -648,6 +684,33 @@ mod tests {
         s.update(10, 0, 1, 100);
         s.update(5,  0, 1, 100); // backward
         assert_eq!(s.lost_packets, 0);
+    }
+
+    #[test]
+    fn backward_seq_counted_as_reorder() {
+        // The packet is not lost — it arrived, just out of order. Track it
+        // separately so high reorder rates surface (typical fingerprint of
+        // per-packet ECMP/LAG load-balancing).
+        let mut s = aes67();
+        s.update(10, 0, 1, 100);
+        s.update(5,  0, 1, 100);
+        assert_eq!(s.reorders_this_window, 1);
+        assert_eq!(s.lost_packets, 0);
+    }
+
+    #[test]
+    fn lost_this_window_tracks_per_window_drops() {
+        let mut s = aes67();
+        s.update(0, 0,   1, 100);
+        s.update(3, 144, 1, 100); // 2 lost in this window
+        assert_eq!(s.lost_this_window, 2);
+        assert_eq!(s.lost_packets,     2);
+        // Caller (CaptureState::reset_window) zeros this_window after each report;
+        // simulate that and verify cumulative loss survives.
+        s.lost_this_window = 0;
+        s.update(4, 192, 1, 100); // sequential — no new loss
+        assert_eq!(s.lost_this_window, 0, "no new loss this window");
+        assert_eq!(s.lost_packets,     2, "cumulative loss preserved");
     }
 
     // ── AVTP 8-bit sequence wrap ────────────────────────────────────────────
