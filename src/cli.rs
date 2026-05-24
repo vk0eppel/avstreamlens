@@ -125,11 +125,9 @@ pub fn build_bpf_filter(selected: &[ProtocolChoice]) -> String {
     filters.push("(ether proto 0x88cc)".to_string());
     filters.push("(ether proto 0x88f7)".to_string());
 
-    if filters.len() == 1 {
-        all_protocols_filter()
-    } else {
-        filters.join(" or ")
-    }
+    // After All/Audio/Video expansion, every concrete ProtocolChoice triggers
+    // one of needs_udp/tcp/avb — so this list always has at least 4 entries.
+    filters.join(" or ")
 }
 
 /// Human-readable comma-separated list for the startup banner.

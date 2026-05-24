@@ -57,20 +57,23 @@ fn extract_mdns_instance_name(payload: &[u8], service_needle: &[u8]) -> Option<S
     let pos = payload.windows(service_needle.len())
         .position(|w| w == service_needle)?;
     if pos == 0 { return None; }
-    let mut best: Option<String> = None;
-    for name_len in 1usize..=63 {
-        if pos < name_len + 1 { break; }
+    // Iterate from longest to shortest so the first valid match is also the longest.
+    // The DNS label preceding the service is length-prefixed; in well-formed mDNS
+    // there is exactly one valid match, but coincidental shorter matches can occur
+    // when arbitrary bytes upstream happen to equal a small length value.
+    for name_len in (1usize..=63).rev() {
+        if pos < name_len + 1 { continue; }
         let len_pos = pos - name_len - 1;
         if payload[len_pos] as usize != name_len { continue; }
         let name_bytes = &payload[len_pos + 1..pos];
         if let Ok(s) = std::str::from_utf8(name_bytes) {
             let s = s.trim();
             if !s.is_empty() && s.chars().all(|c| c.is_ascii_graphic() || c == ' ') {
-                best = Some(s.to_string());
+                return Some(s.to_string());
             }
         }
     }
-    best
+    None
 }
 
 /// Extract the Dante device instance name from an mDNS payload.

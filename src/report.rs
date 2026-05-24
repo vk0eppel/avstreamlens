@@ -473,16 +473,17 @@ pub fn print_report(
         format!("QoS: ⚠ {} stream(s) with incorrect DSCP", dscp_bad)
     };
 
-    let interval_str = health.igmp_query_interval_secs
-        .map(|i| format!("  (interval {}s)", i))
-        .unwrap_or_default();
     let querier_str = match health.last_igmp_query {
         None => "IGMP: – (no querier seen)".to_string(),
         Some(t) => {
             let secs = t.elapsed().as_secs();
             if secs > 130 {
-                format!("IGMP: ⚠ querier silent {}s{}", secs, interval_str)
+                // Querier is silent — suppress the stale (interval) from previous queries.
+                format!("IGMP: ⚠ querier silent {}s", secs)
             } else {
+                let interval_str = health.igmp_query_interval_secs
+                    .map(|i| format!("  (interval {}s)", i))
+                    .unwrap_or_default();
                 format!("IGMP: ✓ querier {}s ago{}", secs, interval_str)
             }
         }

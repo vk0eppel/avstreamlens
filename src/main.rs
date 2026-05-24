@@ -51,12 +51,12 @@ fn main() {
 
     // ── Opening capture with BPF filter ───────────────
     let mut cap = Capture::from_device(device.name.as_str())
-        .unwrap()
+        .expect("Unable to find capture device")
         .promisc(true)
         .immediate_mode(true)
         .timeout(1000)  // unblocks the loop so the 5-second report fires even on quiet networks
         .open()
-        .unwrap();
+        .expect("Unable to open capture — run as root/sudo (or as Administrator on Windows)");
 
     cap.filter(&bpf_filter, true)
         .expect("BPF filter failure — run as root/sudo");
