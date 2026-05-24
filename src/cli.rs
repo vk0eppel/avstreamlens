@@ -153,15 +153,6 @@ pub fn selected_protocol_names(selected: &[ProtocolChoice]) -> String {
     }
 }
 
-/// Return true if the selected protocols require a valid PTP clock to be present.
-pub fn protocol_requires_ptp(selected: &[ProtocolChoice]) -> bool {
-    let expanded: Vec<_> = selected.iter().flat_map(|c| c.includes()).collect();
-    if expanded.is_empty() || expanded.iter().any(|c| matches!(c, ProtocolChoice::All)) {
-        return true;
-    }
-    expanded.iter().any(|c| c.requires_valid_ptp_clock())
-}
-
 /// Query macOS for human-readable hardware port names (e.g. "Wi-Fi", "Thunderbolt Ethernet Slot 1").
 /// Returns an empty map on Linux or if networksetup is unavailable.
 fn macos_port_names() -> std::collections::HashMap<String, String> {

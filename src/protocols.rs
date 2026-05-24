@@ -131,12 +131,6 @@ impl ProtocolChoice {
         matches!(self, ProtocolChoice::AVB)
     }
 
-    /// Does this protocol require a valid PTP clock?
-    pub fn requires_valid_ptp_clock(&self) -> bool {
-        matches!(self, ProtocolChoice::AES67 | ProtocolChoice::Audio | ProtocolChoice::Video
-            | ProtocolChoice::ST2110 | ProtocolChoice::AVB | ProtocolChoice::Dante)
-    }
-
     // All available protocol choices (LLDP/EEE always active; PTP/IGMP/SAP gated per protocol)
     pub fn all_choices() -> Vec<ProtocolChoice> {
         vec![

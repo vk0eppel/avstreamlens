@@ -19,8 +19,9 @@ use pnet_packet::Packet;
 
 use crate::parser::{is_aes67_multicast, is_st2110_multicast, parse_rtp};
 use crate::protocols::{
-    AvProtocol, DanteKind, IgmpType, MsrpDeclType, MsrpDeclaration, NdiKind, PtpInfo,
-    SdpSession, St2110Type, DEFAULT_CLOCK_HZ, STREAM_TIMEOUT_SECS, avtp_subtype_name,
+    AvProtocol, DanteKind, IgmpType, MsrpDeclType, MsrpDeclaration, NdiKind, ProtocolChoice,
+    PtpInfo, SdpSession, St2110Type, DEFAULT_CLOCK_HZ, PTP_VERSION_V2, STREAM_TIMEOUT_SECS,
+    avtp_subtype_name,
 };
 use crate::report::Logger;
 use crate::stats::{
@@ -448,6 +449,36 @@ impl CaptureState {
         alerts
     }
 
+    /// Version-aware PTP clock requirement check.
+    ///
+    /// A clock family is required only when (a) the user's selection allows it AND
+    /// (b) at least one stream of that family has actually been observed. Without
+    /// the "observed" gate, picking "All" on a pure-AES67 network would warn about
+    /// missing gPTP just because AVB is in the expanded set.
+    ///
+    ///   AES67/ST2110 require PTPv2 (a PTPv1 clock is not sufficient)
+    ///   Dante accepts PTPv1 or PTPv2
+    ///   AVB requires L2 gPTP (`protocol_kind = "AVB"`)
+    pub fn ptp_requirement_met(&self, expanded: &[ProtocolChoice]) -> bool {
+        let needs_ptpv2 = expanded.iter().any(|c| matches!(c, ProtocolChoice::AES67 | ProtocolChoice::ST2110))
+            && self.streams.values().any(|s| s.protocol == "AES67" || s.protocol.starts_with("2110-"));
+        let needs_ptp_any = expanded.iter().any(|c| matches!(c, ProtocolChoice::Dante))
+            && self.streams.values().any(|s| s.protocol == "Dante");
+        let needs_gptp = expanded.iter().any(|c| matches!(c, ProtocolChoice::AVB))
+            && !self.avtp_streams.is_empty();
+
+        let has_ptpv2 = self.ptp_domains.values().any(|s|
+            s.clock_valid && s.version == PTP_VERSION_V2
+            && s.protocol_kind.as_deref() != Some("AVB"));
+        let has_ptp = self.ptp_domains.values().any(|s| s.clock_valid);
+        let has_gptp = self.ptp_domains.values().any(|s|
+            s.clock_valid && s.protocol_kind.as_deref() == Some("AVB"));
+
+        (!needs_ptpv2 || has_ptpv2)
+        && (!needs_ptp_any || has_ptp)
+        && (!needs_gptp || has_gptp)
+    }
+
     /// Re-compute NDI per-stream bitrate by summing matching TCP flows.
     /// Called once per report cycle.
     pub fn aggregate_ndi_bitrate(&mut self) {
@@ -543,7 +574,8 @@ pub fn dispatch(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocols::{SdpMedia, SdpSession};
+    use crate::protocols::{PTP_VERSION_V1, PTP_VERSION_V2, ProtocolChoice, SdpMedia, SdpSession};
+    use crate::stats::PtpStats;
 
     // ── helpers ──────────────────────────────────────────────────────────────
 
@@ -764,6 +796,104 @@ mod tests {
     }
 
     // ── MSRP ─────────────────────────────────────────────────────────────────
+
+    // ── ptp_requirement_met ─────────────────────────────────────────────────
+
+    /// Build a PtpStats record as if a grandmaster had been observed.
+    fn valid_ptp_stats(version: u8, kind: &str) -> PtpStats {
+        let mut s = PtpStats::new(0, version);
+        s.clock_valid = true;
+        s.protocol_kind = Some(kind.to_string());
+        s.last_grandmaster = Some("test".to_string());
+        s
+    }
+
+    /// Drop an AES67 stream entry into state so the "observed" gate fires.
+    fn seed_aes67_stream(state: &mut CaptureState) {
+        let pkt = ip_udp_rtp(46 << 2, 5004, 96, 0, 0, 0xAAAA);
+        state.handle_aes67(Ipv4Addr::new(239, 69, 0, 1), 5004, 96, &pkt);
+    }
+
+    #[test]
+    fn ptp_ok_when_no_streams_observed_regardless_of_selection() {
+        // Empty state on "All" — nothing to check yet. No streams means no
+        // clock requirement; the "no streams detected" status line is the
+        // right signal at this point, not a PTP warning.
+        let state = CaptureState::new();
+        let expanded = ProtocolChoice::All.includes();
+        assert!(state.ptp_requirement_met(&expanded));
+    }
+
+    #[test]
+    fn ptp_ok_when_aes67_stream_and_ptpv2_clock_present() {
+        let mut state = CaptureState::new();
+        seed_aes67_stream(&mut state);
+        state.ptp_domains.insert((0, PTP_VERSION_V2), valid_ptp_stats(PTP_VERSION_V2, "PTPv2"));
+        assert!(state.ptp_requirement_met(&[ProtocolChoice::AES67]));
+    }
+
+    #[test]
+    fn ptp_fails_when_aes67_stream_but_no_ptp() {
+        let mut state = CaptureState::new();
+        seed_aes67_stream(&mut state);
+        assert!(!state.ptp_requirement_met(&[ProtocolChoice::AES67]));
+    }
+
+    #[test]
+    fn ptp_fails_when_aes67_stream_has_only_ptpv1() {
+        // AES67 requires PTPv2 — a PTPv1 clock is not sufficient.
+        let mut state = CaptureState::new();
+        seed_aes67_stream(&mut state);
+        state.ptp_domains.insert((0, PTP_VERSION_V1), valid_ptp_stats(PTP_VERSION_V1, "PTPv1"));
+        assert!(!state.ptp_requirement_met(&[ProtocolChoice::AES67]));
+    }
+
+    #[test]
+    fn ptp_ok_for_dante_with_ptpv1_clock() {
+        // Dante accepts either PTPv1 or PTPv2.
+        let mut state = CaptureState::new();
+        state.handle_dante(DanteKind::AudioStream, Ipv4Addr::new(192,168,1,10), 5004, &[]);
+        state.ptp_domains.insert((0, PTP_VERSION_V1), valid_ptp_stats(PTP_VERSION_V1, "PTPv1"));
+        assert!(state.ptp_requirement_met(&[ProtocolChoice::Dante]));
+    }
+
+    #[test]
+    fn ptp_ok_for_all_on_pure_aes67_network() {
+        // Regression for the reported bug: picking "All" on a network with
+        // only AES67 + UDP PTPv2 (no AVB, no gPTP) used to warn "no clock
+        // source" because needs_gptp was true based on selection alone.
+        let mut state = CaptureState::new();
+        seed_aes67_stream(&mut state);
+        state.ptp_domains.insert((0, PTP_VERSION_V2), valid_ptp_stats(PTP_VERSION_V2, "PTPv2"));
+        let expanded = ProtocolChoice::All.includes();
+        assert!(state.ptp_requirement_met(&expanded));
+    }
+
+    #[test]
+    fn ptp_fails_for_avb_streams_without_gptp() {
+        let mut state = CaptureState::new();
+        // Seed an AVTP stream so the "observed" gate fires.
+        state.handle_avb(0x00, Some([1,2,3,4,5,6,7,8]), 100, Some(0), Instant::now());
+        // UDP PTPv2 is present but L2 gPTP (protocol_kind="AVB") is not.
+        state.ptp_domains.insert((0, PTP_VERSION_V2), valid_ptp_stats(PTP_VERSION_V2, "PTPv2"));
+        assert!(!state.ptp_requirement_met(&[ProtocolChoice::AVB]));
+    }
+
+    #[test]
+    fn ptp_ok_for_avb_with_l2_gptp() {
+        let mut state = CaptureState::new();
+        state.handle_avb(0x00, Some([1,2,3,4,5,6,7,8]), 100, Some(0), Instant::now());
+        state.ptp_domains.insert((0, PTP_VERSION_V2), valid_ptp_stats(PTP_VERSION_V2, "AVB"));
+        assert!(state.ptp_requirement_met(&[ProtocolChoice::AVB]));
+    }
+
+    #[test]
+    fn ptp_ok_for_ndi_only_no_clock_required() {
+        // NDI is TCP — no PTP at all.
+        let mut state = CaptureState::new();
+        state.ndi_sources.insert(Ipv4Addr::new(192,168,1,60));
+        assert!(state.ptp_requirement_met(&[ProtocolChoice::NDI]));
+    }
 
     #[test]
     fn msrp_talker_failed_emits_warn_alert() {
