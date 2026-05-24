@@ -144,6 +144,7 @@ impl CaptureState {
         self.bytes_this_window = 0;
         self.pause_frames_this_window = 0;
         self.pfc_frames_this_window   = 0;
+        self.network_health.ecn_congestion_marks = 0;
         for s in self.streams.values_mut() {
             s.gap_events      = 0;
             s.max_iat_ms      = 0.0;

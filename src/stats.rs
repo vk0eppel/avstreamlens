@@ -411,8 +411,8 @@ impl NetworkHealth {
             } else if stats.jitter_ms() > 10.0 {
                 score -= 2.0;
             }
-            if stats.ts_discontinuities > 0 {
-                score -= 3.0 * (stats.ts_discontinuities as f64).min(5.0);
+            if stats.ts_discontinuities_this_window > 0 {
+                score -= 3.0 * (stats.ts_discontinuities_this_window as f64).min(5.0);
             }
             if stats.ssrc_changes > 0 {
                 score -= 10.0 * (stats.ssrc_changes as f64).min(3.0);

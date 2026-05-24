@@ -200,16 +200,18 @@ pub fn parse_ptp(payload: &[u8]) -> Option<PtpInfo> {
     let sequence_id = u16::from_be_bytes([payload[30], payload[31]]);
     let log_sync_interval = payload[33] as i8;
 
-    let port_id = if payload.len() >= 28 {
-        Some(u16::from_be_bytes([payload[26], payload[27]]))
-    } else {
-        None
-    };
-
+    // IEEE 1588-2008 §13.3.2: sourcePortIdentity = clockIdentity(8) + portNumber(2).
+    // clockIdentity occupies bytes 20–27; portNumber occupies bytes 28–29.
     let clock_id = if payload.len() >= 28 {
         Some(format!("{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
             payload[20], payload[21], payload[22], payload[23],
             payload[24], payload[25], payload[26], payload[27]))
+    } else {
+        None
+    };
+
+    let port_id = if payload.len() >= 30 {
+        Some(u16::from_be_bytes([payload[28], payload[29]]))
     } else {
         None
     };
