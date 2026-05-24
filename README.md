@@ -161,7 +161,9 @@ Choose the protocols to monitor:
 - `💀 No signal for 12s`
 
 *Clock / PTP:*
-- `⚠  No clock source — streams requiring PTP may lose sync`
+- `⚠  No PTPv2 clock — AES67 streams may lose sync` (or `AES67 and ST2110`)
+- `⚠  No PTPv1 or PTPv2 clock — Dante streams may lose sync`
+- `⚠  No L2 gPTP clock — AVB streams may lose sync`
 - `⚠  Large PTP correction field — transparent clock or path issue`
 - `⚠  PTP path-delay variance > 10µs — unstable link (EEE, half-duplex, or cable)`
 - `⚠  PTP path delay > 1ms — too many hops between this node and grandmaster`

@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use crate::stats::{StreamStats, TcpStreamStats, PtpStats, NetworkHealth, StreamQuality, AvtpStreamStats};
 use crate::protocols::{STREAM_TIMEOUT_SECS, MsrpDeclaration, MsrpDeclType, avtp_subtype_name};
+use crate::capture::{MissingClock, MissingClockKind};
 
 /// Logger for writing timestamped messages to both file and console.
 #[derive(Debug)]
@@ -53,7 +54,7 @@ pub fn print_report(
     streams: &HashMap<String, StreamStats>,
     tcp_streams: &HashMap<String, TcpStreamStats>,
     ptp_domains: &HashMap<(u8, u8), PtpStats>,
-    ptp_ok: bool,
+    missing_ptp: &[MissingClock],
     logger: &mut Logger,
     health: &NetworkHealth,
     bytes_this_window: u64,
@@ -122,10 +123,17 @@ pub fn print_report(
             || s.ssrc_changes > 0
             || s.last_packet_time.is_some_and(|t| t.elapsed() > Duration::from_secs(STREAM_TIMEOUT_SECS))
     }).count();
-    let ptp_issue = !ptp_ok;
     let mut parts = Vec::new();
     if stream_issues > 0 { parts.push(format!("{} stream issue(s)", stream_issues)); }
-    if ptp_issue { parts.push("no clock source".to_string()); }
+    if !missing_ptp.is_empty() {
+        // Status-line summary: list affected protocol names. The detailed
+        // "no <clock-type> clock — <protocols> may lose sync" alert is printed
+        // separately below.
+        let affected: Vec<&str> = missing_ptp.iter()
+            .flat_map(|mc| mc.affected.iter().copied())
+            .collect();
+        parts.push(format!("no clock for {}", affected.join(", ")));
+    }
     let status_line = if !parts.is_empty() {
         format!("⚠  {}", parts.join("  |  "))
     } else if streams.is_empty() {
@@ -509,9 +517,12 @@ pub fn print_report(
     }
 
     // ── Clock source required but absent ───────────────────────────────────
-    if !ptp_ok {
-        let alert = "⚠  No clock source — streams requiring PTP may lose sync";
-        logger.log(alert);
+    // One alert per missing-clock family so the user immediately knows which
+    // clock type (PTPv2 / PTPv1-or-v2 / L2 gPTP) is needed and which protocol
+    // family is at risk because of it.
+    for mc in missing_ptp {
+        let alert = format_missing_clock(mc);
+        logger.log(&alert);
         println!("\x1b[31m{}\x1b[0m", alert);
     }
 
@@ -593,4 +604,25 @@ pub fn print_report(
     }
 
     logger.log("");
+}
+
+/// Render a `MissingClock` as the user-facing red alert line.
+/// Names the clock type plainly and joins the affected protocols with commas
+/// (and "and" before the last item).
+fn format_missing_clock(mc: &MissingClock) -> String {
+    let clock = match mc.kind {
+        MissingClockKind::Ptpv2 => "PTPv2",
+        MissingClockKind::Ptp   => "PTPv1 or PTPv2",
+        MissingClockKind::Gptp  => "L2 gPTP",
+    };
+    let protos = match mc.affected.len() {
+        0 => "(none)".to_string(),
+        1 => mc.affected[0].to_string(),
+        2 => format!("{} and {}", mc.affected[0], mc.affected[1]),
+        _ => {
+            let (last, rest) = mc.affected.split_last().unwrap();
+            format!("{}, and {}", rest.join(", "), last)
+        }
+    };
+    format!("⚠  No {} clock — {} streams may lose sync", clock, protos)
 }

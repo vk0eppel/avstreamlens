@@ -38,6 +38,23 @@ const IGMP_JOIN_DEDUP_TTL_SECS: u64 = 300;
 // waits longer so an alert is shown at least once before the entry disappears.
 const STREAM_PRUNE_SECS: u64 = STREAM_TIMEOUT_SECS * 2;
 
+/// Which clock type a protocol family is missing.
+#[derive(Debug, Clone, PartialEq)]
+pub enum MissingClockKind {
+    Ptpv2,  // needed by AES67 and ST2110 (PTPv1 is not sufficient)
+    Ptp,    // needed by Dante — PTPv1 or PTPv2 both acceptable
+    Gptp,   // needed by AVB — L2 gPTP only
+}
+
+/// A clock requirement that is not satisfied: names the missing clock type
+/// and the protocol families currently affected. Built by
+/// `CaptureState::missing_ptp_clocks` and consumed by the report layer.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MissingClock {
+    pub kind: MissingClockKind,
+    pub affected: Vec<&'static str>,
+}
+
 /// Severity of an alert emitted by a handler. The dispatch layer maps each
 /// variant to an ANSI color and logs the plain text.
 #[derive(Debug, Clone, PartialEq)]
@@ -481,24 +498,46 @@ impl CaptureState {
     ///   AES67/ST2110 require PTPv2 (a PTPv1 clock is not sufficient)
     ///   Dante accepts PTPv1 or PTPv2
     ///   AVB requires L2 gPTP (`protocol_kind = "AVB"`)
-    pub fn ptp_requirement_met(&self, expanded: &[ProtocolChoice]) -> bool {
-        let needs_ptpv2 = expanded.iter().any(|c| matches!(c, ProtocolChoice::AES67 | ProtocolChoice::ST2110))
-            && self.streams.values().any(|s| s.protocol == "AES67" || s.protocol.starts_with("2110-"));
-        let needs_ptp_any = expanded.iter().any(|c| matches!(c, ProtocolChoice::Dante))
-            && self.streams.values().any(|s| s.protocol == "Dante");
-        let needs_gptp = expanded.iter().any(|c| matches!(c, ProtocolChoice::AVB))
-            && !self.avtp_streams.is_empty();
+    /// Returns a per-family list of clock requirements that are not satisfied.
+    /// Each entry names *which* clock is missing and *which* protocol(s) are
+    /// affected — so the report layer can say "no PTPv2 clock — AES67 streams
+    /// may lose sync" instead of a generic "no clock source".
+    pub fn missing_ptp_clocks(&self, expanded: &[ProtocolChoice]) -> Vec<MissingClock> {
+        let mut missing = Vec::new();
 
+        // ── PTPv2 (AES67, ST2110) ────────────────────────────────────────────
+        let aes67_active  = expanded.iter().any(|c| matches!(c, ProtocolChoice::AES67))
+            && self.streams.values().any(|s| s.protocol == "AES67");
+        let st2110_active = expanded.iter().any(|c| matches!(c, ProtocolChoice::ST2110))
+            && self.streams.values().any(|s| s.protocol.starts_with("2110-"));
         let has_ptpv2 = self.ptp_domains.values().any(|s|
             s.clock_valid && s.version == PTP_VERSION_V2
             && s.protocol_kind.as_deref() != Some("AVB"));
+        if (aes67_active || st2110_active) && !has_ptpv2 {
+            let mut affected = Vec::new();
+            if aes67_active  { affected.push("AES67"); }
+            if st2110_active { affected.push("ST2110"); }
+            missing.push(MissingClock { kind: MissingClockKind::Ptpv2, affected });
+        }
+
+        // ── PTPv1 or PTPv2 (Dante) ───────────────────────────────────────────
+        let dante_active = expanded.iter().any(|c| matches!(c, ProtocolChoice::Dante))
+            && self.streams.values().any(|s| s.protocol == "Dante");
         let has_ptp = self.ptp_domains.values().any(|s| s.clock_valid);
+        if dante_active && !has_ptp {
+            missing.push(MissingClock { kind: MissingClockKind::Ptp, affected: vec!["Dante"] });
+        }
+
+        // ── L2 gPTP (AVB) ────────────────────────────────────────────────────
+        let avb_active = expanded.iter().any(|c| matches!(c, ProtocolChoice::AVB))
+            && !self.avtp_streams.is_empty();
         let has_gptp = self.ptp_domains.values().any(|s|
             s.clock_valid && s.protocol_kind.as_deref() == Some("AVB"));
+        if avb_active && !has_gptp {
+            missing.push(MissingClock { kind: MissingClockKind::Gptp, affected: vec!["AVB"] });
+        }
 
-        (!needs_ptpv2 || has_ptpv2)
-        && (!needs_ptp_any || has_ptp)
-        && (!needs_gptp || has_gptp)
+        missing
     }
 
     /// Re-compute NDI per-stream bitrate by summing matching TCP flows.
@@ -847,7 +886,7 @@ mod tests {
         // right signal at this point, not a PTP warning.
         let state = CaptureState::new();
         let expanded = ProtocolChoice::All.includes();
-        assert!(state.ptp_requirement_met(&expanded));
+        assert!(state.missing_ptp_clocks(&expanded).is_empty());
     }
 
     #[test]
@@ -855,14 +894,14 @@ mod tests {
         let mut state = CaptureState::new();
         seed_aes67_stream(&mut state);
         state.ptp_domains.insert((0, PTP_VERSION_V2), valid_ptp_stats(PTP_VERSION_V2, "PTPv2"));
-        assert!(state.ptp_requirement_met(&[ProtocolChoice::AES67]));
+        assert!(state.missing_ptp_clocks(&[ProtocolChoice::AES67]).is_empty());
     }
 
     #[test]
     fn ptp_fails_when_aes67_stream_but_no_ptp() {
         let mut state = CaptureState::new();
         seed_aes67_stream(&mut state);
-        assert!(!state.ptp_requirement_met(&[ProtocolChoice::AES67]));
+        assert!(!state.missing_ptp_clocks(&[ProtocolChoice::AES67]).is_empty());
     }
 
     #[test]
@@ -871,7 +910,7 @@ mod tests {
         let mut state = CaptureState::new();
         seed_aes67_stream(&mut state);
         state.ptp_domains.insert((0, PTP_VERSION_V1), valid_ptp_stats(PTP_VERSION_V1, "PTPv1"));
-        assert!(!state.ptp_requirement_met(&[ProtocolChoice::AES67]));
+        assert!(!state.missing_ptp_clocks(&[ProtocolChoice::AES67]).is_empty());
     }
 
     #[test]
@@ -880,7 +919,7 @@ mod tests {
         let mut state = CaptureState::new();
         state.handle_dante(DanteKind::AudioStream, Ipv4Addr::new(192,168,1,10), 5004, &[]);
         state.ptp_domains.insert((0, PTP_VERSION_V1), valid_ptp_stats(PTP_VERSION_V1, "PTPv1"));
-        assert!(state.ptp_requirement_met(&[ProtocolChoice::Dante]));
+        assert!(state.missing_ptp_clocks(&[ProtocolChoice::Dante]).is_empty());
     }
 
     #[test]
@@ -892,7 +931,7 @@ mod tests {
         seed_aes67_stream(&mut state);
         state.ptp_domains.insert((0, PTP_VERSION_V2), valid_ptp_stats(PTP_VERSION_V2, "PTPv2"));
         let expanded = ProtocolChoice::All.includes();
-        assert!(state.ptp_requirement_met(&expanded));
+        assert!(state.missing_ptp_clocks(&expanded).is_empty());
     }
 
     #[test]
@@ -902,7 +941,7 @@ mod tests {
         state.handle_avb(0x00, Some([1,2,3,4,5,6,7,8]), 100, Some(0), Instant::now());
         // UDP PTPv2 is present but L2 gPTP (protocol_kind="AVB") is not.
         state.ptp_domains.insert((0, PTP_VERSION_V2), valid_ptp_stats(PTP_VERSION_V2, "PTPv2"));
-        assert!(!state.ptp_requirement_met(&[ProtocolChoice::AVB]));
+        assert!(!state.missing_ptp_clocks(&[ProtocolChoice::AVB]).is_empty());
     }
 
     #[test]
@@ -910,7 +949,7 @@ mod tests {
         let mut state = CaptureState::new();
         state.handle_avb(0x00, Some([1,2,3,4,5,6,7,8]), 100, Some(0), Instant::now());
         state.ptp_domains.insert((0, PTP_VERSION_V2), valid_ptp_stats(PTP_VERSION_V2, "AVB"));
-        assert!(state.ptp_requirement_met(&[ProtocolChoice::AVB]));
+        assert!(state.missing_ptp_clocks(&[ProtocolChoice::AVB]).is_empty());
     }
 
     #[test]
@@ -918,7 +957,57 @@ mod tests {
         // NDI is TCP — no PTP at all.
         let mut state = CaptureState::new();
         state.ndi_sources.insert(Ipv4Addr::new(192,168,1,60));
-        assert!(state.ptp_requirement_met(&[ProtocolChoice::NDI]));
+        assert!(state.missing_ptp_clocks(&[ProtocolChoice::NDI]).is_empty());
+    }
+
+    // ── missing_ptp_clocks — per-family identification ──────────────────────
+
+    #[test]
+    fn missing_clock_for_aes67_identifies_ptpv2_and_aes67() {
+        let mut state = CaptureState::new();
+        seed_aes67_stream(&mut state);
+        let missing = state.missing_ptp_clocks(&[ProtocolChoice::AES67]);
+        assert_eq!(missing.len(), 1);
+        assert_eq!(missing[0].kind, MissingClockKind::Ptpv2);
+        assert_eq!(missing[0].affected, vec!["AES67"]);
+    }
+
+    #[test]
+    fn missing_clock_groups_aes67_and_st2110_under_same_ptpv2_entry() {
+        // Both protocols need PTPv2; report should produce ONE missing entry
+        // listing both affected protocols, not two separate entries.
+        let mut state = CaptureState::new();
+        seed_aes67_stream(&mut state);
+        // Seed an ST2110 stream too.
+        let pkt = ip_udp_rtp(46 << 2, 5006, 96, 0, 0, 0xBBBB);
+        state.handle_st2110(Ipv4Addr::new(239, 1, 2, 3), 5006, St2110Type::Audio, &pkt);
+        let missing = state.missing_ptp_clocks(&[ProtocolChoice::AES67, ProtocolChoice::ST2110]);
+        assert_eq!(missing.len(), 1);
+        assert_eq!(missing[0].kind, MissingClockKind::Ptpv2);
+        assert_eq!(missing[0].affected, vec!["AES67", "ST2110"]);
+    }
+
+    #[test]
+    fn missing_clock_separates_ptpv2_and_dante_when_both_lack_their_clock() {
+        let mut state = CaptureState::new();
+        seed_aes67_stream(&mut state);
+        state.handle_dante(DanteKind::AudioStream, Ipv4Addr::new(192,168,1,50), 5004, &[]);
+        let missing = state.missing_ptp_clocks(&[ProtocolChoice::AES67, ProtocolChoice::Dante]);
+        assert_eq!(missing.len(), 2);
+        assert!(missing.iter().any(|m| m.kind == MissingClockKind::Ptpv2 && m.affected == vec!["AES67"]));
+        assert!(missing.iter().any(|m| m.kind == MissingClockKind::Ptp   && m.affected == vec!["Dante"]));
+    }
+
+    #[test]
+    fn missing_clock_for_avb_identifies_gptp() {
+        let mut state = CaptureState::new();
+        state.handle_avb(0x00, Some([1,2,3,4,5,6,7,8]), 100, Some(0), Instant::now());
+        // UDP PTPv2 present but no L2 gPTP — AVB still affected.
+        state.ptp_domains.insert((0, PTP_VERSION_V2), valid_ptp_stats(PTP_VERSION_V2, "PTPv2"));
+        let missing = state.missing_ptp_clocks(&[ProtocolChoice::AVB]);
+        assert_eq!(missing.len(), 1);
+        assert_eq!(missing[0].kind, MissingClockKind::Gptp);
+        assert_eq!(missing[0].affected, vec!["AVB"]);
     }
 
     // ── Flow control (PAUSE / PFC) ──────────────────────────────────────────

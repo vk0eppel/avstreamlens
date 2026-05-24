@@ -85,10 +85,10 @@ fn main() {
                 &state.msrp_state, &state.eee_ports,
             );
 
-            let ptp_ok = state.ptp_requirement_met(&expanded_protocols);
+            let missing_ptp = state.missing_ptp_clocks(&expanded_protocols);
 
             print_report(
-                &state.streams, &state.tcp_streams, &state.ptp_domains, ptp_ok,
+                &state.streams, &state.tcp_streams, &state.ptp_domains, &missing_ptp,
                 &mut logger, &state.network_health, state.bytes_this_window,
                 &state.avtp_streams, &state.msrp_state, &state.mvrp_vlans, &state.eee_ports,
                 state.pause_frames_this_window, state.pfc_frames_this_window,
