@@ -45,7 +45,7 @@ pub fn create_logger(prefix: &str) -> std::io::Result<Logger> {
 ///
 /// Displays:
 /// - Network load summary
-/// - RTP stream statistics (AES67, ST2110, Dante, NDI, SRT, RIST, AVB)
+/// - RTP stream statistics (AES67, ST2110, Dante, NDI, AVB)
 /// - TCP stream quality and diagnostics
 /// - PTP domain synchronization status
 /// - Protocol-specific warnings and alerts
