@@ -10,7 +10,12 @@
 | `src/main.rs` | Entry point — owns pcap handle, 5s report timer, post-dispatch IPv4/TCP tracking. Thin driver (~290 lines) |
 | `src/capture.rs` | `CaptureState` + per-protocol handlers + `dispatch()` + `emit()` — all per-loop state and protocol-handler logic |
 | `src/cli.rs` | Interface selection, protocol selection, BPF filter building |
-| `src/parser.rs` | Protocol detection and packet parsing (SDP, RTP, PTP, AVTP, LLDP…) |
+| `src/parser.rs` | Top-level `detect_protocol` dispatcher + RTP + TCP + VLAN unwrap + multicast helpers; re-exports submodule API |
+| `src/parser/sdp.rs` | SAP envelope (RFC 2974), SDP body (RFC 4566), `ts-refclk` normalisation |
+| `src/parser/ptp.rs` | PTPv1 (IEEE 1588-2002) + PTPv2 (IEEE 1588-2008) message parser — used for both UDP PTP and L2 gPTP |
+| `src/parser/avb.rs` | AVTP stream-id extraction + MSRP (802.1Qat) + MVRP (802.1Q) PDU parsers |
+| `src/parser/lldp.rs` | LLDP TLV walker that surfaces the IEEE 802.3az EEE TLV |
+| `src/parser/mdns.rs` | mDNS service-instance name extraction (Dante `_netaudio`, NDI `_ndi`) |
 | `src/protocols.rs` | Enums, constants, type definitions |
 | `src/stats.rs` | Stream statistics — RTP, TCP, PTP, network health score |
 | `src/report.rs` | Terminal reporting and log file output |
@@ -28,10 +33,19 @@ cargo clippy -- -D warnings  # lint
 ## Architecture
 
 ### General
-- **Test harness**: 69 unit tests in `#[cfg(test)]` modules inside `parser.rs`, `stats.rs`, and `capture.rs` — run with `cargo test`. `capture.rs` tests exercise handlers with hand-built IP/UDP/RTP byte buffers (see `ip_udp_rtp()` helper); no pcap dependency in tests
+- **Test harness**: 69 unit tests in `#[cfg(test)]` modules across `parser.rs` + `parser/{sdp,ptp,avb,lldp,mdns}.rs`, `stats.rs`, and `capture.rs` — run with `cargo test`. Each parser submodule keeps its own fixtures and tests. `capture.rs` tests exercise handlers with hand-built IP/UDP/RTP byte buffers (see `ip_udp_rtp()` helper); no pcap dependency in tests
 - Logging: timestamped `.log` files written on every run in the working directory; `Logger::log()` flushes after every write so the last report survives SIGINT
 - Bitrate computed as `byte_delta / elapsed_secs` — never assumed 1s exactly
 - All modules follow the same pattern: parse → stats → report
+
+### Parser Layout (`parser.rs` + `parser/`)
+- **`parser.rs`** holds the `detect_protocol` dispatcher and only the small, shared bits: VLAN unwrap, multicast classification, RTP, TCP, the Dante port heuristic, ST2110 PT/port classifier. Submodules are declared with `pub mod ...` and their public functions are re-exported with `pub use ...::*` so external consumers (`main.rs`, `capture.rs`) keep using `crate::parser::parse_foo` regardless of which submodule `parse_foo` lives in
+- **`parser/sdp.rs`** — SAP envelope (RFC 2974) → SDP body (RFC 4566); `parse_ts_refclk` normalises `ptp=IEEE1588-2008:<id>:<domain>` to colon-separated lowercase bytes matching `PtpStats::last_grandmaster`
+- **`parser/ptp.rs`** — `parse_ptp` auto-detects PTPv1 vs PTPv2 from byte 1 low nibble; PTPv1 has two wire encodings (separate-byte vs nibble-packed) selected by byte 0 == 0x11
+- **`parser/avb.rs`** — `parse_avtp_stream_id` (sv-bit guarded), `parse_msrp` (TalkerAdvertise/TalkerFailed/Listener), `parse_mvrp` (VLAN registration). MSRP/MVRP share the IEEE 802.1Q vector-attribute format
+- **`parser/lldp.rs`** — TLV walker; emits `AvProtocol::LldpEee` only when the EEE TLV (OUI 00-12-0F, subtype 0x05) is present AND a wake-up time is non-zero
+- **`parser/mdns.rs`** — `extract_mdns_instance_name` finds the DNS-label-encoded service needle, then walks length-prefixed labels backward to find the longest valid printable-ASCII instance name. Used by `extract_dante_name` (needle `\x09_netaudio`) and `extract_ndi_name` (needle `\x04_ndi`)
+- **Adding a new protocol parser** = create `parser/<name>.rs`, declare `pub mod <name>;` in `parser.rs`, re-export its public functions with `pub use <name>::...`, add a branch in `detect_protocol`. Tests live in the same file as the parser
 
 ### Capture Module (`capture.rs`)
 - **`CaptureState`** owns all per-loop HashMaps/HashSets (streams, tcp_streams, sdp_cache, ptp_domains, ndi_sources, ndi_names, dante_names, igmp_joins_seen, avtp_streams, msrp_state, mvrp_vlans, eee_ports), `network_health`, and `bytes_this_window`. `main.rs` holds exactly one `CaptureState` for the lifetime of the process
