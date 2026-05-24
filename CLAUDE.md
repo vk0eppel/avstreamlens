@@ -7,7 +7,8 @@
 
 | File | Purpose |
 |---|---|
-| `src/main.rs` | Entry point, capture loop, protocol dispatcher |
+| `src/main.rs` | Entry point — owns pcap handle, 5s report timer, post-dispatch IPv4/TCP tracking. Thin driver (~290 lines) |
+| `src/capture.rs` | `CaptureState` + per-protocol handlers + `dispatch()` + `emit()` — all per-loop state and protocol-handler logic |
 | `src/cli.rs` | Interface selection, protocol selection, BPF filter building |
 | `src/parser.rs` | Protocol detection and packet parsing (SDP, RTP, PTP, AVTP, LLDP…) |
 | `src/protocols.rs` | Enums, constants, type definitions |
@@ -27,10 +28,19 @@ cargo clippy -- -D warnings  # lint
 ## Architecture
 
 ### General
-- **Test harness**: 53 unit tests in `#[cfg(test)]` modules inside `parser.rs` and `stats.rs` — run with `cargo test`
+- **Test harness**: 69 unit tests in `#[cfg(test)]` modules inside `parser.rs`, `stats.rs`, and `capture.rs` — run with `cargo test`. `capture.rs` tests exercise handlers with hand-built IP/UDP/RTP byte buffers (see `ip_udp_rtp()` helper); no pcap dependency in tests
 - Logging: timestamped `.log` files written on every run in the working directory; `Logger::log()` flushes after every write so the last report survives SIGINT
 - Bitrate computed as `byte_delta / elapsed_secs` — never assumed 1s exactly
 - All modules follow the same pattern: parse → stats → report
+
+### Capture Module (`capture.rs`)
+- **`CaptureState`** owns all per-loop HashMaps/HashSets (streams, tcp_streams, sdp_cache, ptp_domains, ndi_sources, ndi_names, dante_names, igmp_joins_seen, avtp_streams, msrp_state, mvrp_vlans, eee_ports), `network_health`, and `bytes_this_window`. `main.rs` holds exactly one `CaptureState` for the lifetime of the process
+- **One `handle_*` method per protocol** (e.g. `handle_aes67`, `handle_dante`, `handle_ptp`). Each takes already-parsed inputs (`l2_payload: &[u8]`, `frame_bytes: u64`, `avtp_seq: Option<u8>`, `now: Instant`) — never a raw `pcap::Packet`. This is what makes handlers unit-testable
+- **Handlers do not touch IO.** They mutate `CaptureState` and return `Vec<Alert>`. The dispatch layer prints + logs. The `PtpEvent` pattern in `stats.rs` is the same idea applied one layer deeper (data layer returns events; handler layer turns them into `Alert`s)
+- **`Alert { level: AlertLevel, message: String }`** with constructors `Alert::info/good/warn/error`. `emit(&[Alert], &mut Logger)` maps level → ANSI color (none/32/33/31) and prints + logs in one place. Adding a new severity or alert format is a single-site change
+- **`dispatch(state, proto, l2_payload, frame_bytes, avtp_seq, now, logger)`** is the only entry point `main.rs` calls per packet — matches `AvProtocol`, calls the right handler, emits returned alerts
+- **`state.check_ptp_timeouts()` / `state.aggregate_ndi_bitrate()` / `state.reset_window()`** are the periodic-cycle helpers `main.rs` calls every 5s. Window-reset prunes silent streams via `STREAM_PRUNE_SECS = STREAM_TIMEOUT_SECS * 2` (named constant in `capture.rs`)
+- Adding a new protocol = one new variant in `protocols::AvProtocol` + one new `handle_*` method + one new arm in `dispatch()`. No edits to `main.rs`
 
 ### Protocol Dispatch
 - Detection order (first match wins):
