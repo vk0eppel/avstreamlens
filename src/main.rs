@@ -259,7 +259,13 @@ fn ts_refclk_alerts(state: &CaptureState) -> Vec<Alert> {
     alerts
 }
 
-/// Version-aware PTP clock requirement check:
+/// Version-aware PTP clock requirement check.
+///
+/// A clock family is required only when (a) the user's selection allows it AND
+/// (b) at least one stream of that family has actually been observed. Without
+/// the "observed" gate, picking "All" on a pure-AES67 network would warn about
+/// missing gPTP just because AVB is in the expanded set.
+///
 ///   AES67/ST2110 require PTPv2 (a PTPv1 clock is not sufficient)
 ///   Dante accepts PTPv1 or PTPv2
 ///   AVB requires L2 gPTP (protocol_kind = "AVB")
@@ -271,9 +277,12 @@ fn ptp_requirement_met(
     if !cli::protocol_requires_ptp(selected) {
         return true;
     }
-    let needs_ptpv2   = expanded.iter().any(|c| matches!(c, protocols::ProtocolChoice::AES67 | protocols::ProtocolChoice::ST2110));
-    let needs_ptp_any = expanded.iter().any(|c| matches!(c, protocols::ProtocolChoice::Dante));
-    let needs_gptp    = expanded.iter().any(|c| matches!(c, protocols::ProtocolChoice::AVB));
+    let needs_ptpv2 = expanded.iter().any(|c| matches!(c, protocols::ProtocolChoice::AES67 | protocols::ProtocolChoice::ST2110))
+        && state.streams.values().any(|s| s.protocol == "AES67" || s.protocol.starts_with("2110-"));
+    let needs_ptp_any = expanded.iter().any(|c| matches!(c, protocols::ProtocolChoice::Dante))
+        && state.streams.values().any(|s| s.protocol == "Dante");
+    let needs_gptp = expanded.iter().any(|c| matches!(c, protocols::ProtocolChoice::AVB))
+        && !state.avtp_streams.is_empty();
 
     let has_ptpv2 = state.ptp_domains.values().any(|s|
         s.clock_valid && s.version == protocols::PTP_VERSION_V2
