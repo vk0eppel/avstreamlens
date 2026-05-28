@@ -27,7 +27,18 @@
 cargo build --release   # build
 cargo fmt               # format
 cargo clippy -- -D warnings  # lint
+cargo test              # run all 92 unit tests
 ```
+
+## Open Work
+
+See **[TODO.md](TODO.md)** for the full list. Quick summary:
+
+| Category | Items |
+|---|---|
+| Bugs / code issues | Banner `(+ PTP, IGMP)` suffix always shown; dead `ProtocolChoice::All` check; stale `report.rs` docstring; SAP re-enrichment skips existing streams |
+| Missing features | VLAN-ID filter flag; `msrp_state` / `mvrp_vlans` pruning; Dante AV video streams; health score weight review |
+| Platform limitations | NDI loopback unsupported; macOS VLAN tag stripping; Windows `cmd.exe` no ANSI color; PAUSE/PFC NIC-consumed |
 
 ---
 

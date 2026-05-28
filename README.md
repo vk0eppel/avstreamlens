@@ -192,3 +192,21 @@ The health percentage reflects the overall network quality. Factors that reduce 
 - Loopback (`lo`/`lo0`) is excluded — macOS loopback uses a non-Ethernet link layer incompatible with the packet parser
 - Promiscuous mode is enabled automatically on the selected interface
 - Virtual and tunnel interfaces (utun, awdl, docker, vpn…) are filtered from the interface list on macOS/Linux; Windows interface names are passed through as-is
+
+---
+
+## Known Limitations
+
+- **PAUSE / PFC detection is best-effort** — most NICs consume these frames at the MAC layer before pcap sees them. Absence of these alerts does not prove no upstream congestion.
+- **EEE absence is not confirmed** — AVStreamLens detects EEE only when the switch sends LLDP with the EEE TLV. No LLDP does not mean EEE is disabled.
+- **macOS VLAN tag stripping** — many macOS drivers strip 802.1Q tags before pcap, so per-VLAN stream attribution may be unavailable on macOS trunk/SPAN ports. Linux generally preserves tags.
+- **NDI on loopback unsupported** — macOS loopback uses a non-Ethernet link layer; mDNS multicast does not flow over loopback.
+- **No per-VLAN filtering** — the tool processes all VLANs delivered by the capture interface. Use a SPAN session scoped to the target VLAN(s) to limit visibility.
+
+## Roadmap
+
+See [TODO.md](TODO.md) for the full list of open issues and planned features. Highlights:
+
+- `--vlan <id>` flag to filter captured traffic to a specific VLAN
+- Dante AV video stream detection and metrics
+- Health score penalty weight review
