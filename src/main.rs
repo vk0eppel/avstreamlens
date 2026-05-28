@@ -30,8 +30,16 @@ use crate::report::{create_logger, print_report};
 use crate::stats::StreamStats;
 
 fn main() {
-    let device = cli::select_interface();
-    let selected_protocols = cli::prompt_protocol_selection();
+    let args = cli::parse_cli_args();
+
+    let device = match args.interface {
+        Some(ref name) => cli::resolve_interface_by_name(name),
+        None           => cli::select_interface(),
+    };
+    let selected_protocols = match args.protocols {
+        Some(p) => p,
+        None    => cli::prompt_protocol_selection(),
+    };
     let protocol_names = cli::selected_protocol_names(&selected_protocols);
     let bpf_filter = cli::build_bpf_filter(&selected_protocols);
     let expanded_protocols: Vec<protocols::ProtocolChoice> = selected_protocols.iter()

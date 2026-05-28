@@ -6,6 +6,132 @@ use std::io::{self, Write};
 
 use crate::protocols::ProtocolChoice;
 
+// ── CLI argument parsing ─────────────────────────────────────────────────────
+
+/// Parsed command-line flags. All fields are `None` when the flag was not
+/// supplied — callers fall back to interactive prompts in that case.
+pub struct CliArgs {
+    /// `--interface <name>` — pcap device name (e.g. `en0`, `eth0`)
+    pub interface: Option<String>,
+    /// `--protocol <list>` — comma-separated protocol names or numbers
+    pub protocols: Option<Vec<ProtocolChoice>>,
+}
+
+/// Parse command-line arguments.  Exits with a helpful message on bad input.
+pub fn parse_cli_args() -> CliArgs {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        print_help();
+        std::process::exit(0);
+    }
+
+    let mut interface = None;
+    let mut protocols = None;
+    let mut i = 0;
+
+    while i < args.len() {
+        match args[i].as_str() {
+            "--interface" | "-i" => {
+                if i + 1 < args.len() {
+                    interface = Some(args[i + 1].clone());
+                    i += 2;
+                } else {
+                    eprintln!("❌ --interface requires a value (e.g. --interface en0)");
+                    std::process::exit(1);
+                }
+            }
+            "--protocol" | "-p" => {
+                if i + 1 < args.len() {
+                    protocols = Some(parse_protocol_str(&args[i + 1]));
+                    i += 2;
+                } else {
+                    eprintln!("❌ --protocol requires a value (e.g. --protocol aes67,dante)");
+                    std::process::exit(1);
+                }
+            }
+            other => {
+                eprintln!("❌ Unknown argument: {}  (run with --help for usage)", other);
+                std::process::exit(1);
+            }
+        }
+    }
+
+    CliArgs { interface, protocols }
+}
+
+/// Resolve a device by exact pcap name (e.g. `en0`).
+/// Exits with a clear error if the name is not found.
+pub fn resolve_interface_by_name(name: &str) -> Device {
+    let devices = Device::list().expect("Unable to list interfaces");
+    devices.into_iter()
+        .find(|d| d.name == name)
+        .unwrap_or_else(|| {
+            eprintln!("❌ Interface '{}' not found.", name);
+            eprintln!("   Run without --interface to see available interfaces.");
+            std::process::exit(1);
+        })
+}
+
+/// Parse a `--protocol` value like `"aes67,dante"` into a `Vec<ProtocolChoice>`.
+/// Accepts protocol names (case-insensitive) and interactive-mode numbers (1-7).
+fn parse_protocol_str(s: &str) -> Vec<ProtocolChoice> {
+    let s = s.trim();
+    if s.eq_ignore_ascii_case("all") || s == "0" {
+        return vec![ProtocolChoice::All];
+    }
+    let mut selected = Vec::new();
+    for part in s.split(',') {
+        let part = part.trim();
+        let choice: Option<ProtocolChoice> = match part.to_lowercase().as_str() {
+            "all"    => return vec![ProtocolChoice::All],
+            "audio"  => Some(ProtocolChoice::Audio),
+            "video"  => Some(ProtocolChoice::Video),
+            "aes67"  => Some(ProtocolChoice::AES67),
+            "avb"    => Some(ProtocolChoice::AVB),
+            "dante"  => Some(ProtocolChoice::Dante),
+            "ndi"    => Some(ProtocolChoice::NDI),
+            "st2110" => Some(ProtocolChoice::ST2110),
+            _ => {
+                // Also accept the interactive-mode numbers (0-7) for scripting convenience.
+                if let Ok(n) = part.parse::<usize>() {
+                    if n == 0 { return vec![ProtocolChoice::All]; }
+                    ProtocolChoice::all_choices().get(n.saturating_sub(1)).cloned()
+                } else {
+                    eprintln!("⚠  Unknown protocol '{}' — ignored", part);
+                    eprintln!("   Valid names: all, audio, video, aes67, avb, dante, ndi, st2110");
+                    None
+                }
+            }
+        };
+        if let Some(c) = choice
+            && !selected.contains(&c) {
+            selected.push(c);
+        }
+    }
+    if selected.is_empty() { vec![ProtocolChoice::All] } else { selected }
+}
+
+fn print_help() {
+    println!("AVStreamLens — passive AV-over-IP network monitor\n");
+    println!("USAGE");
+    println!("  sudo avstreamlens [OPTIONS]\n");
+    println!("OPTIONS");
+    println!("  -i, --interface <name>    Network interface to capture on (e.g. en0, eth0)");
+    println!("  -p, --protocol  <list>    Comma-separated protocols to monitor (default: all)");
+    println!("  -h, --help                Show this help message\n");
+    println!("PROTOCOL NAMES");
+    println!("  all    audio   video");
+    println!("  aes67  avb     dante   ndi   st2110\n");
+    println!("EXAMPLES");
+    println!("  sudo avstreamlens --interface en0 --protocol aes67,dante");
+    println!("  sudo avstreamlens -i eth0 -p all");
+    println!("  sudo avstreamlens -i eth0 -p audio\n");
+    println!("  Without flags, AVStreamLens prompts interactively.");
+}
+
+// ── Interface selection (interactive) ───────────────────────────────────────
+
 /// List and filter network interfaces, prompt the user to select one.
 pub fn select_interface() -> Device {
     let devices = Device::list().expect("Unable to list interfaces");

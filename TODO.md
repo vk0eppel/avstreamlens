@@ -22,8 +22,6 @@
 
 - **Review health score penalty weights** — the current penalty table was set heuristically. Worth a pass to validate weights feel right for real AV deployments: e.g. is −30 for a dead stream vs −25 for a lost PTP clock the right relative severity? Are the caps (loss capped at −10, EEE capped at −30) appropriate? (`src/stats.rs` — `calculate_score`)
 
-- **`--interface` and `--protocol` CLI flags** — the interactive prompts block scripted/automated use. Skip prompts when these flags are provided: `./avstreamlens --interface en0 --protocol aes67,dante`. Minimal effort; `clap` or manual `std::env::args` parsing before the prompt blocks. (`src/cli.rs`, `src/main.rs`)
-
 - **`--duration <seconds>` flag** — run for N seconds then exit with status 0 (healthy) or 1 (issues). Enables scripted health checks: `avstreamlens --interface en0 --protocol aes67 --duration 30 && echo OK`. (`src/main.rs` — report loop exit condition)
 
 - **JSON output mode (`--output json`)** — emit newline-delimited JSON (one object per report cycle) for Grafana/Prometheus/`jq` integration. Add `serde::Serialize` to `StreamStats`, `PtpStats`, `NetworkHealth`; serialize at the point `print_report` is called. Log file format unchanged unless `--output json` is set. (`src/report.rs`, `src/stats.rs`)

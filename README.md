@@ -58,14 +58,34 @@ The binary is at `target/release/avstreamlens`.
 
 ## Usage
 
+**Interactive** (prompts for interface and protocol on startup):
 ```
 sudo ./target/release/avstreamlens
 ```
 
+**Non-interactive** (skip prompts — useful for scripts and SSH sessions):
+```
+sudo ./target/release/avstreamlens --interface en0 --protocol aes67,dante
+sudo ./target/release/avstreamlens -i eth0 -p all
+sudo ./target/release/avstreamlens --help
+```
+
 On startup:
-1. Select the network interface to monitor
-2. Select which protocols to watch (or press Enter for all)
+1. Select the network interface to monitor (or supply `--interface`)
+2. Select which protocols to watch (or supply `--protocol`, or press Enter for all)
 3. Reports print every 5 seconds; a timestamped `.log` file is written in the current directory
+
+---
+
+## CLI Flags
+
+| Flag | Short | Description |
+|---|---|---|
+| `--interface <name>` | `-i` | pcap device name to capture on (e.g. `en0`, `eth0`) |
+| `--protocol <list>` | `-p` | Comma-separated protocols: `all` `audio` `video` `aes67` `avb` `dante` `ndi` `st2110` |
+| `--help` | `-h` | Show usage and exit |
+
+Protocol names are case-insensitive. The interactive-mode numbers (0–7) are also accepted for scripting convenience. When a flag is omitted, AVStreamLens falls back to the interactive prompt for that item.
 
 ---
 
@@ -142,6 +162,7 @@ Choose the protocols to monitor:
    QoS: ✓ all streams correctly marked  |  IGMP: ✓ querier 42s ago  (interval 125s)
    ⚠  EEE active on 1 switch port(s) — may cause audio/video glitches
       port "Gi0/1"  chassis 00:1a:2b:3c:4d:5e  Tx wake: 16µs  Rx wake: 16µs
+   📦 48 120 pkts received  |  0 kernel drop(s)  |  0 interface drop(s)
 ```
 
 **Status line** — `✓ All streams healthy` or `⚠ N issue(s)` with a brief description.
@@ -174,8 +195,11 @@ Choose the protocols to monitor:
 - `⚠  PFC frames: N in last 5s — priority flow control engaged on upstream link`
 - `⚠  EEE active on switch port(s) — may cause audio/video glitches`
 - `⚠  No VLAN registration — L2 QoS may not be configured`
+- `❌ Capture drops detected — loss/jitter figures may be understated` (shown in red when pcap kernel or interface drops are non-zero)
 
 PAUSE and PFC detection is best-effort: most NICs consume these frames at the MAC layer before pcap sees them. The absence of these alerts therefore does NOT prove no upstream congestion is happening.
+
+The **pcap capture stats line** (`📦 N pkts received | N kernel drop(s) | N interface drop(s)`) always appears at the bottom of the Network Health section. Kernel drops mean the pcap ring buffer overflowed; interface drops mean packets were lost at the NIC before pcap. Either type of drop corrupts loss and jitter numbers — if you see this alert, reduce traffic load or increase the pcap buffer size.
 
 ---
 
