@@ -173,11 +173,21 @@ impl CaptureState {
     // ── Handlers ────────────────────────────────────────────────────────────
 
     /// SAP/SDP: cache the SDP and enrich any matching streams with metadata.
+    ///
+    /// Technical fields (clock_hz, ptime_ms, expected_pt, codec) are always
+    /// re-applied so a mid-run codec change is picked up immediately. The
+    /// session name is only written once — subsequent re-announcements with the
+    /// same or different name do not overwrite a name already shown to the user.
     pub fn handle_sap(&mut self, sdp: SdpSession) {
         for m in &sdp.media {
             for stats in self.streams.values_mut() {
-                if stats.dst_port == m.port && stats.sdp_name.is_none() {
-                    stats.sdp_name   = Some(sdp.session_name.clone());
+                if stats.dst_port == m.port {
+                    // Name: set on first announcement only.
+                    if stats.sdp_name.is_none() {
+                        stats.sdp_name = Some(sdp.session_name.clone());
+                    }
+                    // Technical fields: always refresh so mid-run codec changes
+                    // (sample rate, ptime, payload type) are reflected immediately.
                     stats.sdp_rtpmap = Some(m.rtpmap.clone());
                     if m.clock_hz > 0.0 {
                         stats.clock_hz = m.clock_hz;
@@ -704,6 +714,58 @@ mod tests {
         assert_eq!(s.expected_pt, Some(96));
         assert!(s.clock_hz_confirmed, "SAP-confirmed clock should flip the flag");
         assert_eq!(s.sdp_rtpmap.as_deref(), Some("L24/48000/2"));
+    }
+
+    /// SAP re-announcement with changed technical fields (e.g. payload type) must
+    /// update the stream even when a name was already set by a prior announcement.
+    ///
+    /// Real-world order of events:
+    ///   1. RTP stream observed → stream entry created (sdp_name = None)
+    ///   2. First SAP → name + technical fields written
+    ///   3. Second SAP with different codec → technical fields must update; name must not
+    #[test]
+    fn sap_reenrichment_updates_technical_fields_when_name_already_set() {
+        let mut state = CaptureState::new();
+
+        // Step 1: stream observed before any SAP arrives (no sdp_cache entry yet).
+        let pkt = ip_udp_rtp(46 << 2, 5004, 96, 0, 0, 0xAAAA);
+        state.handle_aes67(Ipv4Addr::new(239, 69, 0, 1), 5004, 96, &pkt);
+        assert_eq!(state.streams["AES67 239.69.0.1:5004"].sdp_name, None);
+
+        // Step 2: first SAP — sets name AND technical fields.
+        state.handle_sap(sdp_for_port(5004, 96, 48_000.0));
+        {
+            let s = &state.streams["AES67 239.69.0.1:5004"];
+            assert_eq!(s.sdp_name.as_deref(), Some("Test Mix"));
+            assert_eq!(s.expected_pt, Some(96));
+            assert_eq!(s.clock_hz as u32, 48_000);
+        }
+
+        // Step 3: second SAP — encoder changed to PT=97 / 96 kHz.
+        // Technical fields must update; name must stay "Test Mix".
+        let updated_sdp = SdpSession {
+            session_id: "1".to_string(),
+            session_name: "Updated Mix".to_string(),
+            info: String::new(),
+            media: vec![SdpMedia {
+                media_type: "audio".to_string(),
+                port: 5004,
+                payload_types: vec![97],
+                connection: String::new(),
+                rtpmap: "L24/96000/2".to_string(),
+                clock_hz: 96_000.0,
+                channels: 2,
+                ptime_ms: 1.0,
+                ts_refclk: String::new(),
+                mediaclk: String::new(),
+            }],
+        };
+        state.handle_sap(updated_sdp);
+        let s = &state.streams["AES67 239.69.0.1:5004"];
+        assert_eq!(s.expected_pt, Some(97),              "payload type must update");
+        assert_eq!(s.clock_hz as u32, 96_000,            "clock rate must update");
+        assert_eq!(s.sdp_rtpmap.as_deref(), Some("L24/96000/2"), "rtpmap must update");
+        assert_eq!(s.sdp_name.as_deref(), Some("Test Mix"),      "name must not be overwritten");
     }
 
     #[test]

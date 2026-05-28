@@ -10,8 +10,6 @@
 
 - **Stale docstring in `report.rs`** — `print_report`'s doc comment still lists `SRT, RIST` which were removed. (`src/report.rs:48`)
 
-- **SAP enrichment skips streams that already have a name** — `handle_sap` guards on `stats.sdp_name.is_none()`, so a SAP update that changes codec parameters mid-run is silently ignored. Consider re-enriching all fields (clock_hz, ptime_ms, expected_pt) unconditionally and only skipping the name if it would overwrite a user-visible one. (`src/capture.rs` — `handle_sap`)
-
 ---
 
 ## Missing Features
