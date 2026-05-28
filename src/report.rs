@@ -64,6 +64,7 @@ pub fn print_report(
     eee_ports: &std::collections::HashMap<(String, String), (u16, u16)>,
     pause_frames: u64,
     pfc_frames: u64,
+    pcap_stats: Option<(u32, u32, u32)>,
 ) {
     let now = Local::now();
     let timestamp = now.format("%Y-%m-%d %H:%M:%S").to_string();
@@ -600,6 +601,28 @@ pub fn print_report(
             let detail = format!("      port \"{}\"  chassis {}  Tx wake: {}µs  Rx wake: {}µs", port, chassis, tx, rx);
             logger.log(&detail);
             println!("{}", detail);
+        }
+    }
+
+    // ── pcap capture stats ──────────────────────────────────────────────────
+    // Kernel drops mean the ring buffer overflowed — packets were received by
+    // the NIC but discarded before pcap handed them to us. Even a small drop
+    // count corrupts loss and jitter measurements for all streams.
+    if let Some((received, dropped, if_dropped)) = pcap_stats {
+        let stats_line = format!(
+            "   📦 {:} pkts received  |  {} kernel drop(s)  |  {} interface drop(s)",
+            received, dropped, if_dropped
+        );
+        logger.log(&stats_line);
+        if dropped > 0 || if_dropped > 0 {
+            // Red: drops actively corrupt loss/jitter numbers — engineer must act.
+            println!("\x1b[31m{}\x1b[0m", stats_line);
+            let warn = "   ❌ Capture drops detected — loss/jitter figures may be understated. \
+                        Reduce load or increase pcap buffer size.";
+            logger.log(warn);
+            println!("\x1b[31m{}\x1b[0m", warn);
+        } else {
+            println!("{}", stats_line);
         }
     }
 

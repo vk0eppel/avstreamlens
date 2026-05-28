@@ -87,11 +87,17 @@ fn main() {
 
             let missing_ptp = state.missing_ptp_clocks(&expanded_protocols);
 
+            // Snapshot pcap kernel drop counters just before the report so the
+            // numbers reflect the full capture window. Failures are silently
+            // ignored — the report renders fine without them.
+            let pcap_stats = cap.stats().ok().map(|s| (s.received, s.dropped, s.if_dropped));
+
             print_report(
                 &state.streams, &state.tcp_streams, &state.ptp_domains, &missing_ptp,
                 &mut logger, &state.network_health, state.bytes_this_window,
                 &state.avtp_streams, &state.msrp_state, &state.mvrp_vlans, &state.eee_ports,
                 state.pause_frames_this_window, state.pfc_frames_this_window,
+                pcap_stats,
             );
 
             state.reset_window();

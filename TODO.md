@@ -30,8 +30,6 @@
 
 - **JSON output mode (`--output json`)** — emit newline-delimited JSON (one object per report cycle) for Grafana/Prometheus/`jq` integration. Add `serde::Serialize` to `StreamStats`, `PtpStats`, `NetworkHealth`; serialize at the point `print_report` is called. Log file format unchanged unless `--output json` is set. (`src/report.rs`, `src/stats.rs`)
 
-- **pcap drop counter in report footer** — `pcap::Capture::stats()` returns `(received, dropped, if_dropped)`. Show this in the Network Health section: `📦 48 120 pkts received | 0 kernel drops | 0 interface drops`. A non-zero drop count invalidates all loss/jitter numbers and must be surfaced. (`src/main.rs` — report cycle; `src/report.rs` — footer)
-
 - **`--quiet` / alert-only mode** — when `--quiet` is set, print nothing on a fully healthy cycle; print only the status line and active `⚠`/`💀` alerts otherwise. Eliminates noise when monitoring via `tail -f` or a log aggregator. (`src/report.rs` — `print_report`; `src/main.rs`)
 
 - **`--no-color` flag / `NO_COLOR` env var** — strip ANSI escape codes from both console and log file output. Log files today contain raw ANSI codes that make `grep` harder. Honour the community-standard `NO_COLOR` env var automatically. (`src/report.rs` — all `\x1b[…m` sites; `src/capture.rs` — `emit`)
