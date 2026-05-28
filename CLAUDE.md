@@ -9,7 +9,7 @@
 |---|---|
 | `src/main.rs` | Entry point — owns pcap handle, 5s report timer, post-dispatch IPv4/TCP tracking. Thin driver (~290 lines) |
 | `src/capture.rs` | `CaptureState` + per-protocol handlers + `dispatch()` + `emit()` — all per-loop state and protocol-handler logic |
-| `src/cli.rs` | CLI arg parsing (`--interface`, `--protocol`, `--help`), interactive interface/protocol selection, BPF filter building |
+| `src/cli.rs` | CLI arg parsing (`--interface`, `--protocol`, `--quiet`, `--no-color`, `--help`), interactive interface/protocol selection, BPF filter building |
 | `src/parser.rs` | Top-level `detect_protocol` dispatcher + RTP + TCP + VLAN unwrap + multicast helpers; re-exports submodule API |
 | `src/parser/sdp.rs` | SAP envelope (RFC 2974), SDP body (RFC 4566), `ts-refclk` normalisation |
 | `src/parser/ptp.rs` | PTPv1 (IEEE 1588-2002) + PTPv2 (IEEE 1588-2008) message parser — used for both UDP PTP and L2 gPTP |
@@ -36,8 +36,8 @@ See **[TODO.md](TODO.md)** for the full list. Quick summary:
 
 | Category | Items |
 |---|---|
-| Bugs / code issues | Banner `(+ PTP, IGMP)` suffix always shown; dead `ProtocolChoice::All` check; stale `report.rs` docstring |
-| Missing features | VLAN-ID filter; `msrp_state`/`mvrp_vlans` pruning; Dante AV video; health score review; `--duration`; `--quiet`; `--no-color`; JSON output; SAP re-announce monitor; redundant stream pairing; RTCP; PTP BMCA; SDP preload; NMOS IS-04 |
+| Bugs / code issues | (none — all resolved) |
+| Missing features | VLAN-ID filter; Dante AV video; health score review; `--duration`; JSON output; SAP re-announce monitor; redundant stream pairing; RTCP; PTP BMCA; stream count anomaly; SDP preload; NMOS IS-04 |
 | Platform limitations | NDI loopback unsupported; macOS VLAN tag stripping; Windows `cmd.exe` no ANSI color; PAUSE/PFC NIC-consumed |
 
 ---
@@ -98,10 +98,11 @@ See **[TODO.md](TODO.md)** for the full list. Quick summary:
 - **VLAN-tagged frames**: `unwrap_vlan()` in `parser.rs` peels 802.1Q / 802.1ad / QinQ tags before dispatch — L2 AVB protocols work on tagged networks. No VLAN-ID filtering is implemented; the app processes whatever VLANs the capture interface receives. Operator-facing guidance (trunk vs access vs SPAN, macOS tag-stripping, QinQ caveat) lives in README.md under "Capture Setup — Monitoring One or Multiple VLANs"
 
 ### CLI Flags & Interface Listing
-- **`parse_cli_args()`** reads `std::env::args()` before any interactive prompt. Recognised flags: `--interface`/`-i`, `--protocol`/`-p`, `--help`/`-h`. Unknown flags exit with an error. Returns `CliArgs { interface: Option<String>, protocols: Option<Vec<ProtocolChoice>> }`
+- **`parse_cli_args()`** reads `std::env::args()` before any interactive prompt. Recognised flags: `--interface`/`-i`, `--protocol`/`-p`, `--quiet`/`-q`, `--no-color`/`--no-colour`, `--help`/`-h`. Unknown flags exit with an error. Returns `CliArgs { interface, protocols, quiet, no_color }`
 - `--interface <name>` — passed to `resolve_interface_by_name()`, which does an exact match against the pcap device list and exits with a clear message if not found. Bypasses the interactive listing entirely
 - `--protocol <list>` — comma-separated names (`all`, `audio`, `video`, `aes67`, `avb`, `dante`, `ndi`, `st2110`, case-insensitive) or interactive-mode numbers (0–7). Parsed by `parse_protocol_str()`. Bypasses the interactive protocol prompt entirely
-- **Interactive fallback**: when either flag is absent `main.rs` calls `select_interface()` / `prompt_protocol_selection()` as before — the interactive path is fully intact
+- `--quiet` / `-q` — when set, `print_report` suppresses all stdout output on fully healthy cycles (no stream issues, no missing clocks, no pcap drops). When issues are present the full report is printed. The log file always receives the full report regardless of this flag. Designed for `tail -f`/log-aggregator use
+- **Interactive fallback**: when interface/protocol flags are absent `main.rs` calls `select_interface()` / `prompt_protocol_selection()` as before — the interactive path is fully intact
 - Interface list filtered: `lo`/`lo0`, `utun*`, `awdl*`, `llw*`, `bridge*`, `vpn*`, `docker*`, `veth*`, `virbr*`, `ap1`, `anpi*` (iPhone USB), `gif*` (IPv6 tunnel), `stf*` (6to4 tunnel)
 - `lo`/`lo0` excluded: macOS loopback uses DLT_NULL (4-byte BSD null header, no Ethernet frame) — incompatible with Ethernet parser; mDNS multicast also does not flow over loopback
 - macOS port names via `macos_port_names()` → `networksetup -listallhardwareports`; IPv4 address shown; Enter selects interface 0 by default
@@ -155,7 +156,7 @@ See **[TODO.md](TODO.md)** for the full list. Quick summary:
 - **AVTP**: `avtp_streams: HashMap<[u8;8], AvtpStreamStats>` per stream_id (sv=1, bytes 4–11); subtype decoded via `avtp_subtype_name()` (0x00=IEC 61883, 0x02=CRF, 0x7E=MAAP…); sequence loss via `AvtpStreamStats::update_seq()` on byte 2 counter (8-bit wrap-safe, signed-i8 reorder filter mirrors the RTP fix); bitrate from Ethernet frame sizes
 - **MSRP**: `parse_msrp()` extracts TalkerAdvertise (bandwidth, VLAN, priority), TalkerFailed (failure code), Listener state; `msrp_state: HashMap<[u8;8], MsrpDeclaration>`; TalkerFailed alert immediate with code (1=bandwidth, 2=bridge resources, 3=traffic class)
 - **MVRP**: `parse_mvrp()` extracts VLAN IDs; `mvrp_vlans: HashSet<u16>` — presence confirms L2 VLAN QoS; alert if AVTP active but no MVRP
-- `avtp_streams` pruned per cycle; `msrp_state` and `mvrp_vlans` not pruned
+- `avtp_streams` pruned per cycle; `msrp_state` pruned to match surviving `avtp_streams` entries; `mvrp_vlans` cleared when `avtp_streams` is empty (MVRP is periodic — the switch re-registers within seconds when AVB resumes)
 
 ### mDNS name extraction (shared)
 - `extract_mdns_instance_name(payload, needle)` in `parser.rs`: finds DNS-label-encoded service, extracts preceding instance name (1–63 bytes, printable ASCII, longest match)

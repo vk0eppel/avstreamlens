@@ -83,9 +83,13 @@ On startup:
 |---|---|---|
 | `--interface <name>` | `-i` | pcap device name to capture on (e.g. `en0`, `eth0`) |
 | `--protocol <list>` | `-p` | Comma-separated protocols: `all` `audio` `video` `aes67` `avb` `dante` `ndi` `st2110` |
+| `--quiet` | `-q` | Silent on healthy cycles; print the full report only when issues are detected |
+| `--no-color` | | Disable ANSI colour output (also honoured via the `NO_COLOR` env var) |
 | `--help` | `-h` | Show usage and exit |
 
 Protocol names are case-insensitive. The interactive-mode numbers (0–7) are also accepted for scripting convenience. When a flag is omitted, AVStreamLens falls back to the interactive prompt for that item.
+
+`--quiet` is useful for long-running monitoring sessions piped to a log file or `tail -f`: no output is produced on healthy cycles, so the terminal stays clean and each new report is immediately visible as an issue. The log file always receives the full report regardless of `--quiet`.
 
 ---
 

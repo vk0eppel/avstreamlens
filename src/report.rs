@@ -2,6 +2,18 @@
 // Reporting and output formatting for stream monitoring results.
 
 use chrono::{Datelike, Timelike, Local};
+
+/// Wrap `text` in an ANSI colour escape when colour output is enabled.
+/// `code` is the SGR code string, e.g. `"36"` for cyan, `"33"` for yellow.
+/// When colour is disabled the text is returned unchanged.
+#[inline]
+fn ansi(code: &str, text: &str) -> String {
+    if crate::color_enabled() {
+        format!("\x1b[{}m{}\x1b[0m", code, text)
+    } else {
+        text.to_string()
+    }
+}
 use std::collections::HashMap;
 use std::time::Duration;
 
@@ -42,13 +54,13 @@ pub fn create_logger(prefix: &str) -> std::io::Result<Logger> {
     Logger::new(prefix)
 }
 
+/// Print one 5-second report cycle to stdout and the log file.
 ///
-/// Displays:
-/// - Network load summary
-/// - RTP stream statistics (AES67, ST2110, Dante, NDI, AVB)
-/// - TCP stream quality and diagnostics
-/// - PTP domain synchronization status
-/// - Protocol-specific warnings and alerts
+/// Sections printed in order:
+/// - Bandwidth + stream count overview + status line
+/// - `📡 Streams:` — AES67, Dante, ST2110, NDI, AVB entries with per-stream alerts
+/// - `🕐 Clock Sources:` — PTP domains (omitted when none observed)
+/// - `🔬 Network Health — X%:` — QoS, IGMP querier, EEE, pcap capture stats
 #[allow(clippy::too_many_arguments)]
 pub fn print_report(
     streams: &HashMap<String, StreamStats>,
@@ -65,17 +77,13 @@ pub fn print_report(
     pause_frames: u64,
     pfc_frames: u64,
     pcap_stats: Option<(u32, u32, u32)>,
+    quiet: bool,
 ) {
     let now = Local::now();
     let timestamp = now.format("%Y-%m-%d %H:%M:%S").to_string();
     let header_line = format!("{} | AVStreamLens report", timestamp);
 
     logger.log(&header_line);
-
-    let rule = "─".repeat(66);
-    println!("\n\x1b[36m{}\x1b[0m", rule);
-    println!("\x1b[36m  AVStreamLens  ·  {}\x1b[0m", timestamp);
-    println!("\x1b[36m{}\x1b[0m", rule);
 
     let mbps = bytes_this_window as f64 * 8.0 / 5_000_000.0;
 
@@ -111,7 +119,6 @@ pub fn print_report(
         mbps, streams_str
     );
     logger.log(&net_summary);
-    println!("{}", net_summary);
 
     // ── Top-level status ────────────────────────────────────────────────────
     // Stream-issue count uses per-window deltas where applicable so the status
@@ -143,17 +150,37 @@ pub fn print_report(
         "✓  All streams healthy".to_string()
     };
     logger.log(&status_line);
+
+    // ── Quiet-mode early exit ───────────────────────────────────────────────
+    // When --quiet is set and the cycle is fully healthy (no stream issues,
+    // no missing clocks, no pcap drops), suppress all stdout output.
+    // The log file always receives the full report regardless of this flag.
+    let pcap_drops_ok = pcap_stats.is_none_or(|(_, d, id)| d == 0 && id == 0);
+    let is_healthy = status_line.starts_with('✓') && pcap_drops_ok;
+    if quiet && is_healthy {
+        logger.log("");
+        return;
+    }
+
+    // From here on, output goes to both stdout and the log file.
+    let rule = "─".repeat(66);
+    println!("\n{}", ansi("36", &rule));
+    println!("{}", ansi("36", &format!("  AVStreamLens  ·  {}", timestamp)));
+    println!("{}", ansi("36", &rule));
+
+    println!("{}", net_summary);
+
     if status_line.starts_with('✓') {
-        println!("\x1b[32m{}\x1b[0m", status_line);
+        println!("{}", ansi("32", &status_line));
     } else if status_line.starts_with('⚠') {
-        println!("\x1b[33m{}\x1b[0m", status_line);
+        println!("{}", ansi("33", &status_line));
     } else {
         println!("{}", status_line);
     }
 
     // ── Streams (all protocols unified) ────────────────────────────────────
     logger.log("\nStreams:");
-    println!("\n\x1b[36m📡 Streams:\x1b[0m");
+    println!("\n{}", ansi("36", "📡 Streams:"));
 
     let group_order = ["AES67", "Dante", "NDI", "ST", "AVB"];
     let mut keys: Vec<&String> = streams.keys().collect();
@@ -196,7 +223,13 @@ pub fn print_report(
             None                       => String::new(),
         };
 
-        let stream_line = format!("  ▸ {}{}{}{}", proto_label, name_str, codec_str, addr_str);
+        // Dante: show [unicast] or [multicast] so the engineer knows immediately
+        // whether the stream requires IGMP/multicast switch configuration.
+        let multicast_tag = if s.protocol == "Dante" {
+            if s.is_multicast { "  [multicast]" } else { "  [unicast]" }
+        } else { "" };
+
+        let stream_line = format!("  ▸ {}{}{}{}{}", proto_label, multicast_tag, name_str, codec_str, addr_str);
         logger.log(&stream_line);
         println!("{}", stream_line);
 
@@ -236,7 +269,7 @@ pub fn print_report(
                 s.ts_discontinuities_this_window
             );
             logger.log(&alert);
-            println!("\x1b[33m{}\x1b[0m", alert);
+            println!("{}", ansi("33", &alert));
         }
 
         if s.lost_this_window > 0 {
@@ -245,7 +278,7 @@ pub fn print_report(
                 s.lost_this_window, s.loss_pct()
             );
             logger.log(&alert);
-            println!("\x1b[33m{}\x1b[0m", alert);
+            println!("{}", ansi("33", &alert));
         }
 
         // Reorder rate — distinct from loss. >1% suggests per-packet ECMP/LAG
@@ -259,7 +292,7 @@ pub fn print_report(
                     pct, s.reorders_this_window
                 );
                 logger.log(&alert);
-                println!("\x1b[33m{}\x1b[0m", alert);
+                println!("{}", ansi("33", &alert));
             }
         }
 
@@ -270,19 +303,19 @@ pub fn print_report(
                 s.dscp_violations, expected
             );
             logger.log(&alert);
-            println!("\x1b[33m{}\x1b[0m", alert);
+            println!("{}", ansi("33", &alert));
         }
 
         if s.jitter_ms() > 20.0 {
             let alert = "    ⚠  High jitter — stream quality at risk";
             logger.log(alert);
-            println!("\x1b[33m{}\x1b[0m", alert);
+            println!("{}", ansi("33", alert));
         }
 
         if s.protocol == "AES67" && s.jitter_ms() > 10.0 {
             let alert = "    ⚠  AES67 timing issue — check PTP lock";
             logger.log(alert);
-            println!("\x1b[33m{}\x1b[0m", alert);
+            println!("{}", ansi("33", alert));
         }
 
         // 0.1% loss ≈ ~3 dropped packets per 5s window at 1ms ptime — below that is
@@ -290,20 +323,20 @@ pub fn print_report(
         if s.protocol == "Dante" && (s.loss_pct() > 0.1 || s.jitter_ms() > 15.0) {
             let alert = "    ⚠  Dante clock or subscription issue";
             logger.log(alert);
-            println!("\x1b[33m{}\x1b[0m", alert);
+            println!("{}", ansi("33", alert));
         }
 
         if s.ssrc_changes > 0 {
             let alert = format!("    ⚠  Source interrupted and reconnected ({} time(s))", s.ssrc_changes);
             logger.log(&alert);
-            println!("\x1b[33m{}\x1b[0m", alert);
+            println!("{}", ansi("33", &alert));
         }
 
         // Gap 2: payload type mismatch
         if s.pt_mismatches > 0 {
             let alert = format!("    ⚠  RTP payload type mismatch ({} packet(s)) — encoder/SDP misconfiguration", s.pt_mismatches);
             logger.log(&alert);
-            println!("\x1b[33m{}\x1b[0m", alert);
+            println!("{}", ansi("33", &alert));
         }
 
         // Gap 3: stream not yet announced via SAP
@@ -315,14 +348,14 @@ pub fn print_report(
         if expects_sdp && !s.clock_hz_confirmed && s.packets > 10 {
             let alert = "    ⚠  Stream not announced (no SAP) — audio glitch detection unavailable";
             logger.log(alert);
-            println!("\x1b[33m{}\x1b[0m", alert);
+            println!("{}", ansi("33", alert));
         }
 
         // ST2110 unclassified stream type
         if s.protocol == "2110-??" {
             let alert = "    ⚠  Stream type unknown — SDP required to classify as video/audio/ancillary";
             logger.log(alert);
-            println!("\x1b[33m{}\x1b[0m", alert);
+            println!("{}", ansi("33", alert));
         }
 
         // Gap 4: signal gap events (IAT > 50ms).
@@ -334,7 +367,7 @@ pub fn print_report(
                 s.gap_events, s.max_iat_ms
             );
             logger.log(&alert);
-            println!("\x1b[33m{}\x1b[0m", alert);
+            println!("{}", ansi("33", &alert));
         }
 
         if let Some(last_time) = s.last_packet_time
@@ -342,7 +375,7 @@ pub fn print_report(
         {
             let alert = format!("    💀 No signal for {:.0}s", last_time.elapsed().as_secs_f64());
             logger.log(&alert);
-            println!("\x1b[31m{}\x1b[0m", alert);
+            println!("{}", ansi("31", &alert));
         }
     }
 
@@ -394,20 +427,20 @@ pub fn print_report(
                         };
                         let alert = format!("    ⚠  Reservation failed — {}", code_str);
                         logger.log(&alert);
-                        println!("\x1b[33m{}\x1b[0m", alert);
+                        println!("{}", ansi("33", &alert));
                     }
                     MsrpDeclType::Listener => {}
                 }
             } else if mvrp_vlans.is_empty() {
                 let alert = "    ⚠  No VLAN registration — L2 QoS may not be configured";
                 logger.log(alert);
-                println!("\x1b[33m{}\x1b[0m", alert);
+                println!("{}", ansi("33", alert));
             }
 
             if dead {
                 let alert = format!("    💀 No signal for {:.0}s", avtp.last_seen.elapsed().as_secs_f64());
                 logger.log(&alert);
-                println!("\x1b[31m{}\x1b[0m", alert);
+                println!("{}", ansi("31", &alert));
             }
         }
     }
@@ -415,7 +448,7 @@ pub fn print_report(
     // ── PTP / Clock Sources ─────────────────────────────────────────────────
     if !ptp_domains.is_empty() {
         logger.log("\nClock Sources:");
-        println!("\n\x1b[36m🕐 Clock Sources:\x1b[0m");
+        println!("\n{}", ansi("36", "🕐 Clock Sources:"));
 
         let multi_domain = ptp_domains.len() > 1;
 
@@ -471,7 +504,7 @@ pub fn print_report(
                 if offset_ns.unsigned_abs() > 1_000 {
                     let alert = "    ⚠  Large PTP correction field — transparent clock or path issue";
                     logger.log(alert);
-                    println!("\x1b[33m{}\x1b[0m", alert);
+                    println!("{}", ansi("33", alert));
                 }
             }
 
@@ -494,25 +527,25 @@ pub fn print_report(
                 if spread_ns > 10_000 {
                     let alert = "    ⚠  PTP path-delay variance > 10µs — unstable link (EEE, half-duplex, or cable)";
                     logger.log(alert);
-                    println!("\x1b[33m{}\x1b[0m", alert);
+                    println!("{}", ansi("33", alert));
                 }
                 if max > 1_000_000 {
                     let alert = "    ⚠  PTP path delay > 1ms — too many hops between this node and grandmaster";
                     logger.log(alert);
-                    println!("\x1b[33m{}\x1b[0m", alert);
+                    println!("{}", ansi("33", alert));
                 }
             }
 
             if stats.protocol_clock_lost {
                 let alert = "    ⚠  Clock lost — grandmaster disappeared";
                 logger.log(alert);
-                println!("\x1b[33m{}\x1b[0m", alert);
+                println!("{}", ansi("33", alert));
             }
 
             if stats.protocol_changes_count > 0 {
                 let alert = format!("    ⚠  Clock source changed {} time(s)", stats.protocol_changes_count);
                 logger.log(&alert);
-                println!("\x1b[33m{}\x1b[0m", alert);
+                println!("{}", ansi("33", &alert));
             }
         }
     }
@@ -524,13 +557,13 @@ pub fn print_report(
     for mc in missing_ptp {
         let alert = format_missing_clock(mc);
         logger.log(&alert);
-        println!("\x1b[31m{}\x1b[0m", alert);
+        println!("{}", ansi("31", &alert));
     }
 
     // ── Network health ──────────────────────────────────────────────────────
     let score = format!("{:.0}%", health.network_score);
     logger.log(&format!("\nNetwork Health — {}:", score));
-    println!("\n\x1b[36m🔬 Network Health — {}:\x1b[0m", score);
+    println!("\n{}", ansi("36", &format!("🔬 Network Health — {}:", score)));
 
     let dscp_bad = streams.values().filter(|s| s.dscp_violations > 0).count();
     let qos_str = if streams.values().all(|s| s.protocol == "NDI" || s.protocol == "AVB" || s.protocol.starts_with("AVB ")) {
@@ -567,7 +600,7 @@ pub fn print_report(
             health.ecn_congestion_marks
         );
         logger.log(&alert);
-        println!("\x1b[33m{}\x1b[0m", alert);
+        println!("{}", ansi("33", &alert));
     }
 
     // Link-layer flow control (PAUSE / PFC). Most NICs strip these in hardware
@@ -579,7 +612,7 @@ pub fn print_report(
             pause_frames
         );
         logger.log(&alert);
-        println!("\x1b[33m{}\x1b[0m", alert);
+        println!("{}", ansi("33", &alert));
     }
     if pfc_frames > 0 {
         let alert = format!(
@@ -587,7 +620,7 @@ pub fn print_report(
             pfc_frames
         );
         logger.log(&alert);
-        println!("\x1b[33m{}\x1b[0m", alert);
+        println!("{}", ansi("33", &alert));
     }
 
     if !eee_ports.is_empty() {
@@ -596,7 +629,7 @@ pub fn print_report(
             eee_ports.len()
         );
         logger.log(&eee_alert);
-        println!("\x1b[33m{}\x1b[0m", eee_alert);
+        println!("{}", ansi("33", &eee_alert));
         for ((chassis, port), (tx, rx)) in eee_ports.iter() {
             let detail = format!("      port \"{}\"  chassis {}  Tx wake: {}µs  Rx wake: {}µs", port, chassis, tx, rx);
             logger.log(&detail);
@@ -616,11 +649,11 @@ pub fn print_report(
         logger.log(&stats_line);
         if dropped > 0 || if_dropped > 0 {
             // Red: drops actively corrupt loss/jitter numbers — engineer must act.
-            println!("\x1b[31m{}\x1b[0m", stats_line);
+            println!("{}", ansi("31", &stats_line));
             let warn = "   ❌ Capture drops detected — loss/jitter figures may be understated. \
                         Reduce load or increase pcap buffer size.";
             logger.log(warn);
-            println!("\x1b[31m{}\x1b[0m", warn);
+            println!("{}", ansi("31", warn));
         } else {
             println!("{}", stats_line);
         }

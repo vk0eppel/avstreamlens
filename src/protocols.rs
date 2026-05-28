@@ -181,9 +181,8 @@ impl ProtocolChoice {
 
 impl AvProtocol {
     pub fn is_selected(&self, expanded: &[ProtocolChoice]) -> bool {
-        if expanded.iter().any(|c| matches!(c, ProtocolChoice::All)) {
-            return true;
-        }
+        // ProtocolChoice::All is always fully expanded to concrete variants via includes()
+        // before is_selected() is called, so All never appears in the expanded slice here.
         match self {
             AvProtocol::Aes67  { .. } => expanded.iter().any(|c| matches!(c, ProtocolChoice::AES67)),
             AvProtocol::St2110 { .. } => expanded.iter().any(|c| matches!(c, ProtocolChoice::ST2110)),

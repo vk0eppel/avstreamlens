@@ -15,6 +15,12 @@ pub struct CliArgs {
     pub interface: Option<String>,
     /// `--protocol <list>` — comma-separated protocol names or numbers
     pub protocols: Option<Vec<ProtocolChoice>>,
+    /// `--no-color` or `NO_COLOR` env var — disable ANSI colour output
+    pub no_color: bool,
+    /// `--quiet` — suppress all stdout output on healthy cycles; print only
+    /// the status line and active alerts when issues are detected.
+    /// The log file always receives the full report.
+    pub quiet: bool,
 }
 
 /// Parse command-line arguments.  Exits with a helpful message on bad input.
@@ -26,8 +32,12 @@ pub fn parse_cli_args() -> CliArgs {
         std::process::exit(0);
     }
 
+    // Honour the NO_COLOR env var (https://no-color.org/): presence of the variable,
+    // regardless of its value (even empty string), disables ANSI colour output.
+    let mut no_color = std::env::var_os("NO_COLOR").is_some();
     let mut interface = None;
     let mut protocols = None;
+    let mut quiet = false;
     let mut i = 0;
 
     while i < args.len() {
@@ -50,6 +60,14 @@ pub fn parse_cli_args() -> CliArgs {
                     std::process::exit(1);
                 }
             }
+            "--no-color" | "--no-colour" => {
+                no_color = true;
+                i += 1;
+            }
+            "--quiet" | "-q" => {
+                quiet = true;
+                i += 1;
+            }
             other => {
                 eprintln!("❌ Unknown argument: {}  (run with --help for usage)", other);
                 std::process::exit(1);
@@ -57,7 +75,7 @@ pub fn parse_cli_args() -> CliArgs {
         }
     }
 
-    CliArgs { interface, protocols }
+    CliArgs { interface, protocols, no_color, quiet }
 }
 
 /// Resolve a device by exact pcap name (e.g. `en0`).
@@ -119,6 +137,8 @@ fn print_help() {
     println!("OPTIONS");
     println!("  -i, --interface <name>    Network interface to capture on (e.g. en0, eth0)");
     println!("  -p, --protocol  <list>    Comma-separated protocols to monitor (default: all)");
+    println!("  -q, --quiet               Suppress output on healthy cycles; show alerts only");
+    println!("      --no-color            Disable ANSI colour output (also: NO_COLOR env var)");
     println!("  -h, --help                Show this help message\n");
     println!("PROTOCOL NAMES");
     println!("  all    audio   video");
@@ -257,6 +277,25 @@ pub fn build_bpf_filter(selected: &[ProtocolChoice]) -> String {
     // After All/Audio/Video expansion, every concrete ProtocolChoice triggers
     // one of needs_udp/tcp/avb — so this list always has at least 5 entries.
     filters.join(" or ")
+}
+
+/// Suffix showing which infrastructure protocols are auto-enabled alongside the
+/// user's selection.  Returns e.g. `"  (+ PTP, IGMP)"`, `"  (+ PTP)"`, or `""`.
+///
+/// Rules (matching the actual `is_selected()` gating in `protocols.rs`):
+/// - PTP:  enabled when AES67, ST2110, Dante, or AVB is selected
+/// - IGMP: enabled when AES67, ST2110, or Dante is selected
+pub fn selected_extras_display(expanded: &[ProtocolChoice]) -> String {
+    let has_ptp  = expanded.iter().any(|c| matches!(c,
+        ProtocolChoice::AES67 | ProtocolChoice::ST2110 | ProtocolChoice::Dante | ProtocolChoice::AVB));
+    let has_igmp = expanded.iter().any(|c| matches!(c,
+        ProtocolChoice::AES67 | ProtocolChoice::ST2110 | ProtocolChoice::Dante));
+    match (has_ptp, has_igmp) {
+        (true,  true)  => "  (+ PTP, IGMP)".to_string(),
+        (true,  false) => "  (+ PTP)".to_string(),
+        (false, true)  => "  (+ IGMP)".to_string(),
+        (false, false) => String::new(),
+    }
 }
 
 /// Human-readable comma-separated list for the startup banner.

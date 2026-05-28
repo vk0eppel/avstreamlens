@@ -22,6 +22,7 @@ mod capture;
 use pcap::Capture;
 use pnet_packet::ethernet::EthernetPacket;
 use pnet_packet::Packet;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::capture::{Alert, CaptureState};
@@ -29,8 +30,20 @@ use crate::parser::{detect_protocol, parse_tcp_packet, parse_ts_refclk, is_multi
 use crate::report::{create_logger, print_report};
 use crate::stats::StreamStats;
 
+/// Global colour flag — set once at startup, read-only after that.
+/// Use `color_enabled()` everywhere rather than accessing this directly.
+static COLOR: AtomicBool = AtomicBool::new(true);
+
+/// Returns `true` when ANSI colour output is enabled (the default).
+/// Set to `false` by `--no-color` or the `NO_COLOR` environment variable.
+pub fn color_enabled() -> bool { COLOR.load(Ordering::Relaxed) }
+
 fn main() {
     let args = cli::parse_cli_args();
+    if args.no_color {
+        COLOR.store(false, Ordering::Relaxed);
+    }
+    let quiet = args.quiet;
 
     let device = match args.interface {
         Some(ref name) => cli::resolve_interface_by_name(name),
@@ -49,10 +62,11 @@ fn main() {
     let mut logger = create_logger(&protocol_names).expect("Unable to create log file");
 
     let proto_display = cli::selected_protocol_display(&selected_protocols);
+    let extras = cli::selected_extras_display(&expanded_protocols);
     let banner = if proto_display == "all protocols" {
         format!("📡 Listening on {}  —  all protocols", device.name)
     } else {
-        format!("📡 Listening on {}  for {}  (+ PTP, IGMP)  streams", device.name, proto_display)
+        format!("📡 Listening on {}  for {}{}  streams", device.name, proto_display, extras)
     };
     println!("{}", banner);
     logger.log(&banner);
@@ -105,7 +119,7 @@ fn main() {
                 &mut logger, &state.network_health, state.bytes_this_window,
                 &state.avtp_streams, &state.msrp_state, &state.mvrp_vlans, &state.eee_ports,
                 state.pause_frames_this_window, state.pfc_frames_this_window,
-                pcap_stats,
+                pcap_stats, quiet,
             );
 
             state.reset_window();
@@ -119,7 +133,7 @@ fn main() {
                 // Real capture failure (interface down, permissions revoked, etc.).
                 // Log once and exit — busy-looping on a broken handle helps no one.
                 let msg = format!("❌ Capture error: {} — exiting", e);
-                eprintln!("\x1b[31m{}\x1b[0m", msg);
+                if color_enabled() { eprintln!("\x1b[31m{}\x1b[0m", msg); } else { eprintln!("{}", msg); }
                 logger.log(&msg);
                 std::process::exit(1);
             }

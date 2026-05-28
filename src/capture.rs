@@ -166,6 +166,15 @@ impl CaptureState {
         self.avtp_streams.retain(|_, s| {
             s.last_seen.elapsed().as_secs() < STREAM_PRUNE_SECS
         });
+        // Prune MSRP reservation state for stream IDs whose AVTP stream was
+        // just pruned — a gone stream has no active reservation to display.
+        self.msrp_state.retain(|sid, _| self.avtp_streams.contains_key(sid));
+        // Clear MVRP VLAN registrations when there are no active AVTP streams.
+        // MVRP is periodic — when AVB is active, the switch re-registers VLANs
+        // within a few seconds, so clearing here causes no lasting data loss.
+        if self.avtp_streams.is_empty() {
+            self.mvrp_vlans.clear();
+        }
         // Drop IGMP Join entries from hosts that vanished without sending a Leave.
         self.igmp_joins_seen.retain(|_, t| t.elapsed() < Duration::from_secs(IGMP_JOIN_DEDUP_TTL_SECS));
     }
@@ -584,8 +593,8 @@ fn ansi_color(level: &AlertLevel) -> Option<&'static str> {
 pub fn emit(alerts: &[Alert], logger: &mut Logger) {
     for a in alerts {
         match ansi_color(&a.level) {
-            Some(c) => println!("\x1b[{}m{}\x1b[0m", c, a.message),
-            None    => println!("{}", a.message),
+            Some(c) if crate::color_enabled() => println!("\x1b[{}m{}\x1b[0m", c, a.message),
+            _ => println!("{}", a.message),
         }
         logger.log(&a.message);
     }
