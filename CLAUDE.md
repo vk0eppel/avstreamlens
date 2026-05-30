@@ -189,7 +189,7 @@ See **[TODO.md](TODO.md)** for the full list. Quick summary:
 ### IGMP
 - Processed only when AES67, ST2110, or Dante is selected (IP multicast protocols); suppressed for NDI-only and AVB-only
 - `igmp_joins_seen` deduplicates Join prints per (src, group); Queries always printed
-- Querier absence penalizes health score only when active multicast streams exist (>130s silence = −10 pts)
+- Querier absence penalizes health score only when active multicast streams exist (−10 pts); "silent" threshold is interval-aware via `NetworkHealth::querier_silent_after_secs()` ≈ 2× the observed query interval (default 260s), per RFC 3376 "Other Querier Present Interval" — a fixed 130s left too little margin on a default 125s querier
 - `igmp_query_interval_secs` tracks detected interval between consecutive queries — shown in footer as `(interval Xs)`
 
 ### LLDP / EEE

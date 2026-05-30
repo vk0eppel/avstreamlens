@@ -388,6 +388,17 @@ impl NetworkHealth {
         }
     }
 
+    /// Seconds of querier silence after which the IGMP querier is considered gone.
+    /// Per RFC 3376 the "Other Querier Present Interval" is ≈ 2× the query interval
+    /// (Robustness 2 × QueryInterval + ½ QueryResponseInterval). We mirror that:
+    /// 2× the observed interval plus a small margin, falling back to 260 s (2× the
+    /// RFC default of 125 s + margin) until two queries have established the interval.
+    /// A fixed 130 s threshold left only ~5 s of headroom on a default 125 s querier,
+    /// so a single missed query produced a false "querier silent" alert.
+    pub fn querier_silent_after_secs(&self) -> u64 {
+        self.igmp_query_interval_secs.map(|i| i * 2 + 10).unwrap_or(260)
+    }
+
     pub fn calculate_score(
         &mut self,
         streams: &std::collections::HashMap<String, StreamStats>,
@@ -450,12 +461,14 @@ impl NetworkHealth {
 
         // ── IGMP / Snooping ───────────────────────────────────────────────────
         // Multicast snooping requires a live IGMP Querier. If multicast streams are
-        // active but no Query has been seen in >130 s (slightly above RFC 3376 default
-        // 125 s query interval), managed switches may start flooding multicast.
+        // active but no Query has been seen within the "other querier present" window
+        // (≈ 2× the query interval, see querier_silent_after_secs), managed switches
+        // may start flooding multicast.
         if has_active_multicast {
+            let silent_after = self.querier_silent_after_secs();
             match self.last_igmp_query {
                 None => score -= 10.0,
-                Some(t) if t.elapsed().as_secs() > 130 => score -= 10.0,
+                Some(t) if t.elapsed().as_secs() > silent_after => score -= 10.0,
                 _ => {}
             }
         }

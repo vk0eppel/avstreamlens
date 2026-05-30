@@ -96,6 +96,14 @@ Items to check next time connected to a functional network of each type. Results
 
 - **PTPv2 class 7 (free-running) in practice** — `ptp_class_str(7)` is labelled "Primary reference — free-running". Verify whether a real device that has lost its GPS/GNSS lock actually advertises class 7, or whether it falls back to class 135 (holdover) first. Affects how the clock quality string reads during a reference failure.
 
+### IGMP / Multicast Snooping
+
+- **Querier detection with the Router Alert option (IHL=6)** — ✅ CONFIRMED (2026-05-30). Verified against a live Luminex IGMPv3 querier (`10.244.70.241` → `224.0.0.1`, ~125 s General-Query interval, `length 36`, `options (RA)`). Real IGMP queries carry the IP Router Alert option, so the IP header is 24 bytes (IHL=6) and the IGMP type byte sits at offset 24, not 20. `detect_protocol` reads it correctly (pnet's `Ipv4Packet::payload()` respects IHL); the report showed `IGMP: ✓ querier 88s ago (interval 125s)`. A regression test now pins this path — `igmpv3_query_with_router_alert_option_detected` in `src/parser.rs` (all other IGMP fixtures only build IHL=5). The initial "no querier seen" was a true statement about a single 5 s window, not a bug — the next query simply hadn't arrived yet.
+
+- **"Querier silent" threshold margin** — ✅ ADDRESSED (2026-05-30). The old fixed 130 s threshold left only ~5 s of headroom on a default 125 s querier, so a single missed query produced a false `⚠ querier silent`. Replaced with an interval-aware threshold (`NetworkHealth::querier_silent_after_secs()` ≈ 2× observed interval, default 260 s) matching RFC 3376's "Other Querier Present Interval". (`src/stats.rs`, `src/report.rs`)
+
+- **Snooping prunes multicast on a non-mirror port** — observed (2026-05-30). On the Luminex (IGMP-snooping) network, a standard non-mirror port received only always-flooded link-local multicast (mDNS) — Dante audio (`239.255.x.x`) and PTP (`224.0.1.x`) were pruned away because the passive monitor never sends IGMP joins. The no-SPAN diagnostic in `src/report.rs:103-106` says "unicast flows need a SPAN/mirror port", but here *multicast* (PTP, Dante audio, AES67/ST2110) is also pruned. Consider broadening the diagnostic wording to mention snooped multicast, or note that a SPAN/mrouter port (or disabling snooping) is needed even for multicast on snooping networks. (`src/report.rs` — `print_discovery` no-SPAN diagnostic)
+
 ---
 
 ## Platform Limitations (documented, tracked here for awareness)

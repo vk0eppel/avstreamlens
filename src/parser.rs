@@ -512,4 +512,40 @@ mod tests {
         let eth = EthernetPacket::new(&frame).unwrap();
         assert!(matches!(detect_protocol(&eth), Some(AvProtocol::St2110 { .. })));
     }
+
+    // ── IGMP query with the IP Router Alert option (IHL=6) ───────────────────
+
+    #[test]
+    fn igmpv3_query_with_router_alert_option_detected() {
+        // Real IGMP queries carry the IP Router Alert option (RFC 2113), making the
+        // IP header 24 bytes (IHL=6), not 20 — so the IGMP type byte sits at offset
+        // 24, not 20. This is the exact on-wire shape verified against a live Luminex
+        // IGMPv3 querier (2026-05-30: 10.244.70.241 → 224.0.0.1, length 36, options RA).
+        // The other IGMP fixtures only build IHL=5 headers, so this pins the real path.
+        let mut ip = vec![0u8; 24 + 12];
+        ip[0] = 0x46; // v4, IHL=6 (24-byte header with one 4-byte option)
+        let total: u16 = (24 + 12) as u16;
+        ip[2..4].copy_from_slice(&total.to_be_bytes());
+        ip[8] = 1; // TTL=1 (link-local query)
+        ip[9] = 0x02; // proto IGMP
+        ip[12..16].copy_from_slice(&[10, 244, 70, 241]); // querier src
+        ip[16..20].copy_from_slice(&[224, 0, 0, 1]); // all-hosts (general query)
+        ip[20..24].copy_from_slice(&[0x94, 0x04, 0x00, 0x00]); // IP Router Alert option
+        ip[24] = 0x11; // IGMP Membership Query type
+
+        let frame = eth_frame(&[0x08, 0x00], &[], &ip);
+        let eth = EthernetPacket::new(&frame).unwrap();
+        let proto = detect_protocol(&eth);
+        assert!(
+            matches!(
+                proto,
+                Some(AvProtocol::Igmp { igmp_type: crate::protocols::IgmpType::Query, .. })
+            ),
+            "IGMPv3 query with Router Alert (IHL=6) must be detected as a Query"
+        );
+        if let Some(AvProtocol::Igmp { group, src, .. }) = proto {
+            assert_eq!(group, Ipv4Addr::new(224, 0, 0, 1));
+            assert_eq!(src, Ipv4Addr::new(10, 244, 70, 241));
+        }
+    }
 }

@@ -645,7 +645,7 @@ pub fn print_report(
         None => "IGMP: – (no querier seen)".to_string(),
         Some(t) => {
             let secs = t.elapsed().as_secs();
-            if secs > 130 {
+            if secs > health.querier_silent_after_secs() {
                 // Querier is silent — suppress the stale (interval) from previous queries.
                 format!("IGMP: ⚠ querier silent {}s", secs)
             } else {
