@@ -27,7 +27,7 @@
 cargo build --release   # build
 cargo fmt               # format
 cargo clippy -- -D warnings  # lint
-cargo test              # run all 93 unit tests
+cargo test              # run all 114 unit tests
 ```
 
 ## Open Work
@@ -45,7 +45,7 @@ See **[TODO.md](TODO.md)** for the full list. Quick summary:
 ## Architecture
 
 ### General
-- **Test harness**: 93 unit tests in `#[cfg(test)]` modules across `parser.rs` + `parser/{sdp,ptp,avb,lldp,mdns,flow_control}.rs`, `stats.rs`, and `capture.rs` — run with `cargo test`. Each parser submodule keeps its own fixtures and tests. `capture.rs` tests exercise handlers with hand-built IP/UDP/RTP byte buffers (see `ip_udp_rtp()` helper); no pcap dependency in tests
+- **Test harness**: 114 unit tests in `#[cfg(test)]` modules across `parser.rs` + `parser/{sdp,ptp,avb,lldp,mdns,flow_control}.rs`, `stats.rs`, and `capture.rs` — run with `cargo test`. Each parser submodule keeps its own fixtures and tests. `capture.rs` tests exercise handlers with hand-built IP/UDP/RTP byte buffers (see `ip_udp_rtp()` helper); no pcap dependency in tests
 - Logging: timestamped `.log` files written on every run in the working directory; `Logger::log()` flushes after every write so the last report survives SIGINT
 - Bitrate computed as `byte_delta / elapsed_secs` — never assumed 1s exactly
 - All modules follow the same pattern: parse → stats → report
@@ -155,7 +155,7 @@ See **[TODO.md](TODO.md)** for the full list. Quick summary:
 ### AVB
 - **Transport**: L2 Ethernet — AVTP (0x22F0), MSRP (0x22EA), MVRP (0x88F5), gPTP (0x88F7)
 - **AVTP**: `avtp_streams: HashMap<[u8;8], AvtpStreamStats>` per stream_id (sv=1, bytes 4–11); subtype decoded via `avtp_subtype_name()` (0x00=IEC 61883, 0x02=CRF, 0x7E=MAAP…); sequence loss via `AvtpStreamStats::update_seq()` on byte 2 counter (8-bit wrap-safe, signed-i8 reorder filter mirrors the RTP fix); bitrate from Ethernet frame sizes
-- **MSRP**: `parse_msrp()` extracts TalkerAdvertise (bandwidth, VLAN, priority), TalkerFailed (failure code), Listener state; `msrp_state: HashMap<[u8;8], MsrpDeclaration>`; TalkerFailed alert immediate with code (1=bandwidth, 2=bridge resources, 3=traffic class)
+- **MSRP**: `parse_msrp()` extracts TalkerAdvertise (bandwidth, VLAN, priority), TalkerFailed (failure code at `first_value[33]`), Listener state; `msrp_state: HashMap<[u8;8], MsrpDeclaration>`; TalkerFailed alert immediate, decoded via `protocols::msrp_failure_reason()` over the full 802.1Qat Table 35-6 set (1–19, e.g. 8 = egress port not AVB-capable) with a numeric fallback — always shows `(code N: reason)`
 - **MVRP**: `parse_mvrp()` extracts VLAN IDs; `mvrp_vlans: HashSet<u16>` — presence confirms L2 VLAN QoS; alert if AVTP active but no MVRP
 - `avtp_streams` pruned per cycle; `msrp_state` pruned to match surviving `avtp_streams` entries; `mvrp_vlans` cleared when `avtp_streams` is empty (MVRP is periodic — the switch re-registers within seconds when AVB resumes)
 
