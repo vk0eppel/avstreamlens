@@ -74,14 +74,15 @@ fn discovered_line(label: &str, total: usize, mut names: Vec<&str>) -> String {
 /// plus a no-SPAN diagnostic when devices are announced but no flows of that type
 /// are active (the usual fingerprint of unicast flows on a non-mirrored port).
 fn print_discovery(
-    dante_names: &HashMap<std::net::Ipv4Addr, String>,
-    ndi_sources: &std::collections::HashSet<std::net::Ipv4Addr>,
-    ndi_names: &HashMap<std::net::Ipv4Addr, String>,
+    dante_sources: &std::collections::HashSet<std::net::Ipv4Addr>,
+    dante_names:   &HashMap<std::net::Ipv4Addr, String>,
+    ndi_sources:   &std::collections::HashSet<std::net::Ipv4Addr>,
+    ndi_names:     &HashMap<std::net::Ipv4Addr, String>,
     dante_active: usize,
     ndi_active: usize,
     logger: &mut Logger,
 ) {
-    let dante_count = dante_names.len();
+    let dante_count = dante_sources.len();
     let ndi_count   = ndi_sources.len();
     if dante_count == 0 && ndi_count == 0 { return; }
 
@@ -128,6 +129,7 @@ pub fn print_report(
     msrp_state: &HashMap<[u8; 8], MsrpDeclaration>,
     mvrp_vlans: &std::collections::HashSet<u16>,
     eee_ports: &std::collections::HashMap<(String, String), (u16, u16)>,
+    dante_sources: &std::collections::HashSet<std::net::Ipv4Addr>,
     dante_names: &HashMap<std::net::Ipv4Addr, String>,
     ndi_sources: &std::collections::HashSet<std::net::Ipv4Addr>,
     ndi_names: &HashMap<std::net::Ipv4Addr, String>,
@@ -508,7 +510,7 @@ pub fn print_report(
     // (non-SPAN) switch port where the actual unicast audio/video never arrives.
     let dante_active = streams.values().filter(|s| s.protocol == "Dante").count();
     let ndi_active   = streams.values().filter(|s| s.protocol == "NDI").count();
-    print_discovery(dante_names, ndi_sources, ndi_names, dante_active, ndi_active, logger);
+    print_discovery(dante_sources, dante_names, ndi_sources, ndi_names, dante_active, ndi_active, logger);
 
     // ── PTP / Clock Sources ─────────────────────────────────────────────────
     if !ptp_domains.is_empty() {

@@ -122,19 +122,15 @@ fn parse_ptp_v1(payload: &[u8], hdr_shift: usize) -> Option<PtpInfo> {
             );
             let stratum = payload[61];
             let raw_ident = &payload[62..66];
-            let ident = if raw_ident.iter().all(|&b| b == 0) {
-                String::new()
-            } else if let Ok(s) = std::str::from_utf8(raw_ident) {
+            let ident = if let Ok(s) = std::str::from_utf8(raw_ident) {
                 let s = s.trim_end_matches('\0').trim();
-                if s.chars().all(|c| c.is_ascii_graphic() || c == ' ') {
+                if !s.is_empty() && s.chars().all(|c| c.is_ascii_graphic() || c == ' ') {
                     s.to_string()
                 } else {
-                    format!("{:02x}:{:02x}:{:02x}:{:02x}",
-                        raw_ident[0], raw_ident[1], raw_ident[2], raw_ident[3])
+                    String::new()
                 }
             } else {
-                format!("{:02x}:{:02x}:{:02x}:{:02x}",
-                    raw_ident[0], raw_ident[1], raw_ident[2], raw_ident[3])
+                String::new()
             };
             let class_str = match stratum {
                 0 => "Preferred grandmaster".to_string(),
@@ -416,19 +412,31 @@ mod tests {
     }
 
     #[test]
-    fn ptpv1_binary_ident_shows_hex_not_question_marks() {
-        // Dante sends non-ASCII bytes in gmClockIdentifier (e.g. link-local IP 169.254.x.x).
-        // Bytes 0xa9/0xfe are invalid UTF-8; must render as hex, not "????".
+    fn ptpv1_non_ascii_ident_suppressed() {
+        // Dante's gmClockIdentifier bytes are non-ASCII proprietary values (confirmed
+        // field data 2026-05-30). Any ident that isn't all printable ASCII is suppressed.
         let p = ptpv1_nibble_sync(
             [0x00, 0x00, 0x00, 0x01, 0x00, 0x1d],
             0,
-            &[0xa9, 0xfe, 0x68, 0x56], // 169.254.104.86 in binary
+            &[0xa9, 0xfe, 0x68, 0x56], // invalid UTF-8 (0xa9 is a continuation byte)
         );
-        let info = parse_ptp(&p).unwrap();
-        let q = info.clock_quality.unwrap();
+        let q = parse_ptp(&p).unwrap().clock_quality.unwrap();
         assert!(!q.contains("????"), "should not contain ????, got: {}", q);
-        assert!(q.contains("a9:fe:68:56"), "should contain hex ident, got: {}", q);
-        assert!(q.contains("Preferred grandmaster"), "should label stratum 0, got: {}", q);
+        assert!(!q.contains(':'), "should not contain hex bytes, got: {}", q);
+        assert_eq!(q, "Preferred grandmaster", "non-ASCII ident should be suppressed, got: {}", q);
+    }
+
+    #[test]
+    fn ptpv1_high_byte_ident_suppressed() {
+        // Audinate-proprietary ident bytes (all non-null ≥ 0x80) should be silently
+        // suppressed — they carry no meaning for an AV engineer (not GPS/ATOM/etc.).
+        let p = ptpv1_nibble_sync(
+            [0x00, 0x00, 0x00, 0x01, 0x00, 0x1d],
+            0,
+            &[0xcd, 0x9f, 0x00, 0x00], // real bytes seen on Dante network 2026-05-30
+        );
+        let q = parse_ptp(&p).unwrap().clock_quality.unwrap();
+        assert_eq!(q, "Preferred grandmaster", "high-byte ident should be suppressed, got: {}", q);
     }
 
     #[test]

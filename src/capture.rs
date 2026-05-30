@@ -95,6 +95,8 @@ pub struct CaptureState {
     // NDI sender IPs learned from mDNS — used for IP-based stream detection.
     pub ndi_sources:    HashSet<Ipv4Addr>,
     pub ndi_names:      HashMap<Ipv4Addr, String>,
+    // Dante sender IPs learned from mDNS — tracked regardless of whether a name is known.
+    pub dante_sources:  HashSet<Ipv4Addr>,
     pub dante_names:    HashMap<Ipv4Addr, String>,
     // Deduplicates IGMP Join console output — cleared on Leave so re-joins print again.
     pub igmp_joins_seen: HashMap<(Ipv4Addr, Ipv4Addr), Instant>,
@@ -127,6 +129,7 @@ impl CaptureState {
             network_health: NetworkHealth::new(),
             ndi_sources: HashSet::new(),
             ndi_names: HashMap::new(),
+            dante_sources: HashSet::new(),
             dante_names: HashMap::new(),
             igmp_joins_seen: HashMap::new(),
             avtp_streams: HashMap::new(),
@@ -219,24 +222,26 @@ impl CaptureState {
 
     /// PTP: update the (domain, version) entry, return Detected/Changed alert if any.
     pub fn handle_ptp(&mut self, info: PtpInfo) -> Vec<Alert> {
-        let kind = info.protocol_kind.clone();
-        let stats = self.ptp_domains
+        let kind   = info.protocol_kind.clone();
+        let src_ip = info.src_ip;
+        let stats  = self.ptp_domains
             .entry((info.domain, info.version))
             .or_insert_with(|| PtpStats::new(info.domain, info.version));
-        let event = stats.update(&info, &kind);
+        let event  = stats.update(&info, &kind);
+        let ip_str = src_ip.map(|ip| format!("  ({})", ip)).unwrap_or_default();
         match event {
             Some(PtpEvent::GrandmasterDetected) => {
                 let gm = stats.last_grandmaster.as_deref().unwrap_or("?");
                 vec![Alert::good(format!(
-                    "✓  GRANDMASTER DETECTED (Domain {} v{}): {}",
-                    stats.domain, stats.version, gm
+                    "✓  GRANDMASTER DETECTED (Domain {} v{}): {}{}",
+                    stats.domain, stats.version, gm, ip_str
                 ))]
             }
             Some(PtpEvent::GrandmasterChanged { from }) => {
                 let gm = stats.last_grandmaster.as_deref().unwrap_or("?");
                 vec![Alert::warn(format!(
-                    "⚠️  GRANDMASTER CHANGED (Domain {} v{}): {} → {}",
-                    stats.domain, stats.version, from, gm
+                    "⚠️  GRANDMASTER CHANGED (Domain {} v{}): {} → {}{}",
+                    stats.domain, stats.version, from, gm, ip_str
                 ))]
             }
             // update() never emits ClockLost — only check_timeout() does.
@@ -337,11 +342,17 @@ impl CaptureState {
     pub fn handle_dante(&mut self, kind: DanteKind, src: Ipv4Addr, dst: Ipv4Addr, dst_port: u16, l2_payload: &[u8]) -> Vec<Alert> {
         match kind {
             DanteKind::Discovery { device_name } => {
+                let is_new = !self.dante_sources.contains(&src);
+                self.dante_sources.insert(src);
                 if let Some(ref name) = device_name {
                     self.dante_names.insert(src, name.clone());
                 }
-                let label = device_name.as_deref().unwrap_or("unknown device");
-                vec![Alert::info(format!("🔍 Dante discovered: {}  \"{}\"", src, label))]
+                if is_new {
+                    let label = device_name.as_deref().unwrap_or("unknown device");
+                    vec![Alert::info(format!("🔍 Dante discovered: {}  \"{}\"", src, label))]
+                } else {
+                    vec![]
+                }
             }
             DanteKind::Control => vec![],
             DanteKind::AudioStream => {
@@ -878,7 +889,42 @@ mod tests {
         assert_eq!(alerts.len(), 1);
         assert_eq!(alerts[0].level, AlertLevel::Info);
         assert!(alerts[0].message.contains("Stage Box"));
+        assert!(state.dante_sources.contains(&src));
         assert_eq!(state.dante_names.get(&src).map(|s| s.as_str()), Some("Stage Box"));
+    }
+
+    #[test]
+    fn dante_discovery_unknown_name_populates_sources() {
+        // When name extraction fails (device_name: None), the IP must still be tracked in
+        // dante_sources so the periodic 📇 section shows the correct device count.
+        let mut state = CaptureState::new();
+        let src = Ipv4Addr::new(169, 254, 133, 58);
+        let alerts = state.handle_dante(
+            DanteKind::Discovery { device_name: None },
+            src, Ipv4Addr::new(224,0,0,251), 0, &[],
+        );
+        assert_eq!(alerts.len(), 1);
+        assert!(alerts[0].message.contains("unknown device"));
+        assert!(state.dante_sources.contains(&src));
+        assert!(!state.dante_names.contains_key(&src), "dante_names should stay empty for unknown device");
+    }
+
+    #[test]
+    fn dante_discovery_deduplicates_alert() {
+        // Repeated mDNS packets from the same IP must emit the alert exactly once.
+        let mut state = CaptureState::new();
+        let src = Ipv4Addr::new(169, 254, 133, 58);
+        let first = state.handle_dante(
+            DanteKind::Discovery { device_name: None },
+            src, Ipv4Addr::new(224,0,0,251), 0, &[],
+        );
+        let second = state.handle_dante(
+            DanteKind::Discovery { device_name: None },
+            src, Ipv4Addr::new(224,0,0,251), 0, &[],
+        );
+        assert_eq!(first.len(), 1, "first discovery should emit alert");
+        assert_eq!(second.len(), 0, "duplicate discovery should emit no alert");
+        assert_eq!(state.dante_sources.len(), 1);
     }
 
     // ── NDI ──────────────────────────────────────────────────────────────────
