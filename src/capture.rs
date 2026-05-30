@@ -1252,6 +1252,29 @@ mod tests {
     }
 
     #[test]
+    fn ptp_grandmaster_src_ip_is_the_gm_not_a_follower() {
+        // The GM IP must come from the message carrying the grandmaster (Sync/Announce),
+        // so a follower's Delay_Req can't make us attribute (and mDNS-name) the wrong
+        // device. last_src_ip still follows any sender.
+        let gm_ip = Ipv4Addr::new(169, 254, 104, 86);
+        let follower_ip = Ipv4Addr::new(169, 254, 1, 2);
+        let mut s = PtpStats::new(0, PTP_VERSION_V2);
+        let kind = Some("PTPv1".to_string());
+
+        let mut gm_sync = ptp_msg(0x00, Some("00:00:00:01:00:1d"));
+        gm_sync.grandmaster_id = Some("00:00:00:01:00:1d".to_string());
+        gm_sync.src_ip = Some(gm_ip);
+        s.update(&gm_sync, &kind);
+        assert_eq!(s.grandmaster_src_ip, Some(gm_ip));
+
+        let mut follower = ptp_msg(0x01, Some("00:1d:c1:8e:b1:75"));
+        follower.src_ip = Some(follower_ip);
+        s.update(&follower, &kind);
+        assert_eq!(s.last_src_ip, Some(follower_ip), "last_src_ip follows any sender");
+        assert_eq!(s.grandmaster_src_ip, Some(gm_ip), "grandmaster IP stays the GM");
+    }
+
+    #[test]
     fn ptp_path_delay_min_max_track_observed_range() {
         let mut state = CaptureState::new();
         state.handle_ptp(delay_resp(0, 500));

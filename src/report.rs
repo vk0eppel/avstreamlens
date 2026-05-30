@@ -18,7 +18,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use crate::stats::{StreamStats, TcpStreamStats, PtpStats, NetworkHealth, StreamQuality, AvtpStreamStats};
-use crate::protocols::{STREAM_TIMEOUT_SECS, MsrpDeclaration, MsrpDeclType, avtp_subtype_name, msrp_failure_reason};
+use crate::protocols::{STREAM_TIMEOUT_SECS, MsrpDeclaration, MsrpDeclType, PTP_VERSION_V1, avtp_subtype_name, msrp_failure_reason};
 use crate::capture::{MissingClock, MissingClockKind};
 
 /// Logger for writing timestamped messages to both file and console.
@@ -537,10 +537,22 @@ pub fn print_report(
 
             let clock_line = match (&stats.last_grandmaster, stats.clock_valid) {
                 (Some(gm), true) => {
-                    let ip_str = stats.last_src_ip
-                        .map(|ip| format!("  ({})", ip))
-                        .unwrap_or_default();
-                    format!("  {}  {}{}  —  grandmaster {}{}", gm_icon, proto_label, domain_suffix, gm, ip_str)
+                    // Use the grandmaster's own IP (not the last sender in the domain).
+                    let gm_ip = stats.grandmaster_src_ip.or(stats.last_src_ip);
+                    let ip_str = gm_ip.map(|ip| format!("  ({})", ip)).unwrap_or_default();
+                    // Identify the grandmaster the way an operator thinks about it:
+                    //  1. a discovered Dante device name (from mDNS) if we have one;
+                    //  2. else for PTPv1 (Dante) drop the gmClockUuid — it is a firmware
+                    //     constant (00:00:00:01:00:1d), identical on every device, so the
+                    //     IP is the only real discriminator;
+                    //  3. else (PTPv2 / gPTP) keep the EUI-64 — it really identifies the GM.
+                    let name = gm_ip.and_then(|ip| dante_names.get(&ip));
+                    let id_part = match (name, stats.version) {
+                        (Some(n), _)           => format!("  grandmaster \"{}\"", n),
+                        (None, PTP_VERSION_V1) => "  grandmaster".to_string(),
+                        (None, _)              => format!("  grandmaster {}", gm),
+                    };
+                    format!("  {}  {}{}  —{}{}", gm_icon, proto_label, domain_suffix, id_part, ip_str)
                 }
                 (Some(_), false) => {
                     format!("  {}  {}{}  —  clock lost", gm_icon, proto_label, domain_suffix)

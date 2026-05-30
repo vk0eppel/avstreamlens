@@ -225,8 +225,8 @@ Choose the protocols to monitor:
 🕐 Clock Sources:
   ✓  PTPv2  —  grandmaster 00:1a:e5:ff:fe:78:9a:bc  (192.168.1.1)
     clock quality: Primary reference — locked  < 100 ns
-  ✓  PTPv1  —  grandmaster 00:1a:e5:ff:fe:12:34:56
-    clock quality: Primary reference  GPS
+  ✓  PTPv1  —  grandmaster "Stage Box"  (169.254.10.20)
+    clock quality: Preferred grandmaster
   ✓  AVB  —  grandmaster 00:1a:e5:ff:fe:ab:cd:ef
 
 🔬 Network Health — 97%:

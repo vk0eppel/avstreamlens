@@ -124,7 +124,13 @@ fn parse_ptp_v1(payload: &[u8], hdr_shift: usize) -> Option<PtpInfo> {
             let raw_ident = &payload[62..66];
             let ident = if let Ok(s) = std::str::from_utf8(raw_ident) {
                 let s = s.trim_end_matches('\0').trim();
-                if !s.is_empty() && s.chars().all(|c| c.is_ascii_graphic() || c == ' ') {
+                // Only treat the gmClockIdentifier as a real clock-source code
+                // (GPS, ATOM, NTP, DFLT, HAND, INIT…) when it looks like one: at
+                // least 2 ASCII alphanumeric characters. Dante leaves junk in these
+                // bytes — a lone printable byte like "@" (0x40) is graphic but not an
+                // identifier, and it varies frame-to-frame. The old graphic-char test
+                // let it through as "Preferred grandmaster  @".
+                if s.len() >= 2 && s.chars().all(|c| c.is_ascii_alphanumeric()) {
                     s.to_string()
                 } else {
                     String::new()
@@ -437,6 +443,21 @@ mod tests {
         );
         let q = parse_ptp(&p).unwrap().clock_quality.unwrap();
         assert_eq!(q, "Preferred grandmaster", "high-byte ident should be suppressed, got: {}", q);
+    }
+
+    #[test]
+    fn ptpv1_lone_printable_junk_ident_suppressed() {
+        // Dante intermittently leaves a single printable byte (e.g. "@" = 0x40) in the
+        // gmClockIdentifier — printable but not a real clock-source code, and it varies
+        // frame-to-frame (observed 2026-05-30 as "Preferred grandmaster  @"). Anything
+        // shorter than 2 chars or containing non-alphanumerics must be suppressed.
+        let p = ptpv1_nibble_sync(
+            [0x00, 0x00, 0x00, 0x01, 0x00, 0x1d],
+            0,
+            &[0x40, 0x00, 0x00, 0x00], // "@" then padding
+        );
+        let q = parse_ptp(&p).unwrap().clock_quality.unwrap();
+        assert_eq!(q, "Preferred grandmaster", "lone '@' ident must be suppressed, got: {}", q);
     }
 
     #[test]

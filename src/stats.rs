@@ -531,7 +531,8 @@ pub struct PtpStats {
     pub protocol_grandmaster_detected: bool,         // Was grandmaster detected for this protocol
     pub protocol_clock_lost:           bool,          // Was clock lost for this protocol
     pub protocol_changes_count:        u64,           // Grandmaster changes for this protocol
-    pub last_src_ip:                   Option<std::net::Ipv4Addr>, // Source IP of last PTP packet
+    pub last_src_ip:                   Option<std::net::Ipv4Addr>, // Source IP of last PTP packet (any sender in the domain)
+    pub grandmaster_src_ip:            Option<std::net::Ipv4Addr>, // Source IP of the message that carried the grandmaster (Sync v1 / Announce v2) — the GM itself, not a follower
     pub last_clock_id:                 Option<String>,             // Source EUI-64 from most recent PTP message
     pub seen_sync:                     bool,                       // A real Sync (msgType 0x00) has arrived — distinguishes a clock from a Pdelay-only endpoint
 }
@@ -566,6 +567,7 @@ impl PtpStats {
             protocol_clock_lost: false,
             protocol_changes_count: 0,
             last_src_ip: None,
+            grandmaster_src_ip: None,
             last_clock_id: None,
             seen_sync: false,
         }
@@ -608,6 +610,10 @@ impl PtpStats {
                 }
             }
             self.clock_valid = true;
+            // This message carried the grandmaster (Sync v1 / Announce v2), so its
+            // source IP is the grandmaster itself — capture it here so a follower's
+            // Delay_Req can't overwrite the IP we attribute to the GM.
+            if let Some(ip) = info.src_ip { self.grandmaster_src_ip = Some(ip); }
             // Clock is back — clear the "lost" sticky flag so the report stops
             // showing the stale "grandmaster disappeared" alert after recovery.
             self.protocol_clock_lost = false;
