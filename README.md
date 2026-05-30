@@ -105,12 +105,14 @@ AVStreamLens is a **passive capture tool** — it reads traffic delivered to its
 |---|---|
 | **AES67** | UDP multicast (239.69.*) — delivered to every port |
 | **SMPTE ST 2110** | UDP multicast (239.x.x.x) — delivered to every port |
-| **AVB** (gPTP, MSRP, MVRP, AVTP) | L2 multicast MAC addresses — delivered to every port |
+| **AVB — AVTP stream data** | MAAP-allocated multicast MACs — forwarded like normal multicast |
 | **PTP, IGMP, SAP** | Multicast — delivered to every port |
 | **Dante / NDI discovery** | mDNS multicast — delivered to every port |
 | **Dante PTPv1 clock** | Multicast — delivered to every port |
 
-For AES67, ST 2110, and AVB installations you can simply plug into any port on the switch and get full visibility.
+> **AVB gPTP / MSRP / MVRP are NOT delivered to every port.** They use link-local reserved MACs (`01:80:C2:00:00:0E`, `…:21`) in the IEEE range that bridges must **not** forward — they are hop-by-hop, so you only ever see the copy on your own link, not a remote grandmaster. See *Monitoring gPTP / the AVB grandmaster* below.
+
+For AES67 and ST 2110 you can plug into any port on the switch and get full visibility. For AVB you will see **stream data** and your own link's MSRP/gPTP, but the **grandmaster and time domain are only visible on a time-aware (AVB-enabled) port** — see below.
 
 ### When you need a SPAN port
 
@@ -139,6 +141,20 @@ How to configure a SPAN session depends on the switch vendor:
 1. Connect the capture machine to a spare port on the managed switch.
 2. Configure a SPAN session that mirrors the uplink port (or the entire AV VLAN) to that port.
 3. Run AVStreamLens — it will now see all unicast and multicast flows on the mirrored segment.
+
+### Monitoring gPTP / the AVB grandmaster
+
+AVB's clock protocol, **gPTP (IEEE 802.1AS)**, behaves differently from every other protocol here, and it surprises people: **you cannot see the grandmaster from an arbitrary port.**
+
+gPTP frames use the link-local destination MAC `01:80:C2:00:00:0E`, which lives in the reserved `01:80:C2:00:00:00`–`0F` range that bridges are **required not to forward**. gPTP is *hop-by-hop*: each time-aware switch consumes the grandmaster's Sync/Announce on its upstream port and **regenerates its own** Sync/Announce on each downstream port. So the grandmaster's actual Announce never travels more than one link — you only ever see the gPTP of your **direct link partner**.
+
+This is the opposite of AES67/Dante/ST 2110 PTP, which is ordinary **IP** multicast and floods the whole VLAN (so those grandmasters show up from any port).
+
+**Consequences for monitoring:**
+
+- If your capture port is **not** an AVB-enabled (time-aware) port, you will see at most the directly-attached device's `P_Delay_Req` traffic — **no Sync, no Announce, no grandmaster.** AVStreamLens reports this as `peer-delay requests only — link partner may not be gPTP-capable` and adds `ℹ gPTP is link-local — the grandmaster is only visible on a time-aware (AVB-enabled) port`.
+- To actually observe the grandmaster's Announce, capture on (or SPAN-mirror) a **time-aware, AVB-enabled** link — ideally the link directly between the grandmaster device and its first switch. A mirror of a non-AVB port will **not** show it, because the frames were never forwarded there in the first place.
+- The same link-local rule applies to **MSRP** (`01:80:C2:00:00:0E`) and **MVRP** (`…:21`): you see your own link's declarations, not a network-wide view. AVB **stream data (AVTP)** uses normal forwardable multicast and is not subject to this limitation.
 
 ### Trunk port vs access port
 

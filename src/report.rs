@@ -563,6 +563,21 @@ pub fn print_report(
             logger.log(&clock_line);
             println!("{}", clock_line);
 
+            // gPTP is link-local (dest MAC 01:80:C2:00:00:0E) and never forwarded by
+            // bridges — so the grandmaster's Announce is only visible on a time-aware
+            // (AVB-enabled) port. When all we see on this port is P_Delay_Req from an
+            // AVB node (no Sync, no grandmaster), tell the operator where to look
+            // instead of leaving them to wonder why the configured GM is absent.
+            if stats.protocol_kind.as_deref() == Some("AVB")
+                && stats.last_grandmaster.is_none()
+                && !stats.seen_sync
+                && stats.last_clock_id.is_some()
+            {
+                let hint = "    ℹ  gPTP is link-local — the grandmaster is only visible on a time-aware (AVB-enabled) port";
+                logger.log(hint);
+                println!("{}", hint);
+            }
+
             if let Some(ref q) = stats.last_quality {
                 let quality_line = format!("    clock quality: {}", q);
                 logger.log(&quality_line);
