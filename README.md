@@ -93,26 +93,33 @@ Protocol names are case-insensitive. The interactive-mode numbers (0–7) are al
 
 ---
 
-## Capture Setup — Switch Port and Unicast Visibility
+## Capture Setup — Choosing the Right Switch Port
 
-### Why a SPAN port is required for full visibility
+What AVStreamLens can see depends entirely on which switch port you connect to. The right choice depends on which protocols you are monitoring.
 
-AVStreamLens is a **passive capture tool** — it reads traffic delivered to its network interface. On a switched network this matters: a switch forwards unicast frames only to the destination port, not to every port on the switch. Promiscuous mode does not change this — it lets the NIC accept frames addressed to other MAC addresses, but only frames the switch has already forwarded to that port.
+### What any port gives you (no SPAN needed)
 
-**Consequence for Dante and other unicast AV protocols:**
-Dante audio is unicast by default. If a flow runs between two devices that are NOT the capture machine, the switch delivers those packets only to those two ports. The capture machine never sees them — regardless of promiscuous mode or what tool you use.
+AVStreamLens is a **passive capture tool** — it reads traffic delivered to its network interface. Multicast and L2 broadcast traffic is delivered to every port on the switch, so the following is visible from any access port, trunk port, or SPAN port:
 
-You will see:
-- Multicast traffic (mDNS discovery, Dante device status, AES67 / ST 2110 streams, IGMP, PTP)
-- Any unicast traffic where the capture machine is the source or destination
-- Broadcast (ARP, DHCP)
+| Protocol | Why visible without SPAN |
+|---|---|
+| **AES67** | UDP multicast (239.69.*) — delivered to every port |
+| **SMPTE ST 2110** | UDP multicast (239.x.x.x) — delivered to every port |
+| **AVB** (gPTP, MSRP, MVRP, AVTP) | L2 multicast MAC addresses — delivered to every port |
+| **PTP, IGMP, SAP** | Multicast — delivered to every port |
+| **Dante / NDI discovery** | mDNS multicast — delivered to every port |
+| **Dante PTPv1 clock** | Multicast — delivered to every port |
 
-You will **not** see:
-- Unicast Dante audio flows between two other devices
-- Unicast NDI flows between two other devices
-- Any other unicast traffic not destined for your port
+For AES67, ST 2110, and AVB installations you can simply plug into any port on the switch and get full visibility.
 
-**The solution is a SPAN / mirror port.** A SPAN session (also called port mirroring) instructs the switch to copy all traffic from one or more source ports — or an entire VLAN — to a dedicated monitor port. Connect the capture machine to that monitor port and it receives a copy of all mirrored traffic, including unicast flows between other devices.
+### When you need a SPAN port
+
+A switch forwards **unicast** frames only to the destination port. Promiscuous mode does not change this — it lets the NIC accept frames addressed to other MAC addresses, but only frames the switch has already forwarded to that port.
+
+SPAN is required when you need to see **unicast flows between two other devices**:
+
+- **Dante audio** — Dante subscriptions are unicast by default. If a flow runs between two devices that are not the capture machine, the switch delivers those packets only to those two ports. A SPAN session mirroring those ports (or the whole VLAN) is the only way to see them.
+- **NDI streams** — NDI uses TCP (unicast). Same constraint as Dante audio.
 
 How to configure a SPAN session depends on the switch vendor:
 
@@ -126,26 +133,24 @@ How to configure a SPAN session depends on the switch vendor:
 | Netgear ProSafe | **Switching → Port Mirroring** in the web UI |
 | Unmanaged switch | No SPAN capability — use a **network tap** or replace with a managed switch |
 
-**Typical SPAN setup for an AV network:**
+**Typical SPAN setup for a Dante or NDI network:**
 1. Connect the capture machine to a spare port on the managed switch.
 2. Configure a SPAN session that mirrors the uplink port (or the entire AV VLAN) to that port.
-3. Run AVStreamLens on the capture machine — it will now see all unicast and multicast flows on the mirrored segment.
+3. Run AVStreamLens — it will now see all unicast and multicast flows on the mirrored segment.
 
----
+### Trunk port vs access port
 
-### Monitoring one or multiple VLANs
+A trunk port carries multiple VLANs tagged with 802.1Q. It does **not** affect unicast forwarding — a trunk port gives the same unicast visibility as an access port. The difference is VLAN scope, not traffic coverage.
 
 AVStreamLens has no per-VLAN configuration: it parses any VLAN delivered to the capture interface. 802.1Q, 802.1ad, and QinQ tags are stripped transparently before protocol detection, so AVB, PTP, and IP streams are recognised regardless of tagging.
 
-What you actually see is determined by the **switch port** you plug into, not by the app:
+| Port type | VLANs visible | Unicast between other devices |
+|---|---|---|
+| **Access port** | One VLAN, untagged | No |
+| **Trunk port** | All VLANs the trunk carries, tagged | No |
+| **SPAN / mirror port** | Depends on mirror session scope | Yes, for mirrored ports/VLANs |
 
-| Port type | Visibility |
-|---|---|
-| **Access port** | One VLAN, untagged. You see only the streams on that VLAN. |
-| **Trunk port** | Every VLAN the trunk carries, tagged. AVStreamLens peels the tags and parses normally. |
-| **SPAN / mirror port** | Whatever the switch's mirror session copies. This is the usual way to monitor production AV networks without disturbing live traffic. |
-
-**To monitor multiple VLANs at once**, ask the network team to configure a SPAN/mirror session that copies the trunk(s) carrying AV traffic, or plug the capture host into an existing trunk port.
+To monitor streams across multiple VLANs, plug into a trunk port or configure a SPAN session scoped to the trunk.
 
 **Caveats**
 

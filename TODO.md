@@ -40,9 +40,11 @@ Items to check next time connected to a functional network of each type. Results
 
 - **gmClockIdentifier = device IP?** — The 4 bytes at PTPv1 Sync body offset 62–65 displayed as `a9:fe:68:56` match the grandmaster's IP `169.254.104.86`. If Dante consistently puts the grandmaster's IPv4 address in that field, render it as dotted-decimal instead of hex. Need to confirm on a second network / with a statically-addressed device.
 
-- **PTPv1 stratum semantics** — We label stratum 0 as "Preferred grandmaster" assuming it indicates external clock reference. Need to observe a free-running Dante device (no word clock input) and check whether it also reports stratum 0, or stratum 1+. If free-running also = 0, the label is wrong and should be changed to something neutral.
+- **PTPv1 stratum semantics** — Audinate confirms lower stratum = better in Dante BMCA (standard PTPv1 convention), so "Preferred grandmaster" for stratum 0 is directionally correct. What remains unknown: what stratum a **free-running** Dante device (no external ref, "Preferred Leader" off in Dante Controller) actually reports. If it's also 0, the label needs to be more neutral. Check with Dante Controller open alongside AVStreamLens — Dante Controller shows each device's clock role.
 
-- **BMCA with multiple Dante devices** — With several devices on the network, observe which one wins grandmaster election and whether its stratum is lower than the others. Confirms whether the stratum field actually drives Dante's BMCA or if some other field does.
+- **"Preferred Leader" flag wire mapping** — Dante Controller has a "Preferred Leader" per-device toggle that influences BMCA independently of external reference. Unknown which PTPv1 wire field this maps to (stratum, or a different field). Observe stratum values with "Preferred Leader" on vs off on the same device to determine if stratum is the sole BMCA lever or if another field is also set.
+
+- **DDM / Dante Director custom subdomains** — Dante Director uses user-defined PTPv1 subdomains (e.g. `H~O$L`) that are not `_DFLT/_ALT1/_ALT2/_ALT3`. Our `map_ptpv1_subdomain` silently maps unknown subdomains to domain 0 — on a DDM-managed network all domains would appear as domain 0 regardless of their actual subdomain. Need to observe DDM subdomain values in the wild and decide whether to show them as raw ASCII strings instead of mapping to a number. (`src/parser/ptp.rs` — `map_ptpv1_subdomain`; `src/report.rs` — domain display)
 
 - **Multicast Dante audio detection (no SPAN)** — On a simple switch port, verify that 239.255.x.x Dante multicast audio streams fire the `5000–6000 even port` heuristic and produce a stream entry. Current logic has never been confirmed on a live multicast Dante flow from a non-SPAN port.
 
