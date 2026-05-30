@@ -73,8 +73,8 @@ See **[TODO.md](TODO.md)** for the full list. Quick summary:
 
 ### Protocol Dispatch
 - Detection order (first match wins):
-  `MSRP → LLDP → Flow-control (PAUSE/PFC) → MVRP → AVTP/AVB → gPTP → IGMP → SAP → mDNS → Dante control → UDP PTP → RTP gate → **Dante audio** → AES67 → ST2110`
-- **Dante audio runs before AES67/ST2110 IP checks** — Dante multicast (239.255.x.x) would otherwise match `is_st2110_multicast`
+  `MSRP → LLDP → Flow-control (PAUSE/PFC) → MVRP → AVTP/AVB → gPTP → IGMP → SAP → mDNS → Dante control → UDP PTP → RTP gate → **Dante audio (port heuristic)** → **Dante multicast (239.255/16 block)** → AES67 → ST2110`
+- **Dante audio runs before AES67/ST2110 IP checks** — Dante multicast (239.255.x.x) would otherwise match `is_st2110_multicast`. Two Dante-audio gates: `is_likely_dante_audio` (strict — both src AND dst ports even in 5000–6000, for unicast) then `is_dante_multicast` (dst in `239.255.0.0/16` AND dst port even in 5000–6000 — catches multicast transmit flows whose source port is out of range, which the strict gate misses and the ST2110 catch-all would otherwise steal)
 - **Always processed regardless of user selection**: only LLDP/EEE (`AvProtocol::is_selected()` returns `true` unconditionally only for `LldpEee`)
 - **Gated on protocol selection** via `is_selected()`:
   - PTP → AES67, ST2110, Dante, or AVB selected
@@ -125,7 +125,7 @@ See **[TODO.md](TODO.md)** for the full list. Quick summary:
 
 ### Dante
 - **Transport**: UDP unicast or multicast (239.255.x.x); discovery via mDNS (`_netaudio-cmc._udp` / `_netaudio-arc._udp` on firmware 4.x+, `_netaudio._udp` legacy)
-- **Detection**: `is_likely_dante_audio()` requires BOTH src AND dst ports in 5000–6000 (even) — prevents false positives from ephemeral source ports
+- **Detection**: `is_likely_dante_audio()` requires BOTH src AND dst ports in 5000–6000 (even) — prevents false positives from ephemeral source ports. Plus `is_dante_multicast()` (`239.255.0.0/16`, Dante's default multicast block): a multicast-destined flow with dst port even in 5000–6000 is classified Dante even when the source port is out of range, so multicast transmit flows aren't stolen by the ST2110 catch-all. **Tradeoff** (see TODO field-verification): an ST2110 deployment using `239.255.x.x` with an even 5000–6000 dst port would be mislabelled Dante — uncommon since `239.255/16` is Dante-specific
 - **Clock**: PTPv1 via UDP ports 319/320; grandmaster from Sync body (bytes 50–55 UUID, byte 61 stratum, bytes 62–65 ident); PTPv1 layout auto-detected by **`payload[0]`**: `0x11` → nibble-packed (hdr_shift=2), else separate-byte (hdr_shift=0); subdomain → domain: _DFLT=0, _ALT1=1, _ALT2=2, _ALT3=3, anything else → 0. **Limitation**: DDM / Dante Director uses custom user-defined subdomains (e.g. `H~O$L`) that don't match these four names — they silently map to 0, so all DDM domains appear as domain 0
 - **Device names**: extracted from mDNS DNS labels via `extract_dante_name()` (tries CMC → ARC → legacy); stored in `dante_names: HashMap<Ipv4Addr, String>`; `DanteKind::Discovery { device_name }` carries name to dispatch
 - **`AvProtocol::Dante`**: `{ kind, src, dst, dst_port }` — `dst` is the destination IP; used in `handle_dante` to set `is_multicast` and fill `dst_ip`/`dst_port` via `StreamStats::new_with_info`
@@ -203,11 +203,12 @@ See **[TODO.md](TODO.md)** for the full list. Quick summary:
 ## Report Design
 - **Audience**: AV engineers, not network admins — plain English alerts, no raw hex or packet counts
 - **Report header**: cyan rule line + `AVStreamLens  ·  <timestamp>` + rule line — separates successive 5-second reports
-- **Four sections** (all use cyan `\x1b[36m` header + emoji); log file output matches console exactly:
+- **Five sections** (all use cyan `\x1b[36m` header + emoji); log file output matches console exactly:
   1. Overview — bandwidth + stream count summary + `✓/⚠/–` status line
   2. `📡 Streams:` — unified list of all active streams (AES67, Dante, ST2110, NDI, AVB), no blank lines between entries
-  3. `🕐 Clock Sources:` — PTP domains (conditional)
-  4. `🔬 Network Health — X%:` — health score + QoS/DSCP + IGMP querier + EEE
+  3. `📇 Discovered (mDNS):` — devices learned from multicast mDNS (Dante/NDI), shown only when ≥1 device discovered; `print_discovery()` in `report.rs`. Emits a yellow **no-SPAN diagnostic** ("Devices announced but no active flows — unicast flows need a SPAN/mirror port") when a protocol has discovered devices but zero active streams — the fingerprint of unicast flows on a non-mirrored port. Does not flip `is_healthy`, so quiet+healthy stays silent
+  4. `🕐 Clock Sources:` — PTP domains (conditional)
+  5. `🔬 Network Health — X%:` — health score + QoS/DSCP + IGMP querier + EEE
 - Stream entry format: `  ▸ Protocol  "Name"  [codec]  —  IP:port` / `    metrics line` / `    ⚠  alerts`
   - RTP streams (AES67/Dante/ST2110): metrics = `loss: X%  |  jitter: X ms  |  X Mbps`
   - NDI: metrics = `quality  |  X Mbps  |  retrans: N` (TCP quality, no RTP metrics)

@@ -121,6 +121,8 @@ SPAN is required when you need to see **unicast flows between two other devices*
 - **Dante audio** — Dante subscriptions are unicast by default. If a flow runs between two devices that are not the capture machine, the switch delivers those packets only to those two ports. A SPAN session mirroring those ports (or the whole VLAN) is the only way to see them.
 - **NDI streams** — NDI uses TCP (unicast). Same constraint as Dante audio.
 
+AVStreamLens detects this situation for you: because mDNS discovery is multicast and always visible, the report lists the discovered Dante/NDI devices under **📇 Discovered (mDNS)** and warns *"Devices announced but no active flows — unicast flows need a SPAN/mirror port"* when devices are present but their flows are not. That tells you a mirror port is needed rather than leaving you guessing.
+
 How to configure a SPAN session depends on the switch vendor:
 
 | Switch family | How to configure port mirroring |
@@ -200,6 +202,10 @@ Choose the protocols to monitor:
     loss: 0.0%  |  2.3 Mbps
     ✓  Reserved  VLAN 100  prio 3  ✓  Listener Ready
 
+📇 Discovered (mDNS):
+   Dante (5):  "Stage Box", "Yamaha-DM7", "TASCAM", "Amp-1", "Amp-2"
+   NDI   (2):  "Studio Camera", "Playback PC"
+
 🕐 Clock Sources:
   ✓  PTPv2  —  grandmaster 00:1a:e5:ff:fe:78:9a:bc  (192.168.1.1)
     clock quality: Primary reference — locked  < 100 ns
@@ -215,6 +221,14 @@ Choose the protocols to monitor:
 ```
 
 **Status line** — `✓ All streams healthy` or `⚠ N issue(s)` with a brief description.
+
+**Discovered (mDNS)** — Dante and NDI devices announce themselves over multicast mDNS, which reaches every switch port. This section lists those devices even when their actual audio/video flows are not visible. On a plain (non-SPAN) port where Dante audio or NDI is unicast between other devices, you will see the devices here but no matching stream above — in that case AVStreamLens adds:
+
+```
+   ⚠  Devices announced but no active flows — unicast flows need a SPAN/mirror port
+```
+
+This distinguishes "wrong interface / nothing here" from "the devices are present but their flows are unicast and need a mirror port" — see [Capture Setup](#capture-setup--choosing-the-right-switch-port).
 
 **Alerts** appear inline when problems are detected. Alerts on cumulative metrics (loss, timing discontinuities) include both a per-window count and the lifetime total, so an old loss does not re-alert forever:
 

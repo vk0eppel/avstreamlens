@@ -54,6 +54,60 @@ pub fn create_logger(prefix: &str) -> std::io::Result<Logger> {
     Logger::new(prefix)
 }
 
+/// Render a single discovery line: `   Dante (5):  "A", "B", … `.
+/// `total` is the authoritative device count; `names` may be shorter (some
+/// sources announce before their instance name is resolved).
+fn discovered_line(label: &str, total: usize, mut names: Vec<&str>) -> String {
+    names.sort_unstable();
+    names.dedup();
+    if names.is_empty() {
+        return format!("   {} ({}):  (names not yet resolved)", label, total);
+    }
+    const SHOWN: usize = 6;
+    let mut listed = names.iter().take(SHOWN).map(|n| format!("\"{}\"", n))
+        .collect::<Vec<_>>().join(", ");
+    if names.len() > SHOWN { listed.push_str(", …"); }
+    format!("   {} ({}):  {}", label, total, listed)
+}
+
+/// Print the `📇 Discovered (mDNS)` section: devices learned from multicast mDNS,
+/// plus a no-SPAN diagnostic when devices are announced but no flows of that type
+/// are active (the usual fingerprint of unicast flows on a non-mirrored port).
+fn print_discovery(
+    dante_names: &HashMap<std::net::Ipv4Addr, String>,
+    ndi_sources: &std::collections::HashSet<std::net::Ipv4Addr>,
+    ndi_names: &HashMap<std::net::Ipv4Addr, String>,
+    dante_active: usize,
+    ndi_active: usize,
+    logger: &mut Logger,
+) {
+    let dante_count = dante_names.len();
+    let ndi_count   = ndi_sources.len();
+    if dante_count == 0 && ndi_count == 0 { return; }
+
+    logger.log("\nDiscovered (mDNS):");
+    println!("\n{}", ansi("36", "📇 Discovered (mDNS):"));
+
+    if dante_count > 0 {
+        let line = discovered_line("Dante", dante_count, dante_names.values().map(|s| s.as_str()).collect());
+        logger.log(&line);
+        println!("{}", line);
+    }
+    if ndi_count > 0 {
+        let line = discovered_line("NDI  ", ndi_count, ndi_names.values().map(|s| s.as_str()).collect());
+        logger.log(&line);
+        println!("{}", line);
+    }
+
+    // No-SPAN diagnostic: devices announced via mDNS but no active flows of that
+    // type — the flows are almost certainly unicast and invisible without a mirror.
+    if (dante_count > 0 && dante_active == 0) || (ndi_count > 0 && ndi_active == 0) {
+        let alert = "   ⚠  Devices announced but no active flows — unicast flows need a SPAN/mirror port";
+        logger.log(alert);
+        println!("{}", ansi("33", alert));
+    }
+}
+
 /// Print one 5-second report cycle to stdout and the log file.
 ///
 /// Sections printed in order:
@@ -74,6 +128,9 @@ pub fn print_report(
     msrp_state: &HashMap<[u8; 8], MsrpDeclaration>,
     mvrp_vlans: &std::collections::HashSet<u16>,
     eee_ports: &std::collections::HashMap<(String, String), (u16, u16)>,
+    dante_names: &HashMap<std::net::Ipv4Addr, String>,
+    ndi_sources: &std::collections::HashSet<std::net::Ipv4Addr>,
+    ndi_names: &HashMap<std::net::Ipv4Addr, String>,
     pause_frames: u64,
     pfc_frames: u64,
     pcap_stats: Option<(u32, u32, u32)>,
@@ -445,6 +502,13 @@ pub fn print_report(
             }
         }
     }
+
+    // ── Discovered devices (mDNS) ────────────────────────────────────────────
+    // mDNS is multicast, so device announcements are visible even on a plain
+    // (non-SPAN) switch port where the actual unicast audio/video never arrives.
+    let dante_active = streams.values().filter(|s| s.protocol == "Dante").count();
+    let ndi_active   = streams.values().filter(|s| s.protocol == "NDI").count();
+    print_discovery(dante_names, ndi_sources, ndi_names, dante_active, ndi_active, logger);
 
     // ── PTP / Clock Sources ─────────────────────────────────────────────────
     if !ptp_domains.is_empty() {

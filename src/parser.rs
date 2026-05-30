@@ -50,6 +50,14 @@ pub fn is_st2110_multicast(ip: Ipv4Addr) -> bool {
     octets[0] == 239 && octets[1] != 69
 }
 
+/// Detect Dante's default multicast block (239.255.0.0/16). Dante multicast audio
+/// flows are addressed here; the generic `is_st2110_multicast` catch-all would
+/// otherwise claim them, so detection consults this block before falling through.
+pub fn is_dante_multicast(ip: Ipv4Addr) -> bool {
+    let octets = ip.octets();
+    octets[0] == 239 && octets[1] == 255
+}
+
 pub fn classify_st2110(pt: u8, port: u16) -> St2110Type {
     match port % 10 {
         4 => St2110Type::Video,
@@ -249,6 +257,16 @@ pub fn detect_protocol(eth: &EthernetPacket) -> Option<AvProtocol> {
     if is_likely_dante_audio(src_port, dst_port, payload_type) {
         return Some(AvProtocol::Dante { kind: DanteKind::AudioStream, src: src_ip, dst: dst_ip, dst_port });
     }
+    // Multicast Dante (239.255.0.0/16): the strict both-ports rule above can miss
+    // transmit flows whose source port isn't in range. For Dante's dedicated
+    // multicast block, require only the destination port to be in the Dante range —
+    // enough to stop the ST2110 239.x catch-all below from stealing the stream.
+    // A 239.255.x.x flow on a non-Dante port still falls through to ST2110.
+    if is_dante_multicast(dst_ip)
+        && (5000..=6000).contains(&dst_port) && dst_port.is_multiple_of(2)
+    {
+        return Some(AvProtocol::Dante { kind: DanteKind::AudioStream, src: src_ip, dst: dst_ip, dst_port });
+    }
     if is_aes67_multicast(dst_ip) {
         return Some(AvProtocol::Aes67 { src: src_ip, dst: dst_ip, dst_port, payload_type });
     }
@@ -445,5 +463,53 @@ mod tests {
         assert!( is_st2110_multicast(Ipv4Addr::new(239,  0, 0, 1)));
         assert!(!is_st2110_multicast(Ipv4Addr::new(239, 69, 0, 1))); // AES67, not ST2110
         assert!(!is_st2110_multicast(Ipv4Addr::new(192,168, 1, 1)));
+    }
+
+    // ── multicast Dante vs ST2110 classification ─────────────────────────────
+
+    /// Build an Ethernet+IPv4+UDP+RTP frame for detect_protocol tests.
+    fn eth_ip_udp_rtp(dst: Ipv4Addr, src_port: u16, dst_port: u16, pt: u8) -> Vec<u8> {
+        let mut ip = vec![0u8; 20 + 8 + 12];
+        ip[0] = 0x45;                                       // v4, IHL=5
+        let total: u16 = (20 + 8 + 12) as u16;
+        ip[2..4].copy_from_slice(&total.to_be_bytes());
+        ip[8] = 64;                                         // TTL
+        ip[9] = 0x11;                                       // UDP
+        ip[12..16].copy_from_slice(&[192, 168, 1, 10]);     // src ip
+        ip[16..20].copy_from_slice(&dst.octets());          // dst ip
+        ip[20..22].copy_from_slice(&src_port.to_be_bytes());
+        ip[22..24].copy_from_slice(&dst_port.to_be_bytes());
+        ip[24..26].copy_from_slice(&20u16.to_be_bytes());   // UDP length
+        ip[28] = 0x80;                                      // RTP V=2
+        ip[29] = pt & 0x7F;
+        eth_frame(&[0x08, 0x00], &[], &ip) // EtherType IPv4
+    }
+
+    #[test]
+    fn dante_multicast_with_ephemeral_src_classified_as_dante() {
+        // 239.255.0.1:5004 with an out-of-range source port — the strict both-ports
+        // rule would miss it, and the ST2110 catch-all must NOT claim it.
+        let frame = eth_ip_udp_rtp(Ipv4Addr::new(239, 255, 0, 1), 41000, 5004, 96);
+        let eth = EthernetPacket::new(&frame).unwrap();
+        assert!(matches!(detect_protocol(&eth),
+            Some(AvProtocol::Dante { kind: DanteKind::AudioStream, .. })),
+            "multicast Dante must not be misclassified as ST2110");
+    }
+
+    #[test]
+    fn st2110_multicast_outside_dante_block_unaffected() {
+        // 239.1.2.3 is not Dante's block — stays ST2110 even on an even Dante-range port.
+        let frame = eth_ip_udp_rtp(Ipv4Addr::new(239, 1, 2, 3), 41000, 5006, 96);
+        let eth = EthernetPacket::new(&frame).unwrap();
+        assert!(matches!(detect_protocol(&eth), Some(AvProtocol::St2110 { .. })));
+    }
+
+    #[test]
+    fn dante_multicast_nonaudio_port_falls_through_to_st2110() {
+        // 239.255.x.x but a non-Dante destination port → we only claim the Dante
+        // port range, so this remains ST2110.
+        let frame = eth_ip_udp_rtp(Ipv4Addr::new(239, 255, 1, 1), 41000, 50000, 96);
+        let eth = EthernetPacket::new(&frame).unwrap();
+        assert!(matches!(detect_protocol(&eth), Some(AvProtocol::St2110 { .. })));
     }
 }
