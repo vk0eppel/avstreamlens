@@ -48,7 +48,7 @@ pub enum AvProtocol {
     St2110 { src: Ipv4Addr, dst: Ipv4Addr, dst_port: u16, stream_type: St2110Type },
     Dante  { kind: DanteKind, src: Ipv4Addr, dst: Ipv4Addr, dst_port: u16 },
     Ndi    { kind: NdiKind,   src: Ipv4Addr },
-    Avb    { subtype: u8, stream_id: Option<[u8; 8]> },
+    Avb    { subtype: u8, stream_id: Option<[u8; 8]>, seq: Option<u8> },
     Msrp   { declarations: Vec<MsrpDeclaration> },
     Mvrp   { vlan_ids: Vec<u16> },
     Sap    { src: Ipv4Addr, sdp: SdpSession },
@@ -82,7 +82,6 @@ pub struct PtpInfo {
     pub clock_quality:     Option<String>,
     pub correction_ns:     Option<i64>,
     pub path_delay_ns:     Option<i64>,
-    pub origin_timestamp_ns: Option<u64>,
     // PTP message parsing improvements
     pub message_name:      String,                  // "Sync", "Follow_Up", "Delay_Req", "Delay_Resp", etc.
     pub port_id:           Option<u16>,

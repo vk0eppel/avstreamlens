@@ -200,14 +200,12 @@ fn main() {
         // VLAN-unwrapped L2 payload (handles 802.1Q / QinQ tagged frames).
         let (l2_et, l2_payload) = unwrap_vlan(&eth).unwrap_or((0, &[][..]));
         let frame_bytes = eth.packet().len() as u64;
-        // AVTP sequence counter is byte 2 of the AVTP payload — only meaningful for AVB.
-        let avtp_seq = eth.payload().get(2).copied();
 
         state.packets_dispatched += 1;
         if let Some(proto) = detect_protocol(&eth)
             && proto.is_selected(&expanded_protocols)
         {
-            capture::dispatch(&mut state, proto, l2_payload, frame_bytes, avtp_seq, now, &mut logger);
+            capture::dispatch(&mut state, proto, l2_payload, frame_bytes, now, &mut logger);
         }
 
         // ── Hoist IPv4 parse — shared by NDI detection and health tracking ───

@@ -104,8 +104,9 @@ pub fn unwrap_vlan<'a>(eth: &'a EthernetPacket<'a>) -> Option<(u16, &'a [u8])> {
 /// Analyzes an Ethernet frame to determine the encapsulated AV protocol.
 ///
 /// Dispatch order matters and is documented in CLAUDE.md under "Protocol Dispatch":
-/// LLDP → MSRP → MVRP → AVTP/AVB → gPTP → IGMP → SAP → mDNS → Dante control →
-/// UDP PTP → RTP gate → Dante audio (before AES67/ST2110 IP checks) → AES67 → ST2110.
+/// MSRP → LLDP → Flow-control → MVRP → AVTP/AVB → gPTP → IGMP → SAP → mDNS →
+/// Dante control → UDP PTP → RTP gate → Dante audio (before AES67/ST2110 IP
+/// checks) → AES67 → ST2110.
 pub fn detect_protocol(eth: &EthernetPacket) -> Option<AvProtocol> {
     let (raw_et, l2_payload) = unwrap_vlan(eth)?;
 
@@ -138,10 +139,14 @@ pub fn detect_protocol(eth: &EthernetPacket) -> Option<AvProtocol> {
     }
 
     // ── AVB / AVTP : L2 pure (EtherType 0x22F0) ─────────
+    // subtype (byte 0), seq (byte 2), and stream_id (bytes 4-11) are all read from
+    // the VLAN-unwrapped payload — AVB normally rides a tagged VLAN, so reading the
+    // sequence counter from the raw Ethernet payload would land inside the 802.1Q tag.
     if raw_et == crate::protocols::ETHERTYPE_AVTP {
         let subtype   = l2_payload.first().copied().unwrap_or(0);
+        let seq       = l2_payload.get(2).copied();
         let stream_id = parse_avtp_stream_id(l2_payload);
-        return Some(AvProtocol::Avb { subtype, stream_id });
+        return Some(AvProtocol::Avb { subtype, stream_id, seq });
     }
 
     // ── gPTP / AVB : L2 (EtherType 0x88F7) ──────────────
@@ -379,6 +384,29 @@ mod tests {
         let (et, payload) = unwrap_vlan(&eth).unwrap();
         assert_eq!(et, 0x22F0);
         assert_eq!(payload, &[0xCC, 0xDD]);
+    }
+
+    // ── AVTP detection on tagged frames ──────────────────────────────────────
+
+    #[test]
+    fn avtp_seq_read_from_unwrapped_payload_on_tagged_frame() {
+        // Regression: the AVTP sequence counter must be read from the
+        // VLAN-unwrapped payload (byte 2 of the AVTP header), not the raw
+        // Ethernet payload — otherwise on a tagged AVB VLAN it lands inside the
+        // 802.1Q tag and loss detection silently breaks.
+        let mut avtp = vec![0x00, 0x81, 0x2A, 0x00]; // subtype, sv-bit, seq=42, reserved
+        avtp.extend_from_slice(&[0xAA,0xBB,0xCC,0xDD,0xEE,0xFF,0x00,0x01]); // stream_id
+        // 0x8100 VLAN | TCI(VLAN 100) | inner ET 0x22F0 | AVTP payload
+        let frame = eth_frame(&[0x81, 0x00], &[0x00, 0x64, 0x22, 0xF0], &avtp);
+        let eth = EthernetPacket::new(&frame).unwrap();
+        match detect_protocol(&eth) {
+            Some(AvProtocol::Avb { subtype, stream_id, seq }) => {
+                assert_eq!(subtype, 0x00);
+                assert_eq!(seq, Some(0x2A), "seq must come from the AVTP header, not the VLAN tag");
+                assert_eq!(stream_id, Some([0xAA,0xBB,0xCC,0xDD,0xEE,0xFF,0x00,0x01]));
+            }
+            other => panic!("expected Avb, got {:?}", other),
+        }
     }
 
     // ── is_likely_dante_audio ────────────────────────────────────────────────

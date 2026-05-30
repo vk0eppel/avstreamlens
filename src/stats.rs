@@ -188,17 +188,17 @@ impl StreamStats {
         }
         self.last_ssrc = Some(ssrc);
         self.last_packet_time = Some(now);
-            // Accumulate actual bytes (UDP payload) and calculate
-            // throughput every second.
-            self.bytes_total += udp_payload_len as u64;
-            let elapsed = self.last_bitrate_check.elapsed();
-            if elapsed > Duration::from_secs(1) {
-                let bytes_delta = self.bytes_total.saturating_sub(self.bytes_at_check);
-                self.bitrate_bps = (bytes_delta as f64 * 8.0 / elapsed.as_secs_f64()) as u64;
-                self.bytes_at_check   = self.bytes_total;
-                self.packets_at_check = self.packets;
-                self.last_bitrate_check = now;
-            }
+
+        // Accumulate actual bytes (UDP payload) and calculate throughput every second.
+        self.bytes_total += udp_payload_len as u64;
+        let elapsed = self.last_bitrate_check.elapsed();
+        if elapsed > Duration::from_secs(1) {
+            let bytes_delta = self.bytes_total.saturating_sub(self.bytes_at_check);
+            self.bitrate_bps = (bytes_delta as f64 * 8.0 / elapsed.as_secs_f64()) as u64;
+            self.bytes_at_check   = self.bytes_total;
+            self.packets_at_check = self.packets;
+            self.last_bitrate_check = now;
+        }
     }
 
     pub fn loss_pct(&self) -> f64 {

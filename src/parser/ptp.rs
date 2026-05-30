@@ -162,7 +162,6 @@ fn parse_ptp_v1(payload: &[u8], hdr_shift: usize) -> Option<PtpInfo> {
         clock_quality,
         correction_ns:               None,
         path_delay_ns:               None,
-        origin_timestamp_ns:         None,
         message_name:                message_name.to_string(),
         port_id,
         sequence_id,
@@ -241,18 +240,6 @@ pub fn parse_ptp(payload: &[u8]) -> Option<PtpInfo> {
         0
     };
 
-    // Parse origin timestamp (for Sync and Delay_Req)
-    // PTPv2 originTimestamp: 6-byte seconds (34–39) + 4-byte nanoseconds (40–43)
-    let origin_timestamp_ns = if payload.len() >= 44 {
-        let seconds = u64::from_be_bytes([
-            0, 0, payload[34], payload[35], payload[36], payload[37], payload[38], payload[39],
-        ]);
-        let nanos = u32::from_be_bytes([payload[40], payload[41], payload[42], payload[43]]);
-        Some(seconds.saturating_mul(1_000_000_000).saturating_add(nanos as u64))
-    } else {
-        None
-    };
-
     // Grandmaster (Announce only): identity at bytes 53-60, quality at 48-49.
     let grandmaster_id = if message_type == 0x0B && payload.len() >= 64 {
         Some(format!("{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
@@ -290,7 +277,6 @@ pub fn parse_ptp(payload: &[u8]) -> Option<PtpInfo> {
         clock_quality,
         correction_ns,
         path_delay_ns,
-        origin_timestamp_ns,
         message_name,
         port_id,
         sequence_id,

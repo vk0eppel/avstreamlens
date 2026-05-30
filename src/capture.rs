@@ -251,13 +251,14 @@ impl CaptureState {
             let sdp_media = self.sdp_cache.values()
                 .flat_map(|s| s.media.iter())
                 .find(|m| m.port == dst_port);
-            let (clock, rtpmap, exp_pt, confirmed) = sdp_media
-                .map(|m| (m.clock_hz, Some(m.rtpmap.clone()), m.payload_types.first().copied(), m.clock_hz > 0.0))
-                .unwrap_or((DEFAULT_CLOCK_HZ, None, None, false));
+            let (clock, rtpmap, exp_pt, channels, confirmed) = sdp_media
+                .map(|m| (m.clock_hz, Some(m.rtpmap.clone()), m.payload_types.first().copied(),
+                          if m.channels > 0 { m.channels } else { 1 }, m.clock_hz > 0.0))
+                .unwrap_or((DEFAULT_CLOCK_HZ, None, None, 1, false));
             let mut s = StreamStats::new_with_info("AES67", clock, is_aes67_multicast(dst), dst, dst_port);
             s.sdp_rtpmap = rtpmap;
             s.media_type = "audio".to_string();
-            s.channels = 1;
+            s.channels = channels;
             s.expected_pt = exp_pt;
             s.clock_hz_confirmed = confirmed;
             s
@@ -547,7 +548,10 @@ impl CaptureState {
         // ── PTPv1 or PTPv2 (Dante) ───────────────────────────────────────────
         let dante_active = expanded.iter().any(|c| matches!(c, ProtocolChoice::Dante))
             && self.streams.values().any(|s| s.protocol == "Dante");
-        let has_ptp = self.ptp_domains.values().any(|s| s.clock_valid);
+        // Dante needs PTPv1/PTPv2 on the IP network — an L2 gPTP (AVB) clock does
+        // not satisfy it, so exclude AVB domains just like the PTPv2 check above.
+        let has_ptp = self.ptp_domains.values().any(|s|
+            s.clock_valid && s.protocol_kind.as_deref() != Some("AVB"));
         if dante_active && !has_ptp {
             missing.push(MissingClock { kind: MissingClockKind::Ptp, affected: vec!["Dante"] });
         }
@@ -606,13 +610,13 @@ pub fn emit(alerts: &[Alert], logger: &mut Logger) {
 
 /// Match an AvProtocol variant to its handler, then emit any returned alerts.
 /// `l2_payload` is the VLAN-stripped Ethernet payload; `frame_bytes` is the
-/// full Ethernet frame size; `avtp_seq` is byte 2 of the AVTP payload (for AVB).
+/// full Ethernet frame size. The AVTP sequence counter is carried in the
+/// `Avb` variant itself (extracted from the unwrapped payload in `detect_protocol`).
 pub fn dispatch(
     state: &mut CaptureState,
     proto: AvProtocol,
     l2_payload: &[u8],
     frame_bytes: u64,
-    avtp_seq: Option<u8>,
     now: Instant,
     logger: &mut Logger,
 ) {
@@ -636,8 +640,8 @@ pub fn dispatch(
         AvProtocol::Ndi { kind: NdiKind::Discovery { source_name }, src } => {
             state.handle_ndi_discovery(src, source_name)
         }
-        AvProtocol::Avb { subtype, stream_id } => {
-            state.handle_avb(subtype, stream_id, frame_bytes, avtp_seq, now);
+        AvProtocol::Avb { subtype, stream_id, seq } => {
+            state.handle_avb(subtype, stream_id, frame_bytes, seq, now);
             vec![]
         }
         AvProtocol::Msrp { declarations } => state.handle_msrp(declarations),
@@ -1075,6 +1079,18 @@ mod tests {
     }
 
     #[test]
+    fn dante_clock_not_satisfied_by_avb_gptp() {
+        // A Dante stream plus only an L2 gPTP (AVB) clock — Dante still needs
+        // PTPv1/PTPv2 on the IP network, so the gPTP clock must not satisfy it.
+        let mut state = CaptureState::new();
+        state.handle_dante(DanteKind::AudioStream, Ipv4Addr::new(192,168,1,50), Ipv4Addr::new(192,168,1,60), 5004, &[]);
+        state.ptp_domains.insert((0, PTP_VERSION_V2), valid_ptp_stats(PTP_VERSION_V2, "AVB"));
+        let missing = state.missing_ptp_clocks(&[ProtocolChoice::Dante]);
+        assert!(missing.iter().any(|m| m.kind == MissingClockKind::Ptp && m.affected == vec!["Dante"]),
+            "AVB gPTP must not satisfy Dante's clock requirement");
+    }
+
+    #[test]
     fn missing_clock_for_avb_identifies_gptp() {
         let mut state = CaptureState::new();
         state.handle_avb(0x00, Some([1,2,3,4,5,6,7,8]), 100, Some(0), Instant::now());
@@ -1120,7 +1136,6 @@ mod tests {
             clock_quality: None,
             correction_ns: Some(path_delay_ns),
             path_delay_ns: Some(path_delay_ns),
-            origin_timestamp_ns: None,
             message_name: "Delay_Resp".to_string(),
             port_id: None,
             sequence_id: 0,
