@@ -103,14 +103,17 @@ AVStreamLens is a **passive capture tool** — it reads traffic delivered to its
 
 | Protocol | Why visible without SPAN |
 |---|---|
-| **AES67** | UDP multicast (239.69.*) — delivered to every port |
-| **SMPTE ST 2110** | UDP multicast (239.x.x.x) — delivered to every port |
+| **AES67** | UDP multicast (239.69.*) — AVStreamLens auto-joins these groups |
+| **SMPTE ST 2110** | UDP multicast (239.x.x.x) — AVStreamLens auto-joins these groups |
+| **Dante audio (multicast)** | 239.255.x.x — AVStreamLens auto-joins groups as streams are discovered |
 | **AVB — AVTP stream data** | MAAP-allocated multicast MACs — forwarded like normal multicast |
-| **PTP, IGMP, SAP** | Multicast — delivered to every port |
-| **Dante / NDI discovery** | mDNS multicast — delivered to every port |
+| **PTP, IGMP, SAP** | Multicast — AVStreamLens joins PTP and SAP groups at startup |
+| **Dante / NDI discovery** | mDNS multicast (link-local, always flooded) — delivered to every port |
 | **Dante PTPv1 clock** | Multicast — delivered to every port |
 
 > **AVB gPTP / MSRP / MVRP are NOT delivered to every port.** They use link-local reserved MACs (`01:80:C2:00:00:0E`, `…:21`) in the IEEE range that bridges must **not** forward — they are hop-by-hop, so you only ever see the copy on your own link, not a remote grandmaster. See *Monitoring gPTP / the AVB grandmaster* below.
+
+**IGMP snooping:** Managed switches with IGMP snooping only deliver multicast traffic to ports that have sent an IGMP Membership Report for that group. AVStreamLens handles this automatically — at startup it joins the PTP and SAP groups, and during capture it dynamically joins stream multicast addresses as they are discovered from SAP/SDP announcements and from IGMPv3 Membership Reports sent by other devices on the network. On a snooping switch the stream groups appear in the log file as `✓ Joined stream multicast 239.69.x.x` entries. No switch configuration is needed.
 
 For AES67 and ST 2110 you can plug into any port on the switch and get full visibility. For AVB you will see **stream data** and your own link's MSRP/gPTP, but the **grandmaster and time domain are only visible on a time-aware (AVB-enabled) port** — see below.
 
@@ -120,10 +123,10 @@ A switch forwards **unicast** frames only to the destination port. Promiscuous m
 
 SPAN is required when you need to see **unicast flows between two other devices**:
 
-- **Dante audio** — Dante subscriptions are unicast by default. If a flow runs between two devices that are not the capture machine, the switch delivers those packets only to those two ports. A SPAN session mirroring those ports (or the whole VLAN) is the only way to see them.
-- **NDI streams** — NDI uses TCP (unicast). Same constraint as Dante audio.
+- **Dante audio (unicast subscriptions)** — Dante subscriptions are unicast by default. If a flow runs between two devices that are not the capture machine, the switch delivers those packets only to those two ports. A SPAN session mirroring those ports (or the whole VLAN) is the only way to see them. Note: Dante multicast audio (239.255.x.x) does **not** require SPAN — AVStreamLens joins those groups automatically.
+- **NDI streams** — NDI uses TCP (unicast). Same constraint as Dante unicast audio.
 
-AVStreamLens detects this situation for you: because mDNS discovery is multicast and always visible, the report lists the discovered Dante/NDI devices under **📇 Discovered (mDNS)** and warns *"Devices announced but no active flows — unicast flows need a SPAN/mirror port"* when devices are present but their flows are not. That tells you a mirror port is needed rather than leaving you guessing.
+AVStreamLens detects this situation for you: because mDNS discovery is multicast and always visible, the report lists the discovered Dante/NDI devices under **📇 Discovered (mDNS)** and warns when devices are present but their flows are not visible — distinguishing multicast-snooping (resolved automatically by IGMP join) from unicast flows that still need a mirror port.
 
 How to configure a SPAN session depends on the switch vendor:
 

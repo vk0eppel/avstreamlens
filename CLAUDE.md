@@ -7,7 +7,7 @@
 
 | File | Purpose |
 |---|---|
-| `src/main.rs` | Entry point — owns pcap handle, 5s report timer, post-dispatch IPv4/TCP tracking. Thin driver (~290 lines) |
+| `src/main.rs` | Entry point — owns pcap handle, 5s report timer, post-dispatch IPv4/TCP tracking, dynamic IGMP join drain. Thin driver |
 | `src/capture.rs` | `CaptureState` + per-protocol handlers + `dispatch()` + `emit()` — all per-loop state and protocol-handler logic |
 | `src/cli.rs` | CLI arg parsing (`--interface`, `--protocol`, `--quiet`, `--no-color`, `--help`), interactive interface/protocol selection, BPF filter building |
 | `src/parser.rs` | Top-level `detect_protocol` dispatcher + RTP + TCP + VLAN unwrap + multicast helpers; re-exports submodule API |
@@ -27,7 +27,7 @@
 cargo build --release   # build
 cargo fmt               # format
 cargo clippy -- -D warnings  # lint
-cargo test              # run all 114 unit tests
+cargo test              # run all 115 unit tests
 ```
 
 ## Open Work
@@ -45,7 +45,7 @@ See **[TODO.md](TODO.md)** for the full list. Quick summary:
 ## Architecture
 
 ### General
-- **Test harness**: 114 unit tests in `#[cfg(test)]` modules across `parser.rs` + `parser/{sdp,ptp,avb,lldp,mdns,flow_control}.rs`, `stats.rs`, and `capture.rs` — run with `cargo test`. Each parser submodule keeps its own fixtures and tests. `capture.rs` tests exercise handlers with hand-built IP/UDP/RTP byte buffers (see `ip_udp_rtp()` helper); no pcap dependency in tests
+- **Test harness**: 115 unit tests in `#[cfg(test)]` modules across `parser.rs` + `parser/{sdp,ptp,avb,lldp,mdns,flow_control}.rs`, `stats.rs`, and `capture.rs` — run with `cargo test`. Each parser submodule keeps its own fixtures and tests. `capture.rs` tests exercise handlers with hand-built IP/UDP/RTP byte buffers (see `ip_udp_rtp()` helper); no pcap dependency in tests
 - Logging: timestamped `.log` files written on every run in the working directory; `Logger::log()` flushes after every write so the last report survives SIGINT
 - Bitrate computed as `byte_delta / elapsed_secs` — never assumed 1s exactly
 - All modules follow the same pattern: parse → stats → report
@@ -61,7 +61,7 @@ See **[TODO.md](TODO.md)** for the full list. Quick summary:
 - **Adding a new protocol parser** = create `parser/<name>.rs`, declare `pub mod <name>;` in `parser.rs`, re-export its public functions with `pub use <name>::...`, add a branch in `detect_protocol`. Tests live in the same file as the parser
 
 ### Capture Module (`capture.rs`)
-- **`CaptureState`** owns all per-loop HashMaps/HashSets (streams, tcp_streams, sdp_cache, ptp_domains, ndi_sources, ndi_names, dante_names, igmp_joins_seen, avtp_streams, msrp_state, mvrp_vlans, eee_ports), `network_health`, and `bytes_this_window`. `main.rs` holds exactly one `CaptureState` for the lifetime of the process
+- **`CaptureState`** owns all per-loop HashMaps/HashSets (streams, tcp_streams, sdp_cache, ptp_domains, ndi_sources, ndi_names, dante_names, igmp_joins_seen, avtp_streams, msrp_state, mvrp_vlans, eee_ports), `network_health`, `bytes_this_window`, and the dynamic-IGMP-join queue: `pending_join_groups: Vec<Ipv4Addr>` (handlers push new `239.x.x.x` groups here; drained by `main.rs` after each dispatch) and `joined_multicast: HashSet<Ipv4Addr>` (written by `main.rs` after a successful `join_multicast_v4` so handlers can skip groups already joined). `main.rs` holds exactly one `CaptureState` for the lifetime of the process
 - **One `handle_*` method per protocol** (e.g. `handle_aes67`, `handle_dante`, `handle_ptp`). Each takes already-parsed inputs (`l2_payload: &[u8]`, `frame_bytes: u64`, `avtp_seq: Option<u8>`, `now: Instant`) — never a raw `pcap::Packet`. This is what makes handlers unit-testable
 - **Handlers do not touch IO.** They mutate `CaptureState` and return `Vec<Alert>`. The dispatch layer prints + logs. The `PtpEvent` pattern in `stats.rs` is the same idea applied one layer deeper (data layer returns events; handler layer turns them into `Alert`s)
 - **`Alert { level: AlertLevel, message: String }`** with constructors `Alert::info/good/warn/error`. `emit(&[Alert], &mut Logger)` maps level → ANSI color (none/32/33/31) and prints + logs in one place. Adding a new severity or alert format is a single-site change
@@ -192,6 +192,8 @@ See **[TODO.md](TODO.md)** for the full list. Quick summary:
 - `igmp_joins_seen` deduplicates Join prints per (src, group); Queries always printed
 - Querier absence penalizes health score only when active multicast streams exist (−10 pts); "silent" threshold is interval-aware via `NetworkHealth::querier_silent_after_secs()` ≈ 2× the observed query interval (default 260s), per RFC 3376 "Other Querier Present Interval" — a fixed 130s left too little margin on a default 125s querier
 - `igmp_query_interval_secs` tracks detected interval between consecutive queries — shown in footer as `(interval Xs)`
+- **IGMPv3 Membership Report parsing** (`IgmpType::MembershipReportV3 { groups: Vec<Ipv4Addr> }`): type `0x22` is now parsed separately from IGMPv2 Join (`0x16`). `parse_igmpv3_report()` in `parser.rs` walks the Group Records (RFC 3376 §4.2): `payload[6..7]` = num_records, then per record: `[0]` record_type, `[1]` aux_data_len, `[2-3]` num_sources, `[4-7]` multicast address; offset advances by `8 + 4*num_sources + 4*aux_data_len`. Extracted groups are pushed to `CaptureState::pending_join_groups` by `handle_igmp` (filtered to `239.x.x.x` only)
+- **Dynamic IGMP join bootstrap**: startup joins `224.0.0.22` (IGMPv3 all-routers, normally flooded) + PTP groups + SAP `224.2.127.254`. From SAP, `handle_sap` pushes stream multicast IPs from `SdpMedia.connection` ("IN IP4 x.x.x.x[/ttl]"). From IGMPv3 reports, `handle_igmp` pushes all `239.x.x.x` groups. `main.rs` drains `pending_join_groups` after each `dispatch()` call: `should_join_group()` gates by octet[1] (69→AES67, 255→Dante, other→ST2110) against `expanded_protocols`; approved groups get a `UdpSocket::join_multicast_v4` call; socket kept in `mc_sockets: Vec<UdpSocket>` (process-lifetime); success written to `state.joined_multicast`. Limitation: Dante IGMPv2 on old switches sends reports to the group address (snooped), creating a chicken/egg that the v3 path cannot resolve
 
 ### LLDP / EEE
 - LLDP (0x88CC) always in BPF filter regardless of protocol selection

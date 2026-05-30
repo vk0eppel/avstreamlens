@@ -109,6 +109,43 @@ pub fn unwrap_vlan<'a>(eth: &'a EthernetPacket<'a>) -> Option<(u16, &'a [u8])> {
 // SECTION 3 — TOP-LEVEL PROTOCOL DETECTION
 // ═════════════════════════════════════════════════════════════════
 
+/// Parse an IGMPv3 Membership Report (type 0x22) and extract the multicast group
+/// addresses from its Group Records (RFC 3376 §4.2).
+///
+/// Layout after the IP header:
+///   byte 0:   type = 0x22
+///   byte 1:   reserved
+///   bytes 2-3: checksum
+///   bytes 4-5: reserved
+///   bytes 6-7: number of group records (big-endian u16)
+///   then for each record:
+///     byte 0:   record type
+///     byte 1:   aux data len (in 32-bit words)
+///     bytes 2-3: number of sources (big-endian u16)
+///     bytes 4-7: multicast address
+///     then: 4*num_sources source bytes, then 4*aux_data_len aux bytes
+fn parse_igmpv3_report(payload: &[u8]) -> crate::protocols::IgmpType {
+    if payload.len() < 8 {
+        return crate::protocols::IgmpType::MembershipReportV3 { groups: vec![] };
+    }
+    let num_records = u16::from_be_bytes([payload[6], payload[7]]) as usize;
+    let mut groups = Vec::new();
+    let mut off = 8usize;
+    for _ in 0..num_records {
+        if off + 8 > payload.len() { break; }
+        let aux_len     = payload[off + 1] as usize;
+        let num_sources = u16::from_be_bytes([payload[off + 2], payload[off + 3]]) as usize;
+        let mcast = Ipv4Addr::new(
+            payload[off + 4], payload[off + 5], payload[off + 6], payload[off + 7],
+        );
+        if mcast.is_multicast() {
+            groups.push(mcast);
+        }
+        off += 8 + 4 * num_sources + 4 * aux_len;
+    }
+    crate::protocols::IgmpType::MembershipReportV3 { groups }
+}
+
 /// Analyzes an Ethernet frame to determine the encapsulated AV protocol.
 ///
 /// Dispatch order matters and is documented in CLAUDE.md under "Protocol Dispatch":
@@ -182,8 +219,9 @@ pub fn detect_protocol(eth: &EthernetPacket) -> Option<AvProtocol> {
         } else {
             match igmp_payload[0] {
                 0x11 => crate::protocols::IgmpType::Query,
-                0x16 | 0x22 => crate::protocols::IgmpType::Join,
+                0x16 => crate::protocols::IgmpType::Join,
                 0x17 => crate::protocols::IgmpType::Leave,
+                0x22 => parse_igmpv3_report(igmp_payload),
                 t    => crate::protocols::IgmpType::Unknown(t),
             }
         };
@@ -546,6 +584,69 @@ mod tests {
         if let Some(AvProtocol::Igmp { group, src, .. }) = proto {
             assert_eq!(group, Ipv4Addr::new(224, 0, 0, 1));
             assert_eq!(src, Ipv4Addr::new(10, 244, 70, 241));
+        }
+    }
+
+    #[test]
+    fn igmpv3_membership_report_group_records_extracted() {
+        // IGMPv3 Membership Report (type 0x22) sent to 224.0.0.22.
+        // Contains two Group Records: one for 239.69.0.1 (AES67) and one for
+        // 239.255.1.2 (Dante multicast). Verifies that parse_igmpv3_report correctly
+        // walks the Group Record list and returns both groups.
+        //
+        // IGMP payload layout (RFC 3376 §4.2):
+        //   [0]    type = 0x22
+        //   [1]    reserved
+        //   [2-3]  checksum (zeroed for test)
+        //   [4-5]  reserved
+        //   [6-7]  num_group_records = 2
+        //   --- Record 1 ---
+        //   [8]    record_type = 2 (MODE_IS_EXCLUDE — host IS joined)
+        //   [9]    aux_data_len = 0
+        //   [10-11] num_sources = 0
+        //   [12-15] multicast_address = 239.69.0.1
+        //   --- Record 2 ---
+        //   [16]   record_type = 2
+        //   [17]   aux_data_len = 0
+        //   [18-19] num_sources = 0
+        //   [20-23] multicast_address = 239.255.1.2
+        let mut igmp_payload = vec![0u8; 24];
+        igmp_payload[0] = 0x22; // IGMPv3 Membership Report
+        igmp_payload[6] = 0x00; igmp_payload[7] = 0x02; // 2 group records
+        // Record 1
+        igmp_payload[8]  = 2; // MODE_IS_EXCLUDE
+        igmp_payload[9]  = 0; // aux_data_len
+        igmp_payload[10] = 0; igmp_payload[11] = 0; // 0 sources
+        igmp_payload[12..16].copy_from_slice(&[239, 69, 0, 1]);
+        // Record 2
+        igmp_payload[16] = 2;
+        igmp_payload[17] = 0;
+        igmp_payload[18] = 0; igmp_payload[19] = 0;
+        igmp_payload[20..24].copy_from_slice(&[239, 255, 1, 2]);
+
+        // Build a minimal IPv4 frame (IHL=5, no options) with IGMP as the payload.
+        let mut ip = vec![0u8; 20 + igmp_payload.len()];
+        ip[0] = 0x45; // v4, IHL=5
+        let total = (20 + igmp_payload.len()) as u16;
+        ip[2..4].copy_from_slice(&total.to_be_bytes());
+        ip[8] = 1;    // TTL=1
+        ip[9] = 0x02; // proto IGMP
+        ip[12..16].copy_from_slice(&[10, 0, 0, 1]);       // src
+        ip[16..20].copy_from_slice(&[224, 0, 0, 22]);     // dst (all IGMPv3 routers)
+        ip[20..].copy_from_slice(&igmp_payload);
+
+        let frame = eth_frame(&[0x08, 0x00], &[], &ip);
+        let eth   = EthernetPacket::new(&frame).unwrap();
+        let proto = detect_protocol(&eth);
+
+        if let Some(AvProtocol::Igmp {
+            igmp_type: crate::protocols::IgmpType::MembershipReportV3 { groups }, ..
+        }) = proto {
+            assert_eq!(groups.len(), 2, "expected 2 group records");
+            assert!(groups.contains(&Ipv4Addr::new(239, 69,  0, 1)), "AES67 group missing");
+            assert!(groups.contains(&Ipv4Addr::new(239, 255, 1, 2)), "Dante group missing");
+        } else {
+            panic!("expected MembershipReportV3, got {:?}", proto);
         }
     }
 }

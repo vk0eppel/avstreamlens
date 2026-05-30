@@ -100,10 +100,14 @@ fn print_discovery(
         println!("{}", line);
     }
 
-    // No-SPAN diagnostic: devices announced via mDNS but no active flows of that
-    // type — the flows are almost certainly unicast and invisible without a mirror.
+    // No-SPAN / snooping diagnostic: devices announced via mDNS but no active flows.
+    // Two causes: (1) unicast flows between other devices need a SPAN port;
+    // (2) on IGMP-snooping switches, even multicast flows are pruned until we
+    // join the group — AVStreamLens joins automatically from SAP and IGMPv3 reports.
     if (dante_count > 0 && dante_active == 0) || (ndi_count > 0 && ndi_active == 0) {
-        let alert = "   ⚠  Devices announced but no active flows — unicast flows need a SPAN/mirror port";
+        let alert = "   ⚠  Devices announced but no active flows\
+            \n      Multicast (Dante audio, AES67): joining stream groups automatically via IGMP\
+            \n      Unicast (Dante subscriptions, NDI): requires a SPAN/mirror port";
         logger.log(alert);
         println!("{}", ansi("33", alert));
     }

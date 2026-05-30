@@ -66,9 +66,10 @@ pub enum FlowControlKind {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum IgmpType {
-    Join,       // Membership Report v2/v3
-    Leave,      // Leave Group
-    Query,      // Membership Query
+    Join,                                        // IGMPv2 Membership Report (0x16)
+    Leave,                                       // Leave Group (0x17)
+    Query,                                       // Membership Query (0x11)
+    MembershipReportV3 { groups: Vec<Ipv4Addr> }, // IGMPv3 Report (0x22) — multiple Group Records
     Unknown(u8),
 }
 

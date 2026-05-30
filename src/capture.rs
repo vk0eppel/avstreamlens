@@ -113,6 +113,12 @@ pub struct CaptureState {
     pub pause_frames_this_window: u64,
     pub pfc_frames_this_window:   u64,
     pub packets_dispatched: u64,
+    // Dynamic IGMP multicast join support — handlers push new 239.x.x.x group
+    // addresses here; main.rs drains this after each dispatch and joins them.
+    // `joined_multicast` is populated by main.rs after a successful join so
+    // handlers can avoid pushing the same group more than once.
+    pub pending_join_groups: Vec<Ipv4Addr>,
+    pub joined_multicast:    HashSet<Ipv4Addr>,
 }
 
 impl Default for CaptureState {
@@ -140,6 +146,8 @@ impl CaptureState {
             pause_frames_this_window: 0,
             pfc_frames_this_window:   0,
             packets_dispatched: 0,
+            pending_join_groups: Vec::new(),
+            joined_multicast:    HashSet::new(),
         }
     }
 
@@ -214,6 +222,18 @@ impl CaptureState {
                         stats.expected_pt = Some(pt);
                     }
                     break;
+                }
+            }
+        }
+        // Queue any multicast stream addresses for dynamic IGMP joining.
+        // SDP connection field is "IN IP4 <addr>[/ttl]"; extract the IP.
+        for m in &sdp.media {
+            let conn = m.connection.trim();
+            if let Some(addr_part) = conn.strip_prefix("IN IP4 ") {
+                let ip_str = addr_part.split('/').next().unwrap_or("").trim();
+                if let Ok(ip) = ip_str.parse::<Ipv4Addr>()
+                    && ip.octets()[0] == 239 && !self.joined_multicast.contains(&ip) {
+                    self.pending_join_groups.push(ip);
                 }
             }
         }
@@ -485,6 +505,16 @@ impl CaptureState {
                 if self.streams.values().any(|s| s.dst_ip == Some(group)) {
                     alerts.push(Alert::warn(format!("    ⚠  IGMP Leave on monitored group {}", group)));
                 }
+            }
+            IgmpType::MembershipReportV3 { groups } => {
+                // Queue new 239.x.x.x groups for dynamic joining so IGMP-snooping
+                // switches deliver those streams to our capture port.
+                for group in groups {
+                    if group.octets()[0] == 239 && !self.joined_multicast.contains(&group) {
+                        self.pending_join_groups.push(group);
+                    }
+                }
+                // No console output — infrastructure detail, not user-visible.
             }
             IgmpType::Query => {
                 // Track interval between consecutive queries (RFC 3376 default 125s).

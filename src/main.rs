@@ -30,6 +30,7 @@ use crate::parser::{detect_protocol, parse_tcp_packet, parse_ts_refclk, is_multi
 use crate::report::{create_logger, print_report};
 use crate::stats::StreamStats;
 
+use std::collections::HashSet;
 use std::net::{Ipv4Addr, UdpSocket};
 
 /// Global colour flag — set once at startup, read-only after that.
@@ -61,6 +62,12 @@ fn join_multicast_groups(
         groups.push((Ipv4Addr::new(224, 0, 1, 131), "PTPv1 _ALT2 (224.0.1.131)"));
         groups.push((Ipv4Addr::new(224, 0, 1, 132), "PTPv1 _ALT3 (224.0.1.132)"));
         groups.push((Ipv4Addr::new(224, 0, 0, 107), "PTPv2 peer-delay (224.0.0.107)"));
+        // IGMPv3 Membership Reports go to 224.0.0.22 (all IGMPv3 routers).
+        // Compliant snooping switches must flood 224.0.0.x, but joining defensively
+        // ensures we receive reports on switches that snoop this range too.
+        // Seeing these reports lets us learn — and then join — stream multicast groups
+        // (e.g. Dante 239.255.x.x) that are otherwise pruned by IGMP snooping.
+        groups.push((Ipv4Addr::new(224, 0, 0, 22), "IGMPv3 reports (224.0.0.22)"));
     }
     if needs_sap {
         groups.push((Ipv4Addr::new(224, 2, 127, 254), "SAP (224.2.127.254)"));
@@ -85,6 +92,19 @@ fn join_multicast_groups(
         }
     }
     sockets
+}
+
+/// Returns true if `group` is a stream multicast address that should be joined
+/// given the selected protocols. Only 239.x.x.x (admin-scoped) addresses are
+/// ever joined dynamically; 224.x.x.x PTP/mDNS groups are handled at startup.
+fn should_join_group(group: &Ipv4Addr, expanded: &[protocols::ProtocolChoice]) -> bool {
+    let oct = group.octets();
+    if oct[0] != 239 { return false; }
+    match oct[1] {
+        69  => expanded.iter().any(|c| matches!(c, protocols::ProtocolChoice::AES67)),
+        255 => expanded.iter().any(|c| matches!(c, protocols::ProtocolChoice::Dante)),
+        _   => expanded.iter().any(|c| matches!(c, protocols::ProtocolChoice::ST2110)),
+    }
 }
 
 fn main() {
@@ -126,7 +146,10 @@ fn main() {
     let iface_ip = device.addresses.iter()
         .find_map(|a| if let std::net::IpAddr::V4(v4) = a.addr { Some(v4) } else { None })
         .unwrap_or(Ipv4Addr::UNSPECIFIED);
-    let _mc_sockets = join_multicast_groups(iface_ip, &expanded_protocols, &mut logger);
+    // Keep sockets alive for the process lifetime; mutable so dynamic joins append.
+    let mut mc_sockets = join_multicast_groups(iface_ip, &expanded_protocols, &mut logger);
+    // Track which groups we've already joined to avoid duplicate sockets.
+    let mut mc_joined: HashSet<Ipv4Addr> = HashSet::new();
 
     // ── Opening capture with BPF filter ───────────────
     let mut cap = Capture::from_device(device.name.as_str())
@@ -207,6 +230,28 @@ fn main() {
             && proto.is_selected(&expanded_protocols)
         {
             capture::dispatch(&mut state, proto, l2_payload, frame_bytes, now, &mut logger);
+        }
+
+        // ── Dynamic IGMP joins — drain groups queued by handlers ────────────
+        // Handlers push newly-discovered 239.x.x.x addresses to pending_join_groups
+        // (from SAP/SDP and IGMPv3 Membership Reports). We join each one here so
+        // IGMP-snooping switches start forwarding those streams to our capture port.
+        for group in state.pending_join_groups.drain(..) {
+            if should_join_group(&group, &expanded_protocols) && !mc_joined.contains(&group) {
+                match UdpSocket::bind("0.0.0.0:0")
+                    .and_then(|s| { s.join_multicast_v4(&group, &iface_ip)?; Ok(s) })
+                {
+                    Ok(s) => {
+                        mc_joined.insert(group);
+                        state.joined_multicast.insert(group);
+                        mc_sockets.push(s);
+                        logger.log(&format!("   ✓ Joined stream multicast {}", group));
+                    }
+                    Err(e) => {
+                        logger.log(&format!("   ⚠ Could not join {} — {}", group, e));
+                    }
+                }
+            }
         }
 
         // ── Hoist IPv4 parse — shared by NDI detection and health tracking ───
