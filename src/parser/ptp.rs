@@ -42,16 +42,16 @@ fn ptp_accuracy_str(acc: u8) -> &'static str {
 
 /// Parse a PTPv1 (IEEE 1588-2002) UDP payload.
 ///
-/// Two wire encodings exist, distinguished by `hdr_shift`:
+/// Three wire encodings exist, distinguished by `hdr_shift`:
 ///
-/// Separate-byte (hdr_shift=0, e.g. ptpd):
+/// Separate-byte (hdr_shift=0, e.g. ptpd, byte[0]=0x01):
 ///   [0]     versionPTP = 0x01
 ///   [1]     versionNetwork = 0x01
 ///   [2-17]  subdomain (16 bytes)
 ///   [20-25] sourceUuid   [26-27] sourcePortId   [28-29] sequenceId
 ///   [30]    control      [31]    logMessagePeriod
 ///
-/// Nibble-packed (hdr_shift=2, byte[0]=0x11):
+/// Nibble-packed (hdr_shift=2, byte[0]=0x11, Audinate Dante):
 ///   [0]     (versionPTP=1)<<4 | versionNetwork=1  = 0x11
 ///   [1]     (messageType)<<4  | sourceCT          = 0x11 for Sync/UDP
 ///   [2-3]   flags
@@ -59,13 +59,21 @@ fn ptp_accuracy_str(acc: u8) -> &'static str {
 ///   [22-27] sourceUuid   [28-29] sourcePortId   [30-31] sequenceId
 ///   [32]    control      [33]    logMessagePeriod
 ///
-/// Sync body (bytes 40-123, same absolute offsets for both encodings):
-///   [40-49] originTimestamp   [50-53] epochNumber/UTC offset
-///   [54]    padding   [55] grandmasterCommunicationTechnology
-///   [56-61] grandmasterClockUuid (6 bytes)
-///   [62-67] grandmasterPortId / sequenceId / padding
-///   [67]    grandmasterClockStratum
-///   [68-71] grandmasterClockIdentifier (4 bytes ASCII, e.g. "ATOM", "GPS ")
+/// Standard IEEE 1588-2002 (hdr_shift=2, byte[0]=0x00):
+///   [0-1]   versionPTP = 0x0001 (big-endian UInteger16)
+///   [2-3]   versionNetwork = 0x0001
+///   [4-19]  subdomain (16 bytes)
+///   [20]    messageType   [21] sourceCommunicationTechnology
+///   [22-27] sourceUuid   [28-29] sourcePortId   [30-31] sequenceId
+///   [32]    control      [33]    reserved
+///
+/// Sync body (same absolute offsets for all encodings):
+///   [34-43] originTimestamp   [44-47] epochNumber/utcOffset
+///   [48] pad  [49] grandmasterCommunicationTechnology
+///   [50-55] grandmasterClockUuid (6 bytes)
+///   [56-57] grandmasterPortId   [58-59] grandmasterSequenceId
+///   [60] pad  [61] grandmasterClockStratum
+///   [62-65] grandmasterClockIdentifier (4 bytes ASCII, e.g. "ATOM", "GPS ")
 fn parse_ptp_v1(payload: &[u8], hdr_shift: usize) -> Option<PtpInfo> {
     if payload.len() < 40 { return None; }
 
@@ -113,11 +121,23 @@ fn parse_ptp_v1(payload: &[u8], hdr_shift: usize) -> Option<PtpInfo> {
                 uuid[0], uuid[1], uuid[2], uuid[3], uuid[4], uuid[5]
             );
             let stratum = payload[61];
-            let ident   = std::str::from_utf8(&payload[62..66])
-                .unwrap_or("????")
-                .trim_end_matches('\0')
-                .trim();
+            let raw_ident = &payload[62..66];
+            let ident = if raw_ident.iter().all(|&b| b == 0) {
+                String::new()
+            } else if let Ok(s) = std::str::from_utf8(raw_ident) {
+                let s = s.trim_end_matches('\0').trim();
+                if s.chars().all(|c| c.is_ascii_graphic() || c == ' ') {
+                    s.to_string()
+                } else {
+                    format!("{:02x}:{:02x}:{:02x}:{:02x}",
+                        raw_ident[0], raw_ident[1], raw_ident[2], raw_ident[3])
+                }
+            } else {
+                format!("{:02x}:{:02x}:{:02x}:{:02x}",
+                    raw_ident[0], raw_ident[1], raw_ident[2], raw_ident[3])
+            };
             let class_str = match stratum {
+                0 => "Preferred grandmaster".to_string(),
                 1 => "Primary reference".to_string(),
                 2 => "Secondary reference".to_string(),
                 n => format!("Stratum {}", n),
@@ -161,12 +181,11 @@ pub fn parse_ptp(payload: &[u8]) -> Option<PtpInfo> {
     // Anything that doesn't match is PTPv1 (we are already in a PTP context: port 319/320
     // or EtherType 0x88F7, so non-PTP traffic is not a concern here).
     if payload[1] & 0x0F != PTP_VERSION_V2 {
-        // PTPv1 layout selection by header byte 0:
-        //   0x11 = nibble-packed (versionPTP<<4 | versionNetwork) → hdr_shift = 2
-        //   0x01 = separate-byte (versionPTP only)                → hdr_shift = 0
-        // Falling back to subdomain-byte sniffing (payload[4]=='_') breaks for custom
-        // subdomain names that don't start with '_'. Byte 0 is unambiguous per spec.
-        let hdr_shift = if payload[0] == 0x11 { 2 } else { 0 };
+        // All known PTPv1 encodings share the same field layout:
+        //   uuid at 22, control at 32, subdomain at 4.
+        // The only variation is what bytes 0-3 contain (packed nibbles, big-endian
+        // UInteger16, or single-byte), but the body offsets are identical in every case.
+        let hdr_shift = 2;
         return parse_ptp_v1(payload, hdr_shift);
     }
 
@@ -362,14 +381,41 @@ mod tests {
     }
 
     #[test]
-    fn ptpv1_separate_byte_detected() {
+    fn ptpv1_single_byte_version_detected() {
+        // payload[0]=0x01 (single-byte versionPTP): same hdr_shift=2 layout as all PTPv1
+        // control at 32, subdomain at 4
         let mut p = vec![0u8; 40];
-        p[0]  = 0x01; // separate-byte marker → hdr_shift=0
+        p[0]  = 0x01;
         p[1]  = 0x01;
-        p[30] = 0x00; // control = Sync
+        p[32] = 0x00; // control = Sync
         let info = parse_ptp(&p).unwrap();
         assert_eq!(info.version,      1);
         assert_eq!(info.message_type, 0x00);
+    }
+
+    #[test]
+    fn ptpv1_standard_ieee1588_extracts_grandmaster() {
+        // Standard IEEE 1588-2002: versionPTP = 0x0001 big-endian → payload[0]=0x00
+        // hdr_shift=2: subdomain at 4, sourceUuid at 22, control at 32
+        // Body layout same as nibble-packed: gmUuid at 50-55, stratum at 61, ident at 62-65
+        let mut p = vec![0u8; 66];
+        p[0]  = 0x00; p[1]  = 0x01; // versionPTP = 1 (big-endian)
+        p[2]  = 0x00; p[3]  = 0x01; // versionNetwork = 1
+        p[4..9].copy_from_slice(b"_DFLT");  // subdomain → domain 0
+        p[20] = 0x01;                // messageType = Sync
+        p[21] = 0x01;                // sourceCommunicationTechnology = UDP_IP
+        p[22..28].copy_from_slice(&[0x00, 0x1d, 0xc1, 0x8e, 0xb1, 0x75]); // sourceUuid
+        p[32] = 0x00;                // control = Sync
+        p[50..56].copy_from_slice(&[0x00, 0x1d, 0xc1, 0x8e, 0xb1, 0x75]); // grandmasterClockUuid
+        p[61] = 1;                   // grandmasterClockStratum = Primary reference
+        p[62..66].copy_from_slice(b"GPS ");
+        let info = parse_ptp(&p).unwrap();
+        assert_eq!(info.version, 1);
+        assert_eq!(info.domain,  0);
+        assert_eq!(info.clock_id.as_deref(),       Some("00:1d:c1:8e:b1:75"));
+        assert_eq!(info.grandmaster_id.as_deref(), Some("00:1d:c1:8e:b1:75"));
+        assert!(info.clock_quality.as_deref().unwrap_or("").contains("Primary reference"));
+        assert!(info.clock_quality.as_deref().unwrap_or("").contains("GPS"));
     }
 
     #[test]
@@ -377,10 +423,37 @@ mod tests {
         let mut p = vec![0u8; 40];
         p[0] = 0x01;
         p[1] = 0x01;
-        p[2..7].copy_from_slice(b"_ALT1"); // hdr_shift=0, sd=2
-        p[30] = 0x01; // Delay_Req
+        p[4..9].copy_from_slice(b"_ALT1"); // hdr_shift=2, sd=4
+        p[32] = 0x01; // Delay_Req
         let info = parse_ptp(&p).unwrap();
         assert_eq!(info.domain, 1);
+    }
+
+    #[test]
+    fn ptpv1_binary_ident_shows_hex_not_question_marks() {
+        // Dante sends non-ASCII bytes in gmClockIdentifier (e.g. link-local IP 169.254.x.x).
+        // Bytes 0xa9/0xfe are invalid UTF-8; must render as hex, not "????".
+        let p = ptpv1_nibble_sync(
+            [0x00, 0x00, 0x00, 0x01, 0x00, 0x1d],
+            0,
+            &[0xa9, 0xfe, 0x68, 0x56], // 169.254.104.86 in binary
+        );
+        let info = parse_ptp(&p).unwrap();
+        let q = info.clock_quality.unwrap();
+        assert!(!q.contains("????"), "should not contain ????, got: {}", q);
+        assert!(q.contains("a9:fe:68:56"), "should contain hex ident, got: {}", q);
+        assert!(q.contains("Preferred grandmaster"), "should label stratum 0, got: {}", q);
+    }
+
+    #[test]
+    fn ptpv1_null_ident_omitted_from_quality() {
+        let p = ptpv1_nibble_sync(
+            [0x00, 0x1d, 0xc1, 0x8e, 0xb1, 0x75],
+            1,
+            &[0x00, 0x00, 0x00, 0x00],
+        );
+        let q = parse_ptp(&p).unwrap().clock_quality.unwrap();
+        assert_eq!(q, "Primary reference");
     }
 
     #[test]

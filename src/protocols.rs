@@ -46,7 +46,7 @@ pub const NDI_PORT_MAX:      u16 = 5980;
 pub enum AvProtocol {
     Aes67  { src: Ipv4Addr, dst: Ipv4Addr, dst_port: u16, payload_type: u8 },
     St2110 { src: Ipv4Addr, dst: Ipv4Addr, dst_port: u16, stream_type: St2110Type },
-    Dante  { kind: DanteKind, src: Ipv4Addr, dst_port: u16 },
+    Dante  { kind: DanteKind, src: Ipv4Addr, dst: Ipv4Addr, dst_port: u16 },
     Ndi    { kind: NdiKind,   src: Ipv4Addr },
     Avb    { subtype: u8, stream_id: Option<[u8; 8]> },
     Msrp   { declarations: Vec<MsrpDeclaration> },

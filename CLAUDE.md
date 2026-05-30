@@ -15,7 +15,7 @@
 | `src/parser/ptp.rs` | PTPv1 (IEEE 1588-2002) + PTPv2 (IEEE 1588-2008) message parser — used for both UDP PTP and L2 gPTP |
 | `src/parser/avb.rs` | AVTP stream-id extraction + MSRP (802.1Qat) + MVRP (802.1Q) PDU parsers |
 | `src/parser/lldp.rs` | LLDP TLV walker that surfaces the IEEE 802.3az EEE TLV |
-| `src/parser/mdns.rs` | mDNS service-instance name extraction (Dante `_netaudio`, NDI `_ndi`) |
+| `src/parser/mdns.rs` | mDNS service-instance name extraction (Dante `_netaudio-cmc`/`_netaudio-arc`/`_netaudio`, NDI `_ndi`) |
 | `src/parser/flow_control.rs` | 802.3x PAUSE / 802.1Qbb PFC frame classifier (EtherType 0x8808) |
 | `src/protocols.rs` | Enums, constants, type definitions |
 | `src/stats.rs` | Stream statistics — RTP, TCP, PTP, network health score |
@@ -37,7 +37,7 @@ See **[TODO.md](TODO.md)** for the full list. Quick summary:
 | Category | Items |
 |---|---|
 | Bugs / code issues | (none — all resolved) |
-| Missing features | VLAN-ID filter; Dante AV video; health score review; `--duration`; JSON output; SAP re-announce monitor; redundant stream pairing; RTCP; PTP BMCA; stream count anomaly; SDP preload; NMOS IS-04 |
+| Missing features | PTPv1 grandmaster NIC MAC display; VLAN-ID filter; Dante AV video; health score review; `--duration`; JSON output; SAP re-announce monitor; redundant stream pairing; RTCP; PTP BMCA; stream count anomaly; SDP preload; NMOS IS-04 |
 | Platform limitations | NDI loopback unsupported; macOS VLAN tag stripping; Windows `cmd.exe` no ANSI color; PAUSE/PFC NIC-consumed |
 
 ---
@@ -56,7 +56,7 @@ See **[TODO.md](TODO.md)** for the full list. Quick summary:
 - **`parser/ptp.rs`** — `parse_ptp` auto-detects PTPv1 vs PTPv2 from byte 1 low nibble; PTPv1 has two wire encodings (separate-byte vs nibble-packed) selected by byte 0 == 0x11
 - **`parser/avb.rs`** — `parse_avtp_stream_id` (sv-bit guarded), `parse_msrp` (TalkerAdvertise/TalkerFailed/Listener), `parse_mvrp` (VLAN registration). MSRP/MVRP share the IEEE 802.1Q vector-attribute format
 - **`parser/lldp.rs`** — TLV walker; emits `AvProtocol::LldpEee` only when the EEE TLV (OUI 00-12-0F, subtype 0x05) is present AND a wake-up time is non-zero
-- **`parser/mdns.rs`** — `extract_mdns_instance_name` finds the DNS-label-encoded service needle, then walks length-prefixed labels backward to find the longest valid printable-ASCII instance name. Used by `extract_dante_name` (needle `\x09_netaudio`) and `extract_ndi_name` (needle `\x04_ndi`)
+- **`parser/mdns.rs`** — `extract_mdns_instance_name` finds the DNS-label-encoded service needle, then walks length-prefixed labels backward to find the longest valid printable-ASCII instance name. Used by `extract_dante_name` (tries `\x0d_netaudio-cmc` → `\x0d_netaudio-arc` → `\x09_netaudio`) and `extract_ndi_name` (needle `\x04_ndi`)
 - **`parser/flow_control.rs`** — `parse_flow_control` classifies 0x8808 frames by MAC-control opcode: `0x0001` → `FlowControlKind::Pause`, `0x0101` → `FlowControlKind::PriorityFlowControl`. Returns `None` for unknown opcodes. **Known limitation:** most NICs/drivers consume PAUSE/PFC at the MAC layer before pcap sees them. Absence of these alerts does NOT prove pause isn't happening upstream — it just means this NIC didn't surface them
 - **Adding a new protocol parser** = create `parser/<name>.rs`, declare `pub mod <name>;` in `parser.rs`, re-export its public functions with `pub use <name>::...`, add a branch in `detect_protocol`. Tests live in the same file as the parser
 
@@ -92,7 +92,7 @@ See **[TODO.md](TODO.md)** for the full list. Quick summary:
 - `streams` and `tcp_streams` pruned after each 5s report: silent >20s removed; TCP `Terminated` removed immediately
 - `ptp_domains` and `sdp_cache` never pruned (bounded by design)
 - Per-window counters reset after each 5s report: `gap_events`, `max_iat_ms`, `pt_mismatches`, `dscp_violations`, `ssrc_changes`, `lost_this_window`, `ts_discontinuities_this_window`, `reorders_this_window` (StreamStats) + `pause_frames_this_window`, `pfc_frames_this_window` (CaptureState) — alerts and score penalties reflect the current window, not the stream's lifetime
-- **Alert dedup pattern**: cumulative counters (`lost_packets`, `ts_discontinuities`) keep growing forever; alerts fire only when the corresponding `*_this_window` delta is non-zero. Without this, a single old loss re-alerted every 5s for the rest of the run. Apply the same pattern when adding alerts on any cumulative metric
+- **Alert dedup pattern**: cumulative counters (`lost_packets`, `ts_discontinuities`) keep growing forever; alerts fire only when the corresponding `*_this_window` delta is non-zero. Without this, a single old loss re-alerted every 5s for the rest of the run. Apply the same pattern when adding alerts on any cumulative metric. Exception: `reorders_this_window` is not cumulative (reorders don't accumulate to a lifetime total) — its alert fires when the per-window count is non-zero AND the reorder rate exceeds 1%
 - All protocol arms set `last_packet_time = Some(now)` so pruning applies uniformly
 - IGMP Join deduplication: `igmp_joins_seen: HashMap<(Ipv4Addr, Ipv4Addr), Instant>` — cleared on Leave; entries older than 5 minutes pruned each report cycle (handles hosts that disappear without sending Leave); Queries/Unknowns always print
 - **VLAN-tagged frames**: `unwrap_vlan()` in `parser.rs` peels 802.1Q / 802.1ad / QinQ tags before dispatch — L2 AVB protocols work on tagged networks. No VLAN-ID filtering is implemented; the app processes whatever VLANs the capture interface receives. Operator-facing guidance (trunk vs access vs SPAN, macOS tag-stripping, QinQ caveat) lives in README.md under "Capture Setup — Monitoring One or Multiple VLANs"
@@ -116,7 +116,7 @@ See **[TODO.md](TODO.md)** for the full list. Quick summary:
 - **Transport**: UDP multicast 239.69.*
 - **Detection**: `is_aes67_multicast(dst_ip)` after RTP version check
 - **Clock**: PTPv2 via UDP ports 319/320; ts-refclk cross-check validates SDP-claimed grandmaster against wire
-- **Health metrics**: loss (RFC 3550 seq, signed-delta — backward/reorder ignored), jitter (RFC 3550 EWMA, sign-preserving), SSRC changes, TS discontinuities, signal gaps, payload type validation, DSCP EF(46) per-stream
+- **Health metrics**: loss (RFC 3550 seq, signed-delta — negative delta = reorder, counted separately in `reorders_this_window`, not added to loss), jitter (RFC 3550 EWMA, sign-preserving), SSRC changes, TS discontinuities, signal gaps, payload type validation, DSCP EF(46) per-stream; reorder alert fires when `reorders_this_window / total_packets > 1%`
 - `clock_hz_confirmed` gates TS discontinuity detection — set at stream creation if SDP found, or retroactively when SAP arrives
 - `expected_pt` from SDP `a=rtpmap`; `pt_mismatches` counts mismatches per packet within the 5s window
 - Signal gap: `gap_events` fires when IAT > 50ms; alert requires **≥2 events per 5s window** (single spike = pcap scheduling noise); `max_iat_ms` tracks worst case; both reset per 5s window
@@ -124,10 +124,11 @@ See **[TODO.md](TODO.md)** for the full list. Quick summary:
 - Alert `⚠ Stream not announced (no SAP)` when >10 packets with no SDP enrichment (AES67/Dante/ST2110 only — AVB/NDI never have SDP)
 
 ### Dante
-- **Transport**: UDP unicast or multicast (239.255.x.x); discovery via mDNS `_netaudio._udp`
+- **Transport**: UDP unicast or multicast (239.255.x.x); discovery via mDNS (`_netaudio-cmc._udp` / `_netaudio-arc._udp` on firmware 4.x+, `_netaudio._udp` legacy)
 - **Detection**: `is_likely_dante_audio()` requires BOTH src AND dst ports in 5000–6000 (even) — prevents false positives from ephemeral source ports
 - **Clock**: PTPv1 via UDP ports 319/320; grandmaster from Sync body (bytes 50–55 UUID, byte 61 stratum, bytes 62–65 ident); PTPv1 layout auto-detected by **`payload[0]`**: `0x11` → nibble-packed (hdr_shift=2), else separate-byte (hdr_shift=0); subdomain → domain: _DFLT=0, _ALT1=1, _ALT2=2, _ALT3=3
-- **Device names**: extracted from mDNS DNS labels via `extract_dante_name()` (needle `\x09_netaudio`); stored in `dante_names: HashMap<Ipv4Addr, String>`; `DanteKind::Discovery { device_name }` carries name to dispatch
+- **Device names**: extracted from mDNS DNS labels via `extract_dante_name()` (tries CMC → ARC → legacy); stored in `dante_names: HashMap<Ipv4Addr, String>`; `DanteKind::Discovery { device_name }` carries name to dispatch
+- **`AvProtocol::Dante`**: `{ kind, src, dst, dst_port }` — `dst` is the destination IP; used in `handle_dante` to set `is_multicast` and fill `dst_ip`/`dst_port` via `StreamStats::new_with_info`
 - **Health metrics**: all RTP metrics (same as AES67), DSCP EF(46) checked per packet
 - `requires_valid_ptp_clock()` returns `true` for Dante — "no clock source" warning fires if PTPv1 disappears
 - Default `ptime_ms = 1.0` (48 samples at 48kHz) for TS discontinuity tolerance
@@ -160,7 +161,7 @@ See **[TODO.md](TODO.md)** for the full list. Quick summary:
 
 ### mDNS name extraction (shared)
 - `extract_mdns_instance_name(payload, needle)` in `parser.rs`: finds DNS-label-encoded service, extracts preceding instance name (1–63 bytes, printable ASCII, longest match)
-- Used by `extract_dante_name()` (needle `\x09_netaudio`) and `extract_ndi_name()` (needle `\x04_ndi`)
+- Used by `extract_dante_name()` (tries `\x0d_netaudio-cmc` → `\x0d_netaudio-arc` → `\x09_netaudio`) and `extract_ndi_name()` (needle `\x04_ndi`)
 
 ---
 

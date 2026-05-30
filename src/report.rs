@@ -77,6 +77,7 @@ pub fn print_report(
     pause_frames: u64,
     pfc_frames: u64,
     pcap_stats: Option<(u32, u32, u32)>,
+    packets_dispatched: u64,
     quiet: bool,
 ) {
     let now = Local::now();
@@ -643,8 +644,8 @@ pub fn print_report(
     // count corrupts loss and jitter measurements for all streams.
     if let Some((received, dropped, if_dropped)) = pcap_stats {
         let stats_line = format!(
-            "   📦 {:} pkts received  |  {} kernel drop(s)  |  {} interface drop(s)",
-            received, dropped, if_dropped
+            "   📦 {:} pkts received  |  {} kernel drop(s)  |  {} interface drop(s)  |  {} parsed",
+            received, dropped, if_dropped, packets_dispatched
         );
         logger.log(&stats_line);
         if dropped > 0 || if_dropped > 0 {
@@ -657,6 +658,10 @@ pub fn print_report(
         } else {
             println!("{}", stats_line);
         }
+    } else {
+        let line = format!("   📦 {} parsed", packets_dispatched);
+        logger.log(&line);
+        println!("{}", line);
     }
 
     logger.log("");

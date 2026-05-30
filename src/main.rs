@@ -30,6 +30,8 @@ use crate::parser::{detect_protocol, parse_tcp_packet, parse_ts_refclk, is_multi
 use crate::report::{create_logger, print_report};
 use crate::stats::StreamStats;
 
+use std::net::{Ipv4Addr, UdpSocket};
+
 /// Global colour flag — set once at startup, read-only after that.
 /// Use `color_enabled()` everywhere rather than accessing this directly.
 static COLOR: AtomicBool = AtomicBool::new(true);
@@ -37,6 +39,53 @@ static COLOR: AtomicBool = AtomicBool::new(true);
 /// Returns `true` when ANSI colour output is enabled (the default).
 /// Set to `false` by `--no-color` or the `NO_COLOR` environment variable.
 pub fn color_enabled() -> bool { COLOR.load(Ordering::Relaxed) }
+
+/// Join multicast groups needed for AV protocol discovery on IGMP-snooped switches.
+/// Returns the sockets — caller must keep them alive for the process lifetime.
+/// Failure to join a group is non-fatal (missing permission, no route) — we log and continue.
+fn join_multicast_groups(
+    iface_ip: Ipv4Addr,
+    expanded: &[protocols::ProtocolChoice],
+    logger: &mut crate::report::Logger,
+) -> Vec<UdpSocket> {
+    let needs_ptp = expanded.iter().any(|c| matches!(c,
+        protocols::ProtocolChoice::AES67 | protocols::ProtocolChoice::ST2110
+        | protocols::ProtocolChoice::Dante | protocols::ProtocolChoice::AVB));
+    let needs_sap = expanded.iter().any(|c| matches!(c,
+        protocols::ProtocolChoice::AES67 | protocols::ProtocolChoice::ST2110));
+
+    let mut groups: Vec<(Ipv4Addr, &str)> = Vec::new();
+    if needs_ptp {
+        groups.push((Ipv4Addr::new(224, 0, 1, 129), "PTPv1/v2 _DFLT (224.0.1.129)"));
+        groups.push((Ipv4Addr::new(224, 0, 1, 130), "PTPv1 _ALT1 (224.0.1.130)"));
+        groups.push((Ipv4Addr::new(224, 0, 1, 131), "PTPv1 _ALT2 (224.0.1.131)"));
+        groups.push((Ipv4Addr::new(224, 0, 1, 132), "PTPv1 _ALT3 (224.0.1.132)"));
+        groups.push((Ipv4Addr::new(224, 0, 0, 107), "PTPv2 peer-delay (224.0.0.107)"));
+    }
+    if needs_sap {
+        groups.push((Ipv4Addr::new(224, 2, 127, 254), "SAP (224.2.127.254)"));
+    }
+
+    let mut sockets = Vec::new();
+    for (group, label) in groups {
+        match UdpSocket::bind("0.0.0.0:0")
+            .and_then(|s| { s.join_multicast_v4(&group, &iface_ip)?; Ok(s) })
+        {
+            Ok(s) => {
+                let msg = format!("   ✓ Joined multicast group {}", label);
+                logger.log(&msg);
+                println!("{}", msg);
+                sockets.push(s);
+            }
+            Err(e) => {
+                let msg = format!("   ⚠ Could not join {} — {}", label, e);
+                logger.log(&msg);
+                println!("{}", msg);
+            }
+        }
+    }
+    sockets
+}
 
 fn main() {
     let args = cli::parse_cli_args();
@@ -70,6 +119,14 @@ fn main() {
     };
     println!("{}", banner);
     logger.log(&banner);
+    println!("🔍 BPF filter: {}", bpf_filter);
+    logger.log(&format!("BPF filter: {}", bpf_filter));
+
+    // ── IGMP joins — ensures IGMP-snooped switches forward PTP/SAP multicast ─
+    let iface_ip = device.addresses.iter()
+        .find_map(|a| if let std::net::IpAddr::V4(v4) = a.addr { Some(v4) } else { None })
+        .unwrap_or(Ipv4Addr::UNSPECIFIED);
+    let _mc_sockets = join_multicast_groups(iface_ip, &expanded_protocols, &mut logger);
 
     // ── Opening capture with BPF filter ───────────────
     let mut cap = Capture::from_device(device.name.as_str())
@@ -119,7 +176,7 @@ fn main() {
                 &mut logger, &state.network_health, state.bytes_this_window,
                 &state.avtp_streams, &state.msrp_state, &state.mvrp_vlans, &state.eee_ports,
                 state.pause_frames_this_window, state.pfc_frames_this_window,
-                pcap_stats, quiet,
+                pcap_stats, state.packets_dispatched, quiet,
             );
 
             state.reset_window();
@@ -146,6 +203,7 @@ fn main() {
         // AVTP sequence counter is byte 2 of the AVTP payload — only meaningful for AVB.
         let avtp_seq = eth.payload().get(2).copied();
 
+        state.packets_dispatched += 1;
         if let Some(proto) = detect_protocol(&eth)
             && proto.is_selected(&expanded_protocols)
         {

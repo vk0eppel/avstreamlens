@@ -32,8 +32,11 @@ fn extract_mdns_instance_name(payload: &[u8], service_needle: &[u8]) -> Option<S
 }
 
 /// Extract the Dante device instance name from an mDNS payload.
+/// Tries modern service types first (firmware 4.x+), then the legacy `_netaudio` service.
 pub fn extract_dante_name(payload: &[u8]) -> Option<String> {
-    extract_mdns_instance_name(payload, b"\x09_netaudio")
+    extract_mdns_instance_name(payload, b"\x0d_netaudio-cmc")
+        .or_else(|| extract_mdns_instance_name(payload, b"\x0d_netaudio-arc"))
+        .or_else(|| extract_mdns_instance_name(payload, b"\x09_netaudio"))
 }
 
 /// Extract the NDI source instance name from an mDNS payload.
@@ -47,10 +50,30 @@ mod tests {
 
     #[test]
     fn dante_name_extracted_from_mdns_label() {
-        // DNS label encoding: \x05Stage + \x09_netaudio
+        // DNS label encoding: \x05Stage + \x09_netaudio  (legacy firmware)
         let mut p = vec![0x05, b'S', b't', b'a', b'g', b'e'];
         p.extend_from_slice(b"\x09_netaudio");
         assert_eq!(extract_dante_name(&p), Some("Stage".to_string()));
+    }
+
+    #[test]
+    fn dante_name_extracted_from_netaudio_cmc_label() {
+        // DNS label encoding: \x0fY001-Yamaha-DM7 + \x0d_netaudio-cmc  (modern firmware 4.x+)
+        let instance = b"Y001-Yamaha-DM7";
+        let mut p = vec![instance.len() as u8];
+        p.extend_from_slice(instance);
+        p.extend_from_slice(b"\x0d_netaudio-cmc");
+        assert_eq!(extract_dante_name(&p), Some("Y001-Yamaha-DM7".to_string()));
+    }
+
+    #[test]
+    fn dante_name_extracted_from_netaudio_arc_label() {
+        // DNS label encoding: instance + \x0d_netaudio-arc  (Dante ARC service)
+        let instance = b"TASCAM";
+        let mut p = vec![instance.len() as u8];
+        p.extend_from_slice(instance);
+        p.extend_from_slice(b"\x0d_netaudio-arc");
+        assert_eq!(extract_dante_name(&p), Some("TASCAM".to_string()));
     }
 
     #[test]

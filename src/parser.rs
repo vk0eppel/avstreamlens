@@ -195,11 +195,14 @@ pub fn detect_protocol(eth: &EthernetPacket) -> Option<AvProtocol> {
 
     // ── mDNS (port 5353) ────────────────────────────────
     if dst_port == crate::protocols::MDNS_PORT || src_port == crate::protocols::MDNS_PORT {
-        if mdns_contains(payload, b"_netaudio._udp") {
+        if mdns_contains(payload, b"\x09_netaudio")
+            || mdns_contains(payload, b"\x0d_netaudio-cmc")
+            || mdns_contains(payload, b"\x0d_netaudio-arc")
+        {
             let device_name = extract_dante_name(payload);
-            return Some(AvProtocol::Dante { kind: DanteKind::Discovery { device_name }, src: src_ip, dst_port });
+            return Some(AvProtocol::Dante { kind: DanteKind::Discovery { device_name }, src: src_ip, dst: dst_ip, dst_port });
         }
-        if mdns_contains(payload, b"_ndi._tcp") {
+        if mdns_contains(payload, b"\x04_ndi") {
             let source_name = extract_ndi_name(payload);
             return Some(AvProtocol::Ndi { kind: NdiKind::Discovery { source_name }, src: src_ip });
         }
@@ -208,7 +211,7 @@ pub fn detect_protocol(eth: &EthernetPacket) -> Option<AvProtocol> {
 
     // ── Dante Control ───────────────────────────────────
     if crate::protocols::DANTE_CTRL_PORTS.contains(&dst_port) || crate::protocols::DANTE_CTRL_PORTS.contains(&src_port) {
-        return Some(AvProtocol::Dante { kind: DanteKind::Control, src: src_ip, dst_port });
+        return Some(AvProtocol::Dante { kind: DanteKind::Control, src: src_ip, dst: dst_ip, dst_port });
     }
 
     // ── PTP over UDP (ports 319/320) ─────────────────────
@@ -239,7 +242,7 @@ pub fn detect_protocol(eth: &EthernetPacket) -> Option<AvProtocol> {
     // Dante multicast uses 239.x.x.x addresses (typically 239.255.*) which would otherwise
     // be misclassified as ST2110. Both src AND dst must be in 5000–6000 (even).
     if is_likely_dante_audio(src_port, dst_port, payload_type) {
-        return Some(AvProtocol::Dante { kind: DanteKind::AudioStream, src: src_ip, dst_port });
+        return Some(AvProtocol::Dante { kind: DanteKind::AudioStream, src: src_ip, dst: dst_ip, dst_port });
     }
     if is_aes67_multicast(dst_ip) {
         return Some(AvProtocol::Aes67 { src: src_ip, dst: dst_ip, dst_port, payload_type });

@@ -110,6 +110,7 @@ pub struct CaptureState {
     // congestion that has caused brief tx-side freezes.
     pub pause_frames_this_window: u64,
     pub pfc_frames_this_window:   u64,
+    pub packets_dispatched: u64,
 }
 
 impl Default for CaptureState {
@@ -135,6 +136,7 @@ impl CaptureState {
             bytes_this_window: 0,
             pause_frames_this_window: 0,
             pfc_frames_this_window:   0,
+            packets_dispatched: 0,
         }
     }
 
@@ -144,6 +146,7 @@ impl CaptureState {
         self.bytes_this_window = 0;
         self.pause_frames_this_window = 0;
         self.pfc_frames_this_window   = 0;
+        self.packets_dispatched = 0;
         self.network_health.ecn_congestion_marks = 0;
         for s in self.streams.values_mut() {
             s.gap_events      = 0;
@@ -330,7 +333,7 @@ impl CaptureState {
     }
 
     /// Dante: discovery, control (silent), or audio stream.
-    pub fn handle_dante(&mut self, kind: DanteKind, src: Ipv4Addr, dst_port: u16, l2_payload: &[u8]) -> Vec<Alert> {
+    pub fn handle_dante(&mut self, kind: DanteKind, src: Ipv4Addr, dst: Ipv4Addr, dst_port: u16, l2_payload: &[u8]) -> Vec<Alert> {
         match kind {
             DanteKind::Discovery { device_name } => {
                 if let Some(ref name) = device_name {
@@ -341,9 +344,10 @@ impl CaptureState {
             }
             DanteKind::Control => vec![],
             DanteKind::AudioStream => {
+                let is_mc = crate::parser::is_multicast(dst);
                 let key = format!("Dante {}:{}", src, dst_port);
                 let stats = self.streams.entry(key).or_insert_with(|| {
-                    let mut s = StreamStats::new("Dante", DEFAULT_CLOCK_HZ);
+                    let mut s = StreamStats::new_with_info("Dante", DEFAULT_CLOCK_HZ, is_mc, dst, dst_port);
                     s.ptime_ms = 1.0; // Dante standard: 48 samples @ 48kHz = 1ms
                     s.sdp_name = self.dante_names.get(&src).cloned();
                     s
@@ -626,8 +630,8 @@ pub fn dispatch(
             state.handle_st2110(dst, dst_port, stream_type, l2_payload);
             vec![]
         }
-        AvProtocol::Dante { kind, src, dst_port } => {
-            state.handle_dante(kind, src, dst_port, l2_payload)
+        AvProtocol::Dante { kind, src, dst, dst_port } => {
+            state.handle_dante(kind, src, dst, dst_port, l2_payload)
         }
         AvProtocol::Ndi { kind: NdiKind::Discovery { source_name }, src } => {
             state.handle_ndi_discovery(src, source_name)
@@ -853,7 +857,7 @@ mod tests {
         let src = Ipv4Addr::new(192, 168, 1, 50);
         state.dante_names.insert(src, "Stage Box".to_string());
         // empty l2_payload — name pickup happens before IP parse
-        let alerts = state.handle_dante(DanteKind::AudioStream, src, 5004, &[]);
+        let alerts = state.handle_dante(DanteKind::AudioStream, src, Ipv4Addr::new(192,168,1,60), 5004, &[]);
         assert!(alerts.is_empty());
         let s = state.streams.get("Dante 192.168.1.50:5004").expect("audio stream entry");
         assert_eq!(s.sdp_name.as_deref(), Some("Stage Box"));
@@ -865,7 +869,7 @@ mod tests {
         let src = Ipv4Addr::new(192, 168, 1, 50);
         let alerts = state.handle_dante(
             DanteKind::Discovery { device_name: Some("Stage Box".to_string()) },
-            src, 0, &[],
+            src, Ipv4Addr::new(224,0,0,251), 0, &[],
         );
         assert_eq!(alerts.len(), 1);
         assert_eq!(alerts[0].level, AlertLevel::Info);
@@ -989,7 +993,7 @@ mod tests {
     fn ptp_ok_for_dante_with_ptpv1_clock() {
         // Dante accepts either PTPv1 or PTPv2.
         let mut state = CaptureState::new();
-        state.handle_dante(DanteKind::AudioStream, Ipv4Addr::new(192,168,1,10), 5004, &[]);
+        state.handle_dante(DanteKind::AudioStream, Ipv4Addr::new(192,168,1,10), Ipv4Addr::new(192,168,1,60), 5004, &[]);
         state.ptp_domains.insert((0, PTP_VERSION_V1), valid_ptp_stats(PTP_VERSION_V1, "PTPv1"));
         assert!(state.missing_ptp_clocks(&[ProtocolChoice::Dante]).is_empty());
     }
@@ -1063,7 +1067,7 @@ mod tests {
     fn missing_clock_separates_ptpv2_and_dante_when_both_lack_their_clock() {
         let mut state = CaptureState::new();
         seed_aes67_stream(&mut state);
-        state.handle_dante(DanteKind::AudioStream, Ipv4Addr::new(192,168,1,50), 5004, &[]);
+        state.handle_dante(DanteKind::AudioStream, Ipv4Addr::new(192,168,1,50), Ipv4Addr::new(192,168,1,60), 5004, &[]);
         let missing = state.missing_ptp_clocks(&[ProtocolChoice::AES67, ProtocolChoice::Dante]);
         assert_eq!(missing.len(), 2);
         assert!(missing.iter().any(|m| m.kind == MissingClockKind::Ptpv2 && m.affected == vec!["AES67"]));

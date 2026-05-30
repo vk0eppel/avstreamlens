@@ -93,7 +93,47 @@ Protocol names are case-insensitive. The interactive-mode numbers (0–7) are al
 
 ---
 
-## Capture Setup — Monitoring One or Multiple VLANs
+## Capture Setup — Switch Port and Unicast Visibility
+
+### Why a SPAN port is required for full visibility
+
+AVStreamLens is a **passive capture tool** — it reads traffic delivered to its network interface. On a switched network this matters: a switch forwards unicast frames only to the destination port, not to every port on the switch. Promiscuous mode does not change this — it lets the NIC accept frames addressed to other MAC addresses, but only frames the switch has already forwarded to that port.
+
+**Consequence for Dante and other unicast AV protocols:**
+Dante audio is unicast by default. If a flow runs between two devices that are NOT the capture machine, the switch delivers those packets only to those two ports. The capture machine never sees them — regardless of promiscuous mode or what tool you use.
+
+You will see:
+- Multicast traffic (mDNS discovery, Dante device status, AES67 / ST 2110 streams, IGMP, PTP)
+- Any unicast traffic where the capture machine is the source or destination
+- Broadcast (ARP, DHCP)
+
+You will **not** see:
+- Unicast Dante audio flows between two other devices
+- Unicast NDI flows between two other devices
+- Any other unicast traffic not destined for your port
+
+**The solution is a SPAN / mirror port.** A SPAN session (also called port mirroring) instructs the switch to copy all traffic from one or more source ports — or an entire VLAN — to a dedicated monitor port. Connect the capture machine to that monitor port and it receives a copy of all mirrored traffic, including unicast flows between other devices.
+
+How to configure a SPAN session depends on the switch vendor:
+
+| Switch family | How to configure port mirroring |
+|---|---|
+| Cisco IOS / IOS-XE | `monitor session 1 source interface Gi0/1 - 24` / `monitor session 1 destination interface Gi0/48` |
+| Cisco Catalyst (GUI) | **Admin → Diagnostics → Port Mirroring** |
+| Aruba / HP ProCurve | `mirror 1 port Trk1` + `interface X mirror 1` |
+| Juniper EX | `set forwarding-options analyzer <name> input ... output interface <port>` |
+| Luminex GigaCore | **Port Mirroring** tab in the web UI — select source ports and mirror destination |
+| Netgear ProSafe | **Switching → Port Mirroring** in the web UI |
+| Unmanaged switch | No SPAN capability — use a **network tap** or replace with a managed switch |
+
+**Typical SPAN setup for an AV network:**
+1. Connect the capture machine to a spare port on the managed switch.
+2. Configure a SPAN session that mirrors the uplink port (or the entire AV VLAN) to that port.
+3. Run AVStreamLens on the capture machine — it will now see all unicast and multicast flows on the mirrored segment.
+
+---
+
+### Monitoring one or multiple VLANs
 
 AVStreamLens has no per-VLAN configuration: it parses any VLAN delivered to the capture interface. 802.1Q, 802.1ad, and QinQ tags are stripped transparently before protocol detection, so AVB, PTP, and IP streams are recognised regardless of tagging.
 
