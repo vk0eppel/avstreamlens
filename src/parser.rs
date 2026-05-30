@@ -5,6 +5,7 @@
 pub mod sdp;
 pub mod ptp;
 pub mod avb;
+pub mod avdecc;
 pub mod lldp;
 pub mod mdns;
 pub mod flow_control;
@@ -14,6 +15,7 @@ pub mod flow_control;
 pub use sdp::{parse_sap_packet, parse_ts_refclk};
 pub use ptp::parse_ptp;
 pub use avb::{parse_avtp_stream_id, parse_msrp, parse_mvrp};
+pub use avdecc::{parse_adp, fmt_eui64, media_type_summary, sr_class_str};
 pub use lldp::parse_lldp_eee;
 pub use mdns::{extract_dante_name, extract_ndi_name, mdns_contains};
 pub use flow_control::parse_flow_control;
@@ -188,6 +190,14 @@ pub fn detect_protocol(eth: &EthernetPacket) -> Option<AvProtocol> {
     // the VLAN-unwrapped payload — AVB normally rides a tagged VLAN, so reading the
     // sequence counter from the raw Ethernet payload would land inside the 802.1Q tag.
     if raw_et == crate::protocols::ETHERTYPE_AVTP {
+        // AVDECC ADP: byte 0 = 0xFA (cd=1, subtype=0x7A). Destination MAC is
+        // 91:E0:F0:01:00:00, a globally registered multicast that bridges MUST
+        // forward — this is how Milan Manager / Hive discover all devices without
+        // a SPAN port. Handle before the generic AVTP path so sv=0 frames are not
+        // silently discarded by handle_avb's stream-id gate.
+        if l2_payload.first().copied() == Some(0xFA) {
+            return parse_adp(l2_payload).map(AvProtocol::AvdeccAdp);
+        }
         let subtype   = l2_payload.first().copied().unwrap_or(0);
         let seq       = l2_payload.get(2).copied();
         let stream_id = parse_avtp_stream_id(l2_payload);

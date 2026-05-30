@@ -14,7 +14,7 @@ AVStreamLens reads the network passively using pcap, identifies streams and cloc
 | **SMPTE ST 2110** | UDP multicast (239.x.x.x) | Video (2110-20), audio (2110-30), ancillary (2110-40) — same RTP metrics as AES67; video clock rate confirmed without SDP |
 | **Dante** | UDP unicast or multicast / mDNS | Device names from mDNS, audio stream RTP metrics, signal gap detection, DSCP, PTPv1 clock |
 | **NDI** | TCP (dynamic ports) | Source names from mDNS, bitrate, TCP quality, retransmissions, RST/FIN |
-| **AVB / IEEE 802.1** | L2 Ethernet | gPTP grandmaster (802.1AS), MSRP bandwidth reservations (802.1Qat), MVRP VLAN registrations (802.1Q), AVTP stream IDs |
+| **AVB / IEEE 802.1** | L2 Ethernet | gPTP grandmaster (802.1AS), MSRP bandwidth reservations (802.1Qat), MVRP VLAN registrations (802.1Q), AVTP stream IDs, AVDECC entity discovery (IEEE 1722.1) |
 
 **Always monitored regardless of selection:** LLDP (for EEE detection).
 **Monitored when relevant:** PTP when AES67/ST2110/Dante/AVB selected — IGMP when AES67/ST2110/Dante selected — SAP when AES67/ST2110 selected.
@@ -107,6 +107,7 @@ AVStreamLens is a **passive capture tool** — it reads traffic delivered to its
 | **SMPTE ST 2110** | UDP multicast (239.x.x.x) — AVStreamLens auto-joins these groups |
 | **Dante audio (multicast)** | 239.255.x.x — AVStreamLens auto-joins groups as streams are discovered |
 | **AVB — AVTP stream data** | MAAP-allocated multicast MACs — forwarded like normal multicast |
+| **AVB — AVDECC entities** | ADP uses MAC `91:E0:F0:01:00:00` (globally registered, bridges MUST forward) |
 | **PTP, IGMP, SAP** | Multicast — AVStreamLens joins PTP and SAP groups at startup |
 | **Dante / NDI discovery** | mDNS multicast (link-local, always flooded) — delivered to every port |
 | **Dante PTPv1 clock** | Multicast — delivered to every port |

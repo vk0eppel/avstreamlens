@@ -14,6 +14,7 @@
 | `src/parser/sdp.rs` | SAP envelope (RFC 2974), SDP body (RFC 4566), `ts-refclk` normalisation |
 | `src/parser/ptp.rs` | PTPv1 (IEEE 1588-2002) + PTPv2 (IEEE 1588-2008) message parser — used for both UDP PTP and L2 gPTP |
 | `src/parser/avb.rs` | AVTP stream-id extraction + MSRP (802.1Qat) + MVRP (802.1Q) PDU parsers |
+| `src/parser/avdecc.rs` | AVDECC ADP (IEEE 1722.1) frame parser — entity discovery without SPAN |
 | `src/parser/lldp.rs` | LLDP TLV walker that surfaces the IEEE 802.3az EEE TLV |
 | `src/parser/mdns.rs` | mDNS service-instance name extraction (Dante `_netaudio-cmc`/`_netaudio-arc`/`_netaudio`, NDI `_ndi`) |
 | `src/parser/flow_control.rs` | 802.3x PAUSE / 802.1Qbb PFC frame classifier (EtherType 0x8808) |
@@ -27,7 +28,7 @@
 cargo build --release   # build
 cargo fmt               # format
 cargo clippy -- -D warnings  # lint
-cargo test              # run all 115 unit tests
+cargo test              # run all 121 unit tests
 ```
 
 ## Open Work
@@ -45,7 +46,7 @@ See **[TODO.md](TODO.md)** for the full list. Quick summary:
 ## Architecture
 
 ### General
-- **Test harness**: 115 unit tests in `#[cfg(test)]` modules across `parser.rs` + `parser/{sdp,ptp,avb,lldp,mdns,flow_control}.rs`, `stats.rs`, and `capture.rs` — run with `cargo test`. Each parser submodule keeps its own fixtures and tests. `capture.rs` tests exercise handlers with hand-built IP/UDP/RTP byte buffers (see `ip_udp_rtp()` helper); no pcap dependency in tests
+- **Test harness**: 121 unit tests in `#[cfg(test)]` modules across `parser.rs` + `parser/{sdp,ptp,avb,avdecc,lldp,mdns,flow_control}.rs`, `stats.rs`, and `capture.rs` — run with `cargo test`. Each parser submodule keeps its own fixtures and tests. `capture.rs` tests exercise handlers with hand-built IP/UDP/RTP byte buffers (see `ip_udp_rtp()` helper); no pcap dependency in tests
 - Logging: timestamped `.log` files written on every run in the working directory; `Logger::log()` flushes after every write so the last report survives SIGINT
 - Bitrate computed as `byte_delta / elapsed_secs` — never assumed 1s exactly
 - All modules follow the same pattern: parse → stats → report
@@ -61,7 +62,7 @@ See **[TODO.md](TODO.md)** for the full list. Quick summary:
 - **Adding a new protocol parser** = create `parser/<name>.rs`, declare `pub mod <name>;` in `parser.rs`, re-export its public functions with `pub use <name>::...`, add a branch in `detect_protocol`. Tests live in the same file as the parser
 
 ### Capture Module (`capture.rs`)
-- **`CaptureState`** owns all per-loop HashMaps/HashSets (streams, tcp_streams, sdp_cache, ptp_domains, ndi_sources, ndi_names, dante_names, igmp_joins_seen, avtp_streams, msrp_state, mvrp_vlans, eee_ports), `network_health`, `bytes_this_window`, and the dynamic-IGMP-join queue: `pending_join_groups: Vec<Ipv4Addr>` (handlers push new `239.x.x.x` groups here; drained by `main.rs` after each dispatch) and `joined_multicast: HashSet<Ipv4Addr>` (written by `main.rs` after a successful `join_multicast_v4` so handlers can skip groups already joined). `main.rs` holds exactly one `CaptureState` for the lifetime of the process
+- **`CaptureState`** owns all per-loop HashMaps/HashSets (streams, tcp_streams, sdp_cache, ptp_domains, ndi_sources, ndi_names, dante_names, igmp_joins_seen, avtp_streams, msrp_state, mvrp_vlans, eee_ports, avdecc_entities), `network_health`, `bytes_this_window`, and the dynamic-IGMP-join queue: `pending_join_groups: Vec<Ipv4Addr>` (handlers push new `239.x.x.x` groups here; drained by `main.rs` after each dispatch) and `joined_multicast: HashSet<Ipv4Addr>` (written by `main.rs` after a successful `join_multicast_v4` so handlers can skip groups already joined). `main.rs` holds exactly one `CaptureState` for the lifetime of the process
 - **One `handle_*` method per protocol** (e.g. `handle_aes67`, `handle_dante`, `handle_ptp`). Each takes already-parsed inputs (`l2_payload: &[u8]`, `frame_bytes: u64`, `avtp_seq: Option<u8>`, `now: Instant`) — never a raw `pcap::Packet`. This is what makes handlers unit-testable
 - **Handlers do not touch IO.** They mutate `CaptureState` and return `Vec<Alert>`. The dispatch layer prints + logs. The `PtpEvent` pattern in `stats.rs` is the same idea applied one layer deeper (data layer returns events; handler layer turns them into `Alert`s)
 - **`Alert { level: AlertLevel, message: String }`** with constructors `Alert::info/good/warn/error`. `emit(&[Alert], &mut Logger)` maps level → ANSI color (none/32/33/31) and prints + logs in one place. Adding a new severity or alert format is a single-site change
@@ -153,7 +154,8 @@ See **[TODO.md](TODO.md)** for the full list. Quick summary:
 - Alert `⚠ Stream type unknown` when classified as 2110-??
 
 ### AVB
-- **Transport**: L2 Ethernet — AVTP (0x22F0), MSRP (0x22EA), MVRP (0x88F5), gPTP (0x88F7)
+- **Transport**: L2 Ethernet — AVTP (0x22F0), MSRP (0x22EA), MVRP (0x88F5), gPTP (0x88F7), AVDECC ADP (0x22F0, byte0=0xFA)
+- **AVDECC ADP** (IEEE 1722.1 discovery): `avdecc_entities: HashMap<[u8;8], AvdeccEntity>` keyed by entity_id EUI-64; parsed by `parser/avdecc.rs::parse_adp()`. Destination MAC `91:E0:F0:01:00:00` is a globally registered multicast — **bridges MUST forward it** (unlike gPTP link-local `01:80:C2:00:00:0E`). This is why Milan Manager / Hive see every device without a SPAN port. Byte 0 of the AVTP payload = `0xFA` (cd=1, subtype=0x7A). ADP layout: `[1]`=message_type (0=AVAILABLE, 1=DEPARTING, 2=DISCOVER), `[4-11]`=entity_id, `[12-19]`=entity_model_id (OUI = vendor), `[20-23]`=entity_capabilities (CLASS_A=0x100, CLASS_B=0x200, AEM=0x08), `[24-25]`=talker_sources, `[26-27]`=talker_caps (AUDIO=0x200, VIDEO=0x400), `[28-29]`=listener_sinks, `[30-31]`=listener_caps, `[36-39]`=available_index, `[40-47]`=gptp_grandmaster_id, `[48]`=gptp_domain. ENTITY_DEPARTING removes the entity immediately; ENTITY_DISCOVER is ignored. Entities pruned when `last_seen > valid_time_secs + 10s`. Displayed in "📡 Discovered (AVDECC)" section. `handle_avdecc_adp()` in capture.rs emits an Info alert on first detection and on available_index change (state change)
 - **AVTP**: `avtp_streams: HashMap<[u8;8], AvtpStreamStats>` per stream_id (sv=1, bytes 4–11); subtype decoded via `avtp_subtype_name()` (0x00=IEC 61883, 0x02=CRF, 0x7E=MAAP…); sequence loss via `AvtpStreamStats::update_seq()` on byte 2 counter (8-bit wrap-safe, signed-i8 reorder filter mirrors the RTP fix); bitrate from Ethernet frame sizes
 - **MSRP**: `parse_msrp()` extracts TalkerAdvertise (bandwidth, VLAN, priority), TalkerFailed (failure code at `first_value[33]`), Listener state; `msrp_state: HashMap<[u8;8], MsrpDeclaration>`; TalkerFailed alert immediate, decoded via `protocols::msrp_failure_reason()` over the full 802.1Qat Table 35-6 set (1–19, e.g. 8 = egress port not AVB-capable) with a numeric fallback — always shows `(code N: reason)`
 - **MVRP**: `parse_mvrp()` extracts VLAN IDs; `mvrp_vlans: HashSet<u16>` — presence confirms L2 VLAN QoS; alert if AVTP active but no MVRP

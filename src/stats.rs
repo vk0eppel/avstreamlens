@@ -209,8 +209,30 @@ impl StreamStats {
     pub fn jitter_ms(&self) -> f64 { self.jitter * 1000.0 }
 }
 
+// ═══════════════════════════════════════════════════════════════════
+// SECTION 2b — AVDECC ENTITY STATE (per entity_id)
+// ═══════════════════════════════════════════════════════════════════
+
+/// Live state for one AVDECC entity discovered via ADP announcements.
+/// Pruned from CaptureState when `last_seen` exceeds `valid_time_secs + 10`.
+#[derive(Debug, Clone)]
+pub struct AvdeccEntity {
+    pub entity_id:             [u8; 8],
+    pub entity_model_id:       [u8; 8],
+    pub entity_capabilities:   u32,
+    pub talker_stream_sources: u16,
+    pub talker_capabilities:   u16,
+    pub listener_stream_sinks: u16,
+    pub listener_capabilities: u16,
+    pub gptp_grandmaster_id:   [u8; 8],
+    pub gptp_domain_number:    u8,
+    pub valid_time_secs:       u64,
+    pub available_index:       u32,
+    pub last_seen:             Instant,
+}
+
 // ═════════════════════──══════════════════──═════════════════════════
-// SECTION 2b — AVTP STREAM STATISTICS (per stream_id)
+// SECTION 2c — AVTP STREAM STATISTICS (per stream_id)
 // ═════════════════════──══════════════════──═════════════════════════
 
 #[derive(Debug, Clone)]

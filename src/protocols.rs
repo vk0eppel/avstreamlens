@@ -52,6 +52,7 @@ pub enum AvProtocol {
     Msrp   { declarations: Vec<MsrpDeclaration> },
     Mvrp   { vlan_ids: Vec<u16> },
     Sap    { src: Ipv4Addr, sdp: SdpSession },
+    AvdeccAdp(AvdeccAdp),
     Ptp    { info: PtpInfo },
     Igmp   { src: Ipv4Addr, group: Ipv4Addr, igmp_type: IgmpType },
     LldpEee { chassis_id: String, port_id: String, tx_wake_us: u16, rx_wake_us: u16 },
@@ -190,7 +191,8 @@ impl AvProtocol {
             AvProtocol::Ndi    { .. } => expanded.iter().any(|c| matches!(c, ProtocolChoice::NDI)),
             AvProtocol::Avb    { .. }
             | AvProtocol::Msrp { .. }
-            | AvProtocol::Mvrp { .. } => expanded.iter().any(|c| matches!(c, ProtocolChoice::AVB)),
+            | AvProtocol::Mvrp { .. }
+            | AvProtocol::AvdeccAdp(_) => expanded.iter().any(|c| matches!(c, ProtocolChoice::AVB)),
             AvProtocol::LldpEee { .. } => true,
             // Flow control is universal infrastructure — always relevant.
             AvProtocol::FlowControl { .. } => true,
@@ -284,6 +286,27 @@ pub enum DanteKind {
 #[derive(Debug, Clone, PartialEq)]
 pub enum NdiKind {
     Discovery { source_name: Option<String> },
+}
+
+// ── AVDECC ADP (IEEE 1722.1 discovery) ──
+
+/// Parsed payload of an AVDECC ADP (AVDECC Discovery Protocol) frame.
+/// ADP uses AVTP EtherType (0x22F0), subtype 0x7A with cd=1 → wire byte 0 = 0xFA.
+/// Destination MAC 91:E0:F0:01:00:00 is a globally registered (forwardable) multicast.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AvdeccAdp {
+    pub message_type:          u8,       // 0=ENTITY_AVAILABLE, 1=ENTITY_DEPARTING, 2=ENTITY_DISCOVER
+    pub entity_id:             [u8; 8],  // EUI-64 of the announcing entity
+    pub entity_model_id:       [u8; 8],  // EUI-64 identifying the product model (OUI = vendor)
+    pub entity_capabilities:   u32,      // bitmask: AEM_SUPPORTED=0x08, CLASS_A=0x100, CLASS_B=0x200
+    pub talker_stream_sources: u16,      // number of talker streams this entity can source
+    pub talker_capabilities:   u16,      // bitmask: IMPLEMENTED=0x01, AUDIO=0x200, VIDEO=0x400
+    pub listener_stream_sinks: u16,      // number of listener sinks
+    pub listener_capabilities: u16,      // bitmask: IMPLEMENTED=0x01, AUDIO=0x200, VIDEO=0x400
+    pub gptp_grandmaster_id:   [u8; 8],  // EUI-64 of the gPTP grandmaster this entity is using
+    pub gptp_domain_number:    u8,       // gPTP domain (usually 0)
+    pub valid_time_secs:       u64,      // announcement lifetime in seconds (valid_time field × 2)
+    pub available_index:       u32,      // increments each time the entity's state changes
 }
 
 // ── SDP metadata (from SAP/SDP parser) ──

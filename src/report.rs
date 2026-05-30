@@ -17,7 +17,8 @@ fn ansi(code: &str, text: &str) -> String {
 use std::collections::HashMap;
 use std::time::Duration;
 
-use crate::stats::{StreamStats, TcpStreamStats, PtpStats, NetworkHealth, StreamQuality, AvtpStreamStats};
+use crate::stats::{AvdeccEntity, StreamStats, TcpStreamStats, PtpStats, NetworkHealth, StreamQuality, AvtpStreamStats};
+use crate::parser::{fmt_eui64, media_type_summary, sr_class_str};
 use crate::protocols::{STREAM_TIMEOUT_SECS, MsrpDeclaration, MsrpDeclType, PTP_VERSION_V1, avtp_subtype_name, msrp_failure_reason};
 use crate::capture::{MissingClock, MissingClockKind};
 
@@ -113,6 +114,59 @@ fn print_discovery(
     }
 }
 
+/// Print AVDECC entities discovered via ADP in a "📡 Discovered (AVDECC):" block.
+/// Each entity shows its entity_id, role (talker/listener), SR class, AEM flag,
+/// and the gPTP grandmaster it is currently using.
+fn print_avdecc_entities(
+    entities: &HashMap<[u8; 8], AvdeccEntity>,
+    logger: &mut Logger,
+) {
+    if entities.is_empty() { return; }
+
+    logger.log(&format!("\nDiscovered (AVDECC — {} {}):{}",
+        entities.len(), if entities.len() == 1 { "entity" } else { "entities" }, ""));
+    println!("\n{}", ansi("36", &format!("📡 Discovered (AVDECC — {} {}):",
+        entities.len(), if entities.len() == 1 { "entity" } else { "entities" })));
+
+    let mut sorted: Vec<_> = entities.values().collect();
+    sorted.sort_by_key(|e| e.entity_id);
+
+    for e in sorted {
+        let eui = fmt_eui64(&e.entity_id);
+        let model = fmt_eui64(&e.entity_model_id);
+
+        // Talker / listener role summary
+        let mut parts: Vec<String> = Vec::new();
+        if e.talker_stream_sources > 0 {
+            parts.push(format!("T:{} ({})",
+                e.talker_stream_sources, media_type_summary(e.talker_capabilities)));
+        }
+        if e.listener_stream_sinks > 0 {
+            parts.push(format!("L:{} ({})",
+                e.listener_stream_sinks, media_type_summary(e.listener_capabilities)));
+        }
+        if parts.is_empty() { parts.push("controller".into()); }
+        let role = parts.join("  ");
+
+        // Capability flags
+        let class = sr_class_str(e.entity_capabilities);
+        let aem   = if e.entity_capabilities & 0x08 != 0 { "  AEM" } else { "" };
+        let not_ready = if e.entity_capabilities & 0x0002_0000 != 0 { "  ⚠ not ready" } else { "" };
+
+        let line1 = format!("  ▸ {}  {}  {}{}{}", eui, role, class, aem, not_ready);
+        logger.log(&line1);
+        println!("{}", line1);
+
+        let gm = fmt_eui64(&e.gptp_grandmaster_id);
+        let all_zero = e.gptp_grandmaster_id == [0u8; 8];
+        let gm_str = if all_zero { "no grandmaster".to_string() }
+                     else { format!("GM: {}  domain {}", gm, e.gptp_domain_number) };
+        let line2 = format!("    model {}  {}", model, gm_str);
+        logger.log(&line2);
+        println!("{}", line2);
+    }
+}
+
 /// Print one 5-second report cycle to stdout and the log file.
 ///
 /// Sections printed in order:
@@ -137,6 +191,7 @@ pub fn print_report(
     dante_names: &HashMap<std::net::Ipv4Addr, String>,
     ndi_sources: &std::collections::HashSet<std::net::Ipv4Addr>,
     ndi_names: &HashMap<std::net::Ipv4Addr, String>,
+    avdecc_entities: &HashMap<[u8; 8], AvdeccEntity>,
     pause_frames: u64,
     pfc_frames: u64,
     pcap_stats: Option<(u32, u32, u32)>,
@@ -519,6 +574,7 @@ pub fn print_report(
     let dante_active = streams.values().filter(|s| s.protocol == "Dante").count();
     let ndi_active   = streams.values().filter(|s| s.protocol == "NDI").count();
     print_discovery(dante_sources, dante_names, ndi_sources, ndi_names, dante_active, ndi_active, logger);
+    print_avdecc_entities(avdecc_entities, logger);
 
     // ── PTP / Clock Sources ─────────────────────────────────────────────────
     if !ptp_domains.is_empty() {

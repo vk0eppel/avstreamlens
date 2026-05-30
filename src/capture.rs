@@ -19,13 +19,13 @@ use pnet_packet::Packet;
 
 use crate::parser::{is_aes67_multicast, is_st2110_multicast, parse_rtp};
 use crate::protocols::{
-    AvProtocol, DanteKind, FlowControlKind, IgmpType, MsrpDeclType, MsrpDeclaration, NdiKind,
-    ProtocolChoice, PtpInfo, SdpSession, St2110Type, DEFAULT_CLOCK_HZ, PTP_VERSION_V2,
+    AvProtocol, AvdeccAdp, DanteKind, FlowControlKind, IgmpType, MsrpDeclType, MsrpDeclaration,
+    NdiKind, ProtocolChoice, PtpInfo, SdpSession, St2110Type, DEFAULT_CLOCK_HZ, PTP_VERSION_V2,
     STREAM_TIMEOUT_SECS, avtp_subtype_name, msrp_failure_reason,
 };
 use crate::report::Logger;
 use crate::stats::{
-    AvtpStreamStats, NetworkHealth, PtpEvent, PtpStats, StreamQuality, StreamStats,
+    AvdeccEntity, AvtpStreamStats, NetworkHealth, PtpEvent, PtpStats, StreamQuality, StreamStats,
     TcpStreamStats,
 };
 
@@ -100,9 +100,11 @@ pub struct CaptureState {
     pub dante_names:    HashMap<Ipv4Addr, String>,
     // Deduplicates IGMP Join console output — cleared on Leave so re-joins print again.
     pub igmp_joins_seen: HashMap<(Ipv4Addr, Ipv4Addr), Instant>,
-    pub avtp_streams:   HashMap<[u8; 8], AvtpStreamStats>,
-    pub msrp_state:     HashMap<[u8; 8], MsrpDeclaration>,
-    pub mvrp_vlans:     HashSet<u16>,
+    pub avtp_streams:    HashMap<[u8; 8], AvtpStreamStats>,
+    pub msrp_state:      HashMap<[u8; 8], MsrpDeclaration>,
+    pub mvrp_vlans:      HashSet<u16>,
+    // AVDECC entities discovered via ADP (IEEE 1722.1) — keyed by entity_id EUI-64.
+    pub avdecc_entities: HashMap<[u8; 8], AvdeccEntity>,
     // EEE detection: (chassis_id, port_id) → (tx_wake_us, rx_wake_us)
     pub eee_ports:      HashMap<(String, String), (u16, u16)>,
     pub bytes_this_window: u64,
@@ -138,9 +140,10 @@ impl CaptureState {
             dante_sources: HashSet::new(),
             dante_names: HashMap::new(),
             igmp_joins_seen: HashMap::new(),
-            avtp_streams: HashMap::new(),
-            msrp_state: HashMap::new(),
-            mvrp_vlans: HashSet::new(),
+            avtp_streams:    HashMap::new(),
+            msrp_state:      HashMap::new(),
+            mvrp_vlans:      HashSet::new(),
+            avdecc_entities: HashMap::new(),
             eee_ports: HashMap::new(),
             bytes_this_window: 0,
             pause_frames_this_window: 0,
@@ -191,6 +194,10 @@ impl CaptureState {
         }
         // Drop IGMP Join entries from hosts that vanished without sending a Leave.
         self.igmp_joins_seen.retain(|_, t| t.elapsed() < Duration::from_secs(IGMP_JOIN_DEDUP_TTL_SECS));
+        // Prune AVDECC entities whose ADP announcement has expired (valid_time + 10s grace).
+        self.avdecc_entities.retain(|_, e| {
+            e.last_seen.elapsed().as_secs() < e.valid_time_secs.max(10) + 10
+        });
     }
 
     // ── Handlers ────────────────────────────────────────────────────────────
@@ -238,6 +245,75 @@ impl CaptureState {
             }
         }
         self.sdp_cache.insert(sdp.session_id.clone(), sdp);
+    }
+
+    /// AVDECC ADP: update or insert entity discovery state; emit an alert on first
+    /// detection and on state change (available_index increment). ENTITY_DEPARTING
+    /// (message_type 1) removes the entity immediately.
+    pub fn handle_avdecc_adp(&mut self, adp: AvdeccAdp, now: Instant) -> Vec<Alert> {
+        use crate::parser::{fmt_eui64, media_type_summary, sr_class_str};
+
+        // ENTITY_DEPARTING — device is leaving the network.
+        if adp.message_type == 1 {
+            if self.avdecc_entities.remove(&adp.entity_id).is_some() {
+                return vec![Alert::info(format!(
+                    "➖ AVDECC entity departed: {}", fmt_eui64(&adp.entity_id)
+                ))];
+            }
+            return vec![];
+        }
+
+        // ENTITY_DISCOVER — a query, not an announcement; nothing to store.
+        if adp.message_type == 2 { return vec![]; }
+
+        // ENTITY_AVAILABLE (0) — upsert.
+        let eui = fmt_eui64(&adp.entity_id);
+        let entry = self.avdecc_entities.get(&adp.entity_id);
+
+        let is_new     = entry.is_none();
+        let state_changed = entry.is_some_and(|e| e.available_index != adp.available_index);
+
+        self.avdecc_entities.insert(adp.entity_id, AvdeccEntity {
+            entity_id:             adp.entity_id,
+            entity_model_id:       adp.entity_model_id,
+            entity_capabilities:   adp.entity_capabilities,
+            talker_stream_sources: adp.talker_stream_sources,
+            talker_capabilities:   adp.talker_capabilities,
+            listener_stream_sinks: adp.listener_stream_sinks,
+            listener_capabilities: adp.listener_capabilities,
+            gptp_grandmaster_id:   adp.gptp_grandmaster_id,
+            gptp_domain_number:    adp.gptp_domain_number,
+            valid_time_secs:       adp.valid_time_secs,
+            available_index:       adp.available_index,
+            last_seen:             now,
+        });
+
+        if is_new {
+            let talker_desc = if adp.talker_stream_sources > 0 {
+                format!("T:{} ({})", adp.talker_stream_sources,
+                    media_type_summary(adp.talker_capabilities))
+            } else { String::new() };
+            let listener_desc = if adp.listener_stream_sinks > 0 {
+                format!("L:{} ({})", adp.listener_stream_sinks,
+                    media_type_summary(adp.listener_capabilities))
+            } else { String::new() };
+            let role = [talker_desc, listener_desc]
+                .into_iter().filter(|s| !s.is_empty()).collect::<Vec<_>>().join("  ");
+            let class = sr_class_str(adp.entity_capabilities);
+            let aem   = if adp.entity_capabilities & 0x08 != 0 { "  AEM" } else { "" };
+            return vec![Alert::info(format!(
+                "📡 AVDECC entity discovered: {}  {}  {}{}",
+                eui, role, class, aem
+            ))];
+        }
+
+        if state_changed {
+            return vec![Alert::info(format!(
+                "ℹ AVDECC entity state changed: {} (index {})", eui, adp.available_index
+            ))];
+        }
+
+        vec![]
     }
 
     /// PTP: update the (domain, version) entry, return Detected/Changed alert if any.
@@ -684,6 +760,7 @@ pub fn dispatch(
         AvProtocol::Ndi { kind: NdiKind::Discovery { source_name }, src } => {
             state.handle_ndi_discovery(src, source_name)
         }
+        AvProtocol::AvdeccAdp(adp) => state.handle_avdecc_adp(adp, now),
         AvProtocol::Avb { subtype, stream_id, seq } => {
             state.handle_avb(subtype, stream_id, frame_bytes, seq, now);
             vec![]
