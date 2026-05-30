@@ -196,6 +196,17 @@ mod tests {
     }
 
     #[test]
+    fn msrp_failure_reason_maps_known_and_unknown_codes() {
+        use crate::protocols::msrp_failure_reason;
+        // Code 8 was observed on a live AVB talker (egress port not AVB-capable) —
+        // the old 1/2/3-only table rendered it as a useless "(failure)".
+        assert_eq!(msrp_failure_reason(8), "egress port is not AVB-capable");
+        assert_eq!(msrp_failure_reason(1), "insufficient bandwidth");
+        assert_eq!(msrp_failure_reason(6), "stream pre-empted by a higher-rank stream");
+        assert_eq!(msrp_failure_reason(200), "unknown failure");
+    }
+
+    #[test]
     fn msrp_empty_payload_returns_empty() {
         assert!(parse_msrp(&[]).is_empty());
     }

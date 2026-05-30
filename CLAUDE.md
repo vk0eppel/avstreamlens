@@ -172,7 +172,7 @@ See **[TODO.md](TODO.md)** for the full list. Quick summary:
 - PTPv2 minimum: 34 bytes (common header) — allows Sync (44b) and P_Delay (54b) to create domain entries, not just Announce (64b)
 - Grandmaster detected from Announce (PTPv2 ≥64b) or Sync body (PTPv1); alerts: DETECTED / CHANGED / LOST
 - Clock loss via `PtpStats::check_timeout()` in the 5s report loop — **not in `update()`** which only runs on packet arrival
-- gPTP display: ✓ grandmaster from Announce, ○ clock source EUI-64 from Sync (`last_clock_id`), ❌ no traffic
+- gPTP display: ✓ grandmaster from Announce, ○ clock source EUI-64 (`last_clock_id`, set from any PTPv2 message), ❌ no traffic. The ○ line distinguishes `seen_sync` (a real Sync 0x00 arrived → "Sync seen, no Announce") from a Pdelay-only endpoint (only P_Delay_Req 0x02 → "peer-delay requests only — link partner may not be gPTP-capable") — the latter, with no Pdelay_Resp, fingerprints a non-AVB switch port
 - Clock quality formatted at parse time: PTPv2 class → `ptp_class_str()` (6=locked, 7=free-running, 135=holdover, 165=default, 187/255=slave-only) + `ptp_accuracy_str()` (e.g. 0x20=< 100ns); PTPv1 stratum + ident (GPS, ATOM…)
 - Correction field stored as nanoseconds (`÷ 65536`); shown in Clock Sources if non-zero; alert if abs > 1µs
 - **Path-delay tracking**: `min_path_delay_ns` / `max_path_delay_ns` recorded from every `Delay_Resp` (0x09) and `P_Delay_Resp` (0x03); reset on grandmaster change so the spread reflects the current clock. Reported as `path delay: 500ns – 1.2µs (spread 700ns)`. Alerts: spread > 10µs → "unstable link (EEE, half-duplex, or cable)"; absolute > 1ms → "too many hops between this node and grandmaster"

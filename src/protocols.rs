@@ -232,6 +232,36 @@ pub enum St2110Type { Video, Audio, Ancdata, Unknown }
 #[derive(Debug, Clone, PartialEq)]
 pub enum MsrpDeclType { TalkerAdvertise, TalkerFailed, Listener }
 
+/// Human-readable reason for an MSRP TalkerFailed FailureCode (IEEE 802.1Qat
+/// Table 35-6). Returns "unknown failure" for codes outside the standard set;
+/// callers always show the numeric code alongside so an unmapped code is still
+/// actionable. (Verified against a live AVB talker reporting code 8 — egress
+/// port not AVB-capable — which the old 1/2/3-only table showed as "(failure)".)
+pub fn msrp_failure_reason(code: u8) -> &'static str {
+    match code {
+        1  => "insufficient bandwidth",
+        2  => "insufficient bridge resources",
+        3  => "insufficient bandwidth for Traffic Class",
+        4  => "StreamID already in use by another Talker",
+        5  => "stream destination address already in use",
+        6  => "stream pre-empted by a higher-rank stream",
+        7  => "reported latency has changed",
+        8  => "egress port is not AVB-capable",
+        9  => "use a different destination address",
+        10 => "out of MSRP resources",
+        11 => "out of MMRP resources",
+        12 => "cannot store destination address",
+        13 => "requested priority is not an SR Class priority",
+        14 => "MaxFrameSize too large for the media",
+        15 => "max fan-in ports limit reached",
+        16 => "changed FirstValue for a registered StreamID",
+        17 => "VLAN blocked on this egress port (registration forbidden)",
+        18 => "VLAN tagging disabled on this egress port",
+        19 => "SR class priority mismatch",
+        _  => "unknown failure",
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct MsrpDeclaration {
     pub decl_type:           MsrpDeclType,

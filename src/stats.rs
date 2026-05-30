@@ -533,6 +533,7 @@ pub struct PtpStats {
     pub protocol_changes_count:        u64,           // Grandmaster changes for this protocol
     pub last_src_ip:                   Option<std::net::Ipv4Addr>, // Source IP of last PTP packet
     pub last_clock_id:                 Option<String>,             // Source EUI-64 from most recent PTP message
+    pub seen_sync:                     bool,                       // A real Sync (msgType 0x00) has arrived — distinguishes a clock from a Pdelay-only endpoint
 }
 
 /// Side-effect-free signal emitted by `PtpStats::update` / `check_timeout`.
@@ -566,6 +567,7 @@ impl PtpStats {
             protocol_changes_count: 0,
             last_src_ip: None,
             last_clock_id: None,
+            seen_sync: false,
         }
     }
 
@@ -619,6 +621,11 @@ impl PtpStats {
         if info.message_type == 0x00 || info.message_type == 0x08 {
             self.last_seen = Instant::now();
             self.last_offset_ns = info.correction_ns;
+        }
+        // A real Sync (0x00) marks an actual clock/grandmaster attempt — as opposed
+        // to a node that only emits P_Delay_Req link-measurement traffic.
+        if info.message_type == 0x00 {
+            self.seen_sync = true;
         }
 
         // Delay_Resp (0x09) and P_Delay_Resp (0x03) carry path_delay in correction field.

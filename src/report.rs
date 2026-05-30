@@ -18,7 +18,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use crate::stats::{StreamStats, TcpStreamStats, PtpStats, NetworkHealth, StreamQuality, AvtpStreamStats};
-use crate::protocols::{STREAM_TIMEOUT_SECS, MsrpDeclaration, MsrpDeclType, avtp_subtype_name};
+use crate::protocols::{STREAM_TIMEOUT_SECS, MsrpDeclaration, MsrpDeclType, avtp_subtype_name, msrp_failure_reason};
 use crate::capture::{MissingClock, MissingClockKind};
 
 /// Logger for writing timestamped messages to both file and console.
@@ -153,7 +153,6 @@ pub fn print_report(
         ("ST2110", |p| p.starts_with("2110-")),
         ("Dante",  |p| p == "Dante"),
         ("NDI",    |p| p == "NDI"),
-        ("AVB",    |p| p == "AVB" || p.starts_with("AVB ")),
     ];
 
     let mut proto_parts: Vec<String> = protocol_groups.iter()
@@ -162,6 +161,14 @@ pub fn print_report(
             if n > 0 { Some(format!("{}: {}", label, n)) } else { None }
         })
         .collect();
+
+    // AVB is counted from avtp_streams (per stream-id) so the overview count equals
+    // the number of rendered AVB lines and matches the gPTP clock-requirement gate.
+    // Counting streams["AVB …"] (per-subtype) instead let sv=0 control frames show
+    // "AVB: 1" with an empty Streams list.
+    if !avtp_streams.is_empty() {
+        proto_parts.push(format!("AVB: {}", avtp_streams.len()));
+    }
 
     let tcp_count = tcp_streams.len();
     if tcp_count > 0 {
@@ -479,11 +486,8 @@ pub fn print_report(
                     }
                     MsrpDeclType::TalkerFailed => {
                         let code_str = match talker.failure_code {
-                            Some(1) => "insufficient bandwidth",
-                            Some(2) => "insufficient bridge resources",
-                            Some(3) => "insufficient bandwidth for Traffic Class",
-                            Some(_) => "unknown failure",
-                            None    => "failed",
+                            Some(code) => format!("code {}: {}", code, msrp_failure_reason(code)),
+                            None       => "failed".to_string(),
                         };
                         let alert = format!("    ⚠  Reservation failed — {}", code_str);
                         logger.log(&alert);
@@ -542,10 +546,17 @@ pub fn print_report(
                     format!("  {}  {}{}  —  clock lost", gm_icon, proto_label, domain_suffix)
                 }
                 (None, _) => {
-                    // No Announce seen yet; use source clock ID from Sync as fallback
+                    // No Announce/grandmaster. Distinguish a clock that is at least
+                    // emitting Sync (no GM elected yet) from a node that only sends
+                    // P_Delay_Req link-measurement traffic — the latter, with no
+                    // Pdelay_Resp, signals the link partner isn't gPTP-capable.
                     match &stats.last_clock_id {
-                        Some(id) => format!("  ○  {}{}  —  clock source: {}  (sync only, no announce)", proto_label, domain_suffix, id),
-                        None     => format!("  {}  {}{}  —  no clock detected", gm_icon, proto_label, domain_suffix),
+                        Some(id) if stats.seen_sync =>
+                            format!("  ○  {}{}  —  clock source: {}  (Sync seen, no Announce — no grandmaster elected)", proto_label, domain_suffix, id),
+                        Some(id) =>
+                            format!("  ○  {}{}  —  clock source: {}  (peer-delay requests only — no Sync/grandmaster; link partner may not be gPTP-capable)", proto_label, domain_suffix, id),
+                        None =>
+                            format!("  {}  {}{}  —  no clock detected", gm_icon, proto_label, domain_suffix),
                     }
                 }
             };

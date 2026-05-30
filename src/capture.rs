@@ -21,7 +21,7 @@ use crate::parser::{is_aes67_multicast, is_st2110_multicast, parse_rtp};
 use crate::protocols::{
     AvProtocol, DanteKind, FlowControlKind, IgmpType, MsrpDeclType, MsrpDeclaration, NdiKind,
     ProtocolChoice, PtpInfo, SdpSession, St2110Type, DEFAULT_CLOCK_HZ, PTP_VERSION_V2,
-    STREAM_TIMEOUT_SECS, avtp_subtype_name,
+    STREAM_TIMEOUT_SECS, avtp_subtype_name, msrp_failure_reason,
 };
 use crate::report::Logger;
 use crate::stats::{
@@ -391,6 +391,13 @@ impl CaptureState {
 
     /// AVB AVTP frame — updates the per-subtype aggregate stream and per-stream_id entry.
     pub fn handle_avb(&mut self, subtype: u8, stream_id: Option<[u8; 8]>, frame_bytes: u64, avtp_seq: Option<u8>, now: Instant) {
+        // sv=0 AVTP control/discovery frames (AVDECC ADP/ACMP, MAAP) carry no stream
+        // id — they are not media streams. Skip them so they don't inflate the AVB
+        // stream count, create a phantom dead-stream entry, or diverge from the
+        // per-stream-id avtp_streams map the Streams list and clock gate both read.
+        // (Their bytes still count toward bandwidth via bytes_this_window in main.rs.)
+        let Some(sid) = stream_id else { return; };
+
         let label = avtp_subtype_name(subtype);
         let stats = self.streams.entry(format!("AVB {}", label))
             .or_insert_with(|| StreamStats::new("AVB", 0.0));
@@ -406,14 +413,13 @@ impl CaptureState {
             stats.packets_at_check = stats.packets;
             stats.last_bitrate_check = now;
         }
-        if let Some(sid) = stream_id {
-            let entry = self.avtp_streams.entry(sid)
-                .or_insert_with(|| AvtpStreamStats::new(sid, subtype));
-            entry.packets += 1;
-            entry.last_seen = now;
-            entry.update_bitrate(frame_bytes, now);
-            if let Some(seq) = avtp_seq { entry.update_seq(seq); }
-        }
+
+        let entry = self.avtp_streams.entry(sid)
+            .or_insert_with(|| AvtpStreamStats::new(sid, subtype));
+        entry.packets += 1;
+        entry.last_seen = now;
+        entry.update_bitrate(frame_bytes, now);
+        if let Some(seq) = avtp_seq { entry.update_seq(seq); }
     }
 
     /// MSRP declarations — records all, alerts only on TalkerFailed.
@@ -422,11 +428,8 @@ impl CaptureState {
         for decl in declarations {
             if matches!(decl.decl_type, MsrpDeclType::TalkerFailed) {
                 let code_str = match decl.failure_code {
-                    Some(1) => " (insufficient bandwidth)",
-                    Some(2) => " (insufficient bridge resources)",
-                    Some(3) => " (insufficient bandwidth for Traffic Class)",
-                    Some(_) => " (failure)",
-                    None    => "",
+                    Some(code) => format!(" (code {}: {})", code, msrp_failure_reason(code)),
+                    None       => String::new(),
                 };
                 let id = &decl.stream_id;
                 alerts.push(Alert::warn(format!(
@@ -1148,6 +1151,27 @@ mod tests {
         assert_eq!(missing[0].affected, vec!["AVB"]);
     }
 
+    // ── handle_avb — sv=0 control frames must not become phantom streams ─────
+
+    #[test]
+    fn avb_control_frame_without_stream_id_creates_no_stream() {
+        // An sv=0 AVTP control/discovery frame (no stream id) must not inflate the
+        // AVB count or create a phantom streams entry — both maps stay empty so the
+        // overview count, the Streams list, and the gPTP gate all agree.
+        let mut state = CaptureState::new();
+        state.handle_avb(0x7e, None, 100, None, Instant::now()); // 0x7e = MAAP
+        assert!(state.avtp_streams.is_empty());
+        assert!(!state.streams.keys().any(|k| k.starts_with("AVB")));
+    }
+
+    #[test]
+    fn avb_media_frame_with_stream_id_creates_stream() {
+        let mut state = CaptureState::new();
+        state.handle_avb(0x00, Some([1, 2, 3, 4, 5, 6, 7, 8]), 100, Some(0), Instant::now());
+        assert_eq!(state.avtp_streams.len(), 1);
+        assert!(state.streams.keys().any(|k| k.starts_with("AVB")));
+    }
+
     // ── Flow control (PAUSE / PFC) ──────────────────────────────────────────
 
     #[test]
@@ -1190,6 +1214,41 @@ mod tests {
             protocol_kind: Some("PTPv2".to_string()),
             src_ip: None,
         }
+    }
+
+    fn ptp_msg(message_type: u8, clock_id: Option<&str>) -> crate::protocols::PtpInfo {
+        crate::protocols::PtpInfo {
+            version: PTP_VERSION_V2,
+            message_type,
+            domain: 0,
+            clock_id: clock_id.map(|s| s.to_string()),
+            grandmaster_id: None,
+            clock_quality: None,
+            correction_ns: Some(0),
+            path_delay_ns: None,
+            message_name: String::new(),
+            port_id: None,
+            sequence_id: 0,
+            log_sync_interval: 0,
+            log_min_pdelay_req_interval: 0,
+            protocol_kind: Some("AVB".to_string()),
+            src_ip: None,
+        }
+    }
+
+    #[test]
+    fn ptp_pdelay_req_only_does_not_set_seen_sync() {
+        // An AVB endpoint on a non-gPTP port emits only P_Delay_Req (0x02). It must
+        // surface a clock_id but NOT be labelled "Sync seen" — seen_sync gates the
+        // report wording that distinguishes a real clock from a Pdelay-only node.
+        let mut s = PtpStats::new(0, PTP_VERSION_V2);
+        let kind = Some("AVB".to_string());
+        s.update(&ptp_msg(0x02, Some("d0:69:9e:ff:fe:11:86:3c")), &kind);
+        assert!(s.last_clock_id.is_some());
+        assert!(!s.seen_sync, "P_Delay_Req must not count as Sync");
+
+        s.update(&ptp_msg(0x00, Some("d0:69:9e:ff:fe:11:86:3c")), &kind);
+        assert!(s.seen_sync, "a real Sync (0x00) sets seen_sync");
     }
 
     #[test]
