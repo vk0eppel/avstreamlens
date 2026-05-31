@@ -121,6 +121,10 @@ pub struct CaptureState {
     // handlers can avoid pushing the same group more than once.
     pub pending_join_groups: Vec<Ipv4Addr>,
     pub joined_multicast:    HashSet<Ipv4Addr>,
+    // Rolling history of total stream counts (RTP + TCP + AVTP) at the end of
+    // each 5s window, used to detect sudden flood-style anomalies. Capped at 3
+    // entries; the oldest is dropped when a fourth would be added.
+    stream_count_history: Vec<usize>,
 }
 
 impl Default for CaptureState {
@@ -151,6 +155,7 @@ impl CaptureState {
             packets_dispatched: 0,
             pending_join_groups: Vec::new(),
             joined_multicast:    HashSet::new(),
+            stream_count_history: Vec::new(),
         }
     }
 
@@ -630,6 +635,36 @@ impl CaptureState {
                 )));
             }
         }
+        alerts
+    }
+
+    /// Stream-count anomaly detection, called from the periodic report cycle
+    /// **before** `reset_window` so the count reflects streams active this window.
+    ///
+    /// Fires when the current total stream count is more than 2× the rolling
+    /// average of the last 3 windows — the fingerprint of a runaway device
+    /// flooding new multicast groups. Requires a full 3-window baseline before
+    /// alerting so normal startup growth doesn't trigger a false positive.
+    pub fn check_stream_count_anomaly(&mut self) -> Vec<Alert> {
+        let current = self.streams.len() + self.tcp_streams.len() + self.avtp_streams.len();
+
+        let mut alerts = Vec::new();
+        if self.stream_count_history.len() == 3 {
+            let avg: usize = self.stream_count_history.iter().sum::<usize>() / 3;
+            if avg > 0 && current > avg * 2 {
+                alerts.push(Alert::warn(format!(
+                    "⚠ Stream count spike: {} streams (avg last 3 windows: {}) — possible runaway multicast flood",
+                    current, avg,
+                )));
+            }
+        }
+
+        // Maintain a rolling 3-entry history: drop the oldest when full.
+        if self.stream_count_history.len() == 3 {
+            self.stream_count_history.remove(0);
+        }
+        self.stream_count_history.push(current);
+
         alerts
     }
 
@@ -1299,6 +1334,76 @@ mod tests {
         state.reset_window();
         assert_eq!(state.pause_frames_this_window, 0);
         assert_eq!(state.pfc_frames_this_window,   0);
+    }
+
+    // ── Stream count anomaly detection ────────────────────────────────────
+
+    fn add_rtp_stream(state: &mut CaptureState, key: &str) {
+        state.streams.insert(key.to_string(), StreamStats::new("AES67", 48_000.0));
+    }
+
+    #[test]
+    fn stream_count_anomaly_no_alert_without_full_baseline() {
+        // Fewer than 3 history entries → no alert regardless of current count.
+        let mut state = CaptureState::new();
+        for i in 0..10 { add_rtp_stream(&mut state, &format!("s{i}")); }
+        // First call — history is empty, no alert.
+        assert!(state.check_stream_count_anomaly().is_empty());
+        // Second call — only 1 history entry, still no alert.
+        for i in 10..20 { add_rtp_stream(&mut state, &format!("s{i}")); }
+        assert!(state.check_stream_count_anomaly().is_empty());
+    }
+
+    #[test]
+    fn stream_count_anomaly_fires_after_three_baseline_windows() {
+        let mut state = CaptureState::new();
+        // Three baseline windows with 2 streams each → avg = 2.
+        for w in 0..3 {
+            state.streams.clear();
+            add_rtp_stream(&mut state, &format!("base{w}a"));
+            add_rtp_stream(&mut state, &format!("base{w}b"));
+            let alerts = state.check_stream_count_anomaly();
+            assert!(alerts.is_empty(), "no alert during baseline build-up");
+        }
+        // Fourth window: 5 streams > 2 × 2 → alert fires.
+        state.streams.clear();
+        for i in 0..5 { add_rtp_stream(&mut state, &format!("flood{i}")); }
+        let alerts = state.check_stream_count_anomaly();
+        assert_eq!(alerts.len(), 1);
+        assert!(alerts[0].message.contains("Stream count spike"));
+    }
+
+    #[test]
+    fn stream_count_anomaly_no_false_positive_on_normal_growth() {
+        let mut state = CaptureState::new();
+        // Baseline: 4 streams per window.
+        for w in 0..3 {
+            state.streams.clear();
+            for i in 0..4 { add_rtp_stream(&mut state, &format!("w{w}s{i}")); }
+            state.check_stream_count_anomaly();
+        }
+        // Modest growth to 7 streams — below 2 × 4 = 8, no alert.
+        state.streams.clear();
+        for i in 0..7 { add_rtp_stream(&mut state, &format!("grow{i}")); }
+        assert!(state.check_stream_count_anomaly().is_empty());
+    }
+
+    #[test]
+    fn stream_count_history_rolls_after_three_entries() {
+        let mut state = CaptureState::new();
+        // Fill history with counts 10, 10, 10.
+        for w in 0..3 {
+            state.streams.clear();
+            for i in 0..10 { add_rtp_stream(&mut state, &format!("w{w}s{i}")); }
+            state.check_stream_count_anomaly();
+        }
+        assert_eq!(state.stream_count_history, vec![10, 10, 10]);
+        // Next call (current=10) — should roll: drop oldest 10, append 10.
+        state.streams.clear();
+        for i in 0..10 { add_rtp_stream(&mut state, &format!("r{i}")); }
+        state.check_stream_count_anomaly();
+        assert_eq!(state.stream_count_history.len(), 3, "history stays capped at 3");
+        assert_eq!(state.stream_count_history, vec![10, 10, 10]);
     }
 
     // ── PTP path-delay tracking ────────────────────────────────────────────

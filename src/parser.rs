@@ -256,16 +256,24 @@ pub fn detect_protocol(eth: &EthernetPacket) -> Option<AvProtocol> {
 
     // ── mDNS (port 5353) ────────────────────────────────
     if dst_port == crate::protocols::MDNS_PORT || src_port == crate::protocols::MDNS_PORT {
-        if mdns_contains(payload, b"\x09_netaudio")
-            || mdns_contains(payload, b"\x0d_netaudio-cmc")
-            || mdns_contains(payload, b"\x0d_netaudio-arc")
-        {
-            let device_name = extract_dante_name(payload);
-            return Some(AvProtocol::Dante { kind: DanteKind::Discovery { device_name }, src: src_ip, dst: dst_ip, dst_port });
-        }
-        if mdns_contains(payload, b"\x04_ndi") {
-            let source_name = extract_ndi_name(payload);
-            return Some(AvProtocol::Ndi { kind: NdiKind::Discovery { source_name }, src: src_ip });
+        // DNS QR bit (payload[2] bit 7): 0 = query, 1 = response.
+        // Only responses carry PTR/SRV records with real device instance names.
+        // Outgoing queries from the local machine contain the same service-label
+        // bytes in the question section, so without this guard they would be
+        // classified as Dante/NDI discovery with src_ip = the local machine's IP.
+        let is_mdns_response = payload.get(2).map_or(false, |b| b & 0x80 != 0);
+        if is_mdns_response {
+            if mdns_contains(payload, b"\x09_netaudio")
+                || mdns_contains(payload, b"\x0d_netaudio-cmc")
+                || mdns_contains(payload, b"\x0d_netaudio-arc")
+            {
+                let device_name = extract_dante_name(payload);
+                return Some(AvProtocol::Dante { kind: DanteKind::Discovery { device_name }, src: src_ip, dst: dst_ip, dst_port });
+            }
+            if mdns_contains(payload, b"\x04_ndi") {
+                let source_name = extract_ndi_name(payload);
+                return Some(AvProtocol::Ndi { kind: NdiKind::Discovery { source_name }, src: src_ip });
+            }
         }
         return None;
     }
@@ -658,5 +666,103 @@ mod tests {
         } else {
             panic!("expected MembershipReportV3, got {:?}", proto);
         }
+    }
+
+    // ── mDNS QR-bit guard ────────────────────────────────────────────────────
+
+    /// Build a minimal Ethernet+IPv4+UDP frame carrying an mDNS payload.
+    /// `qr` sets bit 7 of flags byte (payload[2]): true = response, false = query.
+    fn mdns_frame(src_ip: [u8; 4], qr: bool, mdns_body: &[u8]) -> Vec<u8> {
+        let udp_len = (8 + mdns_body.len()) as u16;
+        let ip_total = (20 + udp_len) as u16;
+        let mut ip = vec![0u8; 20 + 8 + mdns_body.len()];
+        ip[0] = 0x45;
+        ip[2..4].copy_from_slice(&ip_total.to_be_bytes());
+        ip[8] = 255; // TTL
+        ip[9] = 0x11; // UDP
+        ip[12..16].copy_from_slice(&src_ip);
+        ip[16..20].copy_from_slice(&[224, 0, 0, 251]); // mDNS multicast
+        ip[20..22].copy_from_slice(&5353u16.to_be_bytes()); // src port
+        ip[22..24].copy_from_slice(&5353u16.to_be_bytes()); // dst port
+        ip[24..26].copy_from_slice(&udp_len.to_be_bytes());
+        let dns_start = 28usize;
+        ip[dns_start..dns_start + mdns_body.len()].copy_from_slice(mdns_body);
+        if qr { ip[dns_start + 2] |= 0x80; } // set QR bit = response
+        eth_frame(&[0x08, 0x00], &[], &ip)
+    }
+
+    fn netaudio_response_payload() -> Vec<u8> {
+        // Minimal mDNS DNS payload: 12-byte header + PTR record containing
+        // \x09StageBox\x09_netaudio (instance + service label).
+        let instance: &[u8] = b"StageBox";
+        let mut p = vec![
+            0x00, 0x00, // transaction id
+            0x84, 0x00, // flags: QR=1 (response), Authoritative
+            0x00, 0x00, // QDCOUNT = 0
+            0x00, 0x01, // ANCOUNT = 1
+            0x00, 0x00, // NSCOUNT = 0
+            0x00, 0x00, // ARCOUNT = 0
+        ];
+        p.push(instance.len() as u8);
+        p.extend_from_slice(instance);
+        p.extend_from_slice(b"\x09_netaudio");
+        p
+    }
+
+    #[test]
+    fn mdns_response_from_dante_device_classified_as_discovery() {
+        let dante_ip = [192, 168, 1, 50];
+        let body = netaudio_response_payload();
+        let frame = mdns_frame(dante_ip, true, &body);
+        let eth = EthernetPacket::new(&frame).unwrap();
+        assert!(
+            matches!(
+                detect_protocol(&eth),
+                Some(AvProtocol::Dante { kind: DanteKind::Discovery { .. }, .. })
+            ),
+            "mDNS response with _netaudio must be Dante Discovery"
+        );
+    }
+
+    #[test]
+    fn mdns_query_for_dante_service_suppressed_by_qr_bit() {
+        // The local machine (192.168.1.108) browses for _netaudio. The outgoing
+        // mDNS query contains the same _netaudio label bytes as a response, but
+        // QR = 0. Without the QR-bit guard, src_ip (the local machine) would be
+        // registered as a Dante device. With the guard this must return None.
+        let local_ip = [192, 168, 1, 108];
+        let mut body = netaudio_response_payload();
+        body[2] &= 0x7F; // clear QR bit → query
+        let frame = mdns_frame(local_ip, false, &body);
+        let eth = EthernetPacket::new(&frame).unwrap();
+        assert!(
+            detect_protocol(&eth).is_none(),
+            "mDNS query (QR=0) must not be classified as Dante Discovery"
+        );
+    }
+
+    #[test]
+    fn mdns_query_for_ndi_service_suppressed_by_qr_bit() {
+        // Same false-positive path for NDI: a local browse query for _ndi must
+        // not register the local machine as an NDI source.
+        let local_ip = [192, 168, 1, 108];
+        // Minimal body: header + instance + \x04_ndi
+        let mut p = vec![
+            0x00, 0x00, // transaction id
+            0x00, 0x00, // flags: QR=0 (query)
+            0x00, 0x01, // QDCOUNT = 1
+            0x00, 0x00, // ANCOUNT = 0
+            0x00, 0x00, 0x00, 0x00,
+        ];
+        let instance: &[u8] = b"MyNDI";
+        p.push(instance.len() as u8);
+        p.extend_from_slice(instance);
+        p.extend_from_slice(b"\x04_ndi");
+        let frame = mdns_frame(local_ip, false, &p);
+        let eth = EthernetPacket::new(&frame).unwrap();
+        assert!(
+            detect_protocol(&eth).is_none(),
+            "mDNS query (QR=0) must not be classified as NDI Discovery"
+        );
     }
 }
