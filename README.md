@@ -67,6 +67,7 @@ sudo ./target/release/avstreamlens
 ```
 sudo ./target/release/avstreamlens --interface en0 --protocol aes67,dante
 sudo ./target/release/avstreamlens -i eth0 -p all
+sudo ./target/release/avstreamlens -i en0 -p aes67 --duration 30 && echo OK
 sudo ./target/release/avstreamlens --help
 ```
 
@@ -83,6 +84,7 @@ On startup:
 |---|---|---|
 | `--interface <name>` | `-i` | pcap device name to capture on (e.g. `en0`, `eth0`) |
 | `--protocol <list>` | `-p` | Comma-separated protocols: `all` `audio` `video` `aes67` `avb` `dante` `ndi` `st2110` |
+| `--duration <secs>` | `-d` | Stop after N seconds; exit 0 if healthy (100%), exit 1 if any issues detected |
 | `--quiet` | `-q` | Silent on healthy cycles; print the full report only when issues are detected |
 | `--no-color` | | Disable ANSI colour output (also honoured via the `NO_COLOR` env var) |
 | `--help` | `-h` | Show usage and exit |
@@ -90,6 +92,8 @@ On startup:
 Protocol names are case-insensitive. The interactive-mode numbers (0–7) are also accepted for scripting convenience. When a flag is omitted, AVStreamLens falls back to the interactive prompt for that item.
 
 `--quiet` is useful for long-running monitoring sessions piped to a log file or `tail -f`: no output is produced on healthy cycles, so the terminal stays clean and each new report is immediately visible as an issue. The log file always receives the full report regardless of `--quiet`.
+
+`--duration` enables one-shot scripted health checks. AVStreamLens captures for N seconds (at least one full 5-second report cycle), then exits with code 0 if the network health score is 100% or code 1 if any issue was detected. Pair with `--quiet` to suppress the intermediate report output: `avstreamlens -i en0 -p aes67 --duration 30 --quiet && echo OK`.
 
 ---
 
@@ -273,6 +277,7 @@ This distinguishes "wrong interface / nothing here" from "the devices are presen
 - `⚠  PTP path delay > 1ms — too many hops between this node and grandmaster`
 
 *Network infrastructure:*
+- `⚠  Stream count spike: N streams (avg last 3 windows: M) — possible runaway multicast flood`
 - `⚠  ECN: N congestion mark(s) — router congestion detected on the path`
 - `⚠  PAUSE frames: N in last 5s — upstream link congestion causing tx-side freezes`
 - `⚠  PFC frames: N in last 5s — priority flow control engaged on upstream link`

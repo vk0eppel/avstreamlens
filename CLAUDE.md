@@ -9,7 +9,7 @@
 |---|---|
 | `src/main.rs` | Entry point — owns pcap handle, 5s report timer, post-dispatch IPv4/TCP tracking, dynamic IGMP join drain. Thin driver |
 | `src/capture.rs` | `CaptureState` + per-protocol handlers + `dispatch()` + `emit()` — all per-loop state and protocol-handler logic |
-| `src/cli.rs` | CLI arg parsing (`--interface`, `--protocol`, `--quiet`, `--no-color`, `--help`), interactive interface/protocol selection, BPF filter building |
+| `src/cli.rs` | CLI arg parsing (`--interface`, `--protocol`, `--duration`, `--quiet`, `--no-color`, `--help`), interactive interface/protocol selection, BPF filter building |
 | `src/parser.rs` | Top-level `detect_protocol` dispatcher + RTP + TCP + VLAN unwrap + multicast helpers; re-exports submodule API |
 | `src/parser/sdp.rs` | SAP envelope (RFC 2974), SDP body (RFC 4566), `ts-refclk` normalisation |
 | `src/parser/ptp.rs` | PTPv1 (IEEE 1588-2002) + PTPv2 (IEEE 1588-2008) message parser — used for both UDP PTP and L2 gPTP |
@@ -28,7 +28,7 @@
 cargo build --release   # build
 cargo fmt               # format
 cargo clippy -- -D warnings  # lint
-cargo test              # run all 121 unit tests
+cargo test              # run all 128 unit tests
 ```
 
 ## Open Work
@@ -38,7 +38,7 @@ See **[TODO.md](TODO.md)** for the full list. Quick summary:
 | Category | Items |
 |---|---|
 | Bugs / code issues | (none — all resolved) |
-| Missing features | PTPv1 grandmaster NIC MAC display; VLAN-ID filter; Dante AV video; health score review; `--duration`; JSON output; SAP re-announce monitor; redundant stream pairing; RTCP; PTP BMCA; stream count anomaly; SDP preload; NMOS IS-04 |
+| Missing features | PTPv1 grandmaster NIC MAC display; VLAN-ID filter; Dante AV video; health score review; JSON output; SAP re-announce monitor; redundant stream pairing; RTCP; PTP BMCA; SDP preload; NMOS IS-04 |
 | Platform limitations | NDI loopback unsupported; macOS VLAN tag stripping; Windows `cmd.exe` no ANSI color; PAUSE/PFC NIC-consumed |
 
 ---
@@ -57,7 +57,7 @@ See **[TODO.md](TODO.md)** for the full list. Quick summary:
 - **`parser/ptp.rs`** — `parse_ptp` auto-detects PTPv1 vs PTPv2 from byte 1 low nibble; PTPv1 has two wire encodings (separate-byte vs nibble-packed) selected by byte 0 == 0x11
 - **`parser/avb.rs`** — `parse_avtp_stream_id` (sv-bit guarded), `parse_msrp` (TalkerAdvertise/TalkerFailed/Listener), `parse_mvrp` (VLAN registration). MSRP/MVRP share the IEEE 802.1Q vector-attribute format
 - **`parser/lldp.rs`** — TLV walker; emits `AvProtocol::LldpEee` only when the EEE TLV (OUI 00-12-0F, subtype 0x05) is present AND a wake-up time is non-zero
-- **`parser/mdns.rs`** — `extract_mdns_instance_name` finds the DNS-label-encoded service needle, then walks length-prefixed labels backward to find the longest valid printable-ASCII instance name. Used by `extract_dante_name` (tries `\x0d_netaudio-cmc` → `\x0d_netaudio-arc` → `\x09_netaudio`) and `extract_ndi_name` (needle `\x04_ndi`)
+- **`parser/mdns.rs`** — `extract_mdns_instance_name` finds the DNS-label-encoded service needle, then walks length-prefixed labels backward to find the longest valid printable-ASCII instance name. Used by `extract_dante_name` (tries `\x0d_netaudio-cmc` → `\x0d_netaudio-arc` → `\x09_netaudio`) and `extract_ndi_name` (needle `\x04_ndi`). **QR-bit guard in `detect_protocol`**: mDNS packets are only classified as Dante/NDI discovery when DNS flags byte `payload[2] & 0x80 != 0` (QR=1, response). Without this, outgoing mDNS queries from the local machine — which contain the same service-label bytes in the question section — would register the local machine's IP as a discovered Dante/NDI device
 - **`parser/flow_control.rs`** — `parse_flow_control` classifies 0x8808 frames by MAC-control opcode: `0x0001` → `FlowControlKind::Pause`, `0x0101` → `FlowControlKind::PriorityFlowControl`. Returns `None` for unknown opcodes. **Known limitation:** most NICs/drivers consume PAUSE/PFC at the MAC layer before pcap sees them. Absence of these alerts does NOT prove pause isn't happening upstream — it just means this NIC didn't surface them
 - **Adding a new protocol parser** = create `parser/<name>.rs`, declare `pub mod <name>;` in `parser.rs`, re-export its public functions with `pub use <name>::...`, add a branch in `detect_protocol`. Tests live in the same file as the parser
 
@@ -67,7 +67,7 @@ See **[TODO.md](TODO.md)** for the full list. Quick summary:
 - **Handlers do not touch IO.** They mutate `CaptureState` and return `Vec<Alert>`. The dispatch layer prints + logs. The `PtpEvent` pattern in `stats.rs` is the same idea applied one layer deeper (data layer returns events; handler layer turns them into `Alert`s)
 - **`Alert { level: AlertLevel, message: String }`** with constructors `Alert::info/good/warn/error`. `emit(&[Alert], &mut Logger)` maps level → ANSI color (none/32/33/31) and prints + logs in one place. Adding a new severity or alert format is a single-site change
 - **`dispatch(state, proto, l2_payload, frame_bytes, avtp_seq, now, logger)`** is the only entry point `main.rs` calls per packet — matches `AvProtocol`, calls the right handler, emits returned alerts
-- **`state.check_ptp_timeouts()` / `state.aggregate_ndi_bitrate()` / `state.reset_window()` / `state.missing_ptp_clocks(&expanded)`** are the periodic-cycle helpers `main.rs` calls every 5s. Window-reset prunes silent streams via `STREAM_PRUNE_SECS = STREAM_TIMEOUT_SECS * 2` (named constant in `capture.rs`)
+- **`state.check_ptp_timeouts()` / `state.check_stream_count_anomaly()` / `state.aggregate_ndi_bitrate()` / `state.reset_window()` / `state.missing_ptp_clocks(&expanded)`** are the periodic-cycle helpers `main.rs` calls every 5s. Window-reset prunes silent streams via `STREAM_PRUNE_SECS = STREAM_TIMEOUT_SECS * 2` (named constant in `capture.rs`). `check_stream_count_anomaly()` is called **before** `reset_window` so the count reflects streams active during the window; it maintains a rolling 3-entry `stream_count_history: Vec<usize>` and fires a `Warn` alert when the current total (RTP + TCP + AVTP) exceeds 2× the 3-window average — requires a full baseline of 3 windows before alerting
 - **"Selected AND observed" rule** for clock requirements: `missing_ptp_clocks` only flags a clock family when (a) the user's selection includes a protocol that uses it AND (b) at least one stream of that family has been observed (`state.streams.values().any(...)` or `!state.avtp_streams.is_empty()`). Without the "observed" gate, picking "All" on a pure-AES67 network warned about missing gPTP just because AVB was in the expanded set. Apply the same gate to any future requirement that depends on protocol selection
 - **Per-family clock alerts**: `missing_ptp_clocks` returns `Vec<MissingClock { kind: MissingClockKind, affected: Vec<&'static str> }>` rather than a bool. Kinds are `Ptpv2` (AES67/ST2110), `Ptp` (Dante — v1 or v2), `Gptp` (AVB — L2 only). The report layer renders one red line per entry: `⚠ No <clock> clock — <protos> may lose sync`. AES67 + ST2110 missing the same PTPv2 produce ONE entry with two affected protocols, not two entries
 - Adding a new protocol = one new variant in `protocols::AvProtocol` + one new `handle_*` method + one new arm in `dispatch()`. No edits to `main.rs`
@@ -99,9 +99,10 @@ See **[TODO.md](TODO.md)** for the full list. Quick summary:
 - **VLAN-tagged frames**: `unwrap_vlan()` in `parser.rs` peels 802.1Q / 802.1ad / QinQ tags before dispatch — L2 AVB protocols work on tagged networks. No VLAN-ID filtering is implemented; the app processes whatever VLANs the capture interface receives. Operator-facing guidance (trunk vs access vs SPAN, macOS tag-stripping, QinQ caveat) lives in README.md under "Capture Setup — Monitoring One or Multiple VLANs"
 
 ### CLI Flags & Interface Listing
-- **`parse_cli_args()`** reads `std::env::args()` before any interactive prompt. Recognised flags: `--interface`/`-i`, `--protocol`/`-p`, `--quiet`/`-q`, `--no-color`/`--no-colour`, `--help`/`-h`. Unknown flags exit with an error. Returns `CliArgs { interface, protocols, quiet, no_color }`
+- **`parse_cli_args()`** reads `std::env::args()` before any interactive prompt. Recognised flags: `--interface`/`-i`, `--protocol`/`-p`, `--duration`/`-d`, `--quiet`/`-q`, `--no-color`/`--no-colour`, `--help`/`-h`. Unknown flags exit with an error. Returns `CliArgs { interface, protocols, duration, quiet, no_color }`
 - `--interface <name>` — passed to `resolve_interface_by_name()`, which does an exact match against the pcap device list and exits with a clear message if not found. Bypasses the interactive listing entirely
 - `--protocol <list>` — comma-separated names (`all`, `audio`, `video`, `aes67`, `avb`, `dante`, `ndi`, `st2110`, case-insensitive) or interactive-mode numbers (0–7). Parsed by `parse_protocol_str()`. Bypasses the interactive protocol prompt entirely
+- `--duration` / `-d <seconds>` — run for exactly N seconds then exit with code 0 (health score = 100%) or 1 (any penalty). The exit check fires after each 5s report cycle, so at least one full window is always captured. Enables scripted health checks: `avstreamlens -i en0 -p aes67 --duration 30 && echo OK`
 - `--quiet` / `-q` — when set, `print_report` suppresses all stdout output on fully healthy cycles (no stream issues, no missing clocks, no pcap drops). When issues are present the full report is printed. The log file always receives the full report regardless of this flag. Designed for `tail -f`/log-aggregator use
 - **Interactive fallback**: when interface/protocol flags are absent `main.rs` calls `select_interface()` / `prompt_protocol_selection()` as before — the interactive path is fully intact
 - Interface list filtered: `lo`/`lo0`, `utun*`, `awdl*`, `llw*`, `bridge*`, `vpn*`, `docker*`, `veth*`, `virbr*`, `ap1`, `anpi*` (iPhone USB), `gif*` (IPv6 tunnel), `stf*` (6to4 tunnel)

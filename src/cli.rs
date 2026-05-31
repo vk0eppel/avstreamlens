@@ -21,6 +21,8 @@ pub struct CliArgs {
     /// the status line and active alerts when issues are detected.
     /// The log file always receives the full report.
     pub quiet: bool,
+    /// `--duration <seconds>` — stop after N seconds and exit 0 (healthy) or 1 (issues).
+    pub duration: Option<u64>,
 }
 
 /// Parse command-line arguments.  Exits with a helpful message on bad input.
@@ -38,6 +40,7 @@ pub fn parse_cli_args() -> CliArgs {
     let mut interface = None;
     let mut protocols = None;
     let mut quiet = false;
+    let mut duration = None;
     let mut i = 0;
 
     while i < args.len() {
@@ -68,6 +71,20 @@ pub fn parse_cli_args() -> CliArgs {
                 quiet = true;
                 i += 1;
             }
+            "--duration" | "-d" => {
+                if i + 1 < args.len() {
+                    match args[i + 1].parse::<u64>() {
+                        Ok(n) if n > 0 => { duration = Some(n); i += 2; }
+                        _ => {
+                            eprintln!("❌ --duration requires a positive integer (e.g. --duration 30)");
+                            std::process::exit(1);
+                        }
+                    }
+                } else {
+                    eprintln!("❌ --duration requires a value (e.g. --duration 30)");
+                    std::process::exit(1);
+                }
+            }
             other => {
                 eprintln!("❌ Unknown argument: {}  (run with --help for usage)", other);
                 std::process::exit(1);
@@ -75,7 +92,7 @@ pub fn parse_cli_args() -> CliArgs {
         }
     }
 
-    CliArgs { interface, protocols, no_color, quiet }
+    CliArgs { interface, protocols, no_color, quiet, duration }
 }
 
 /// Resolve a device by exact pcap name (e.g. `en0`).
@@ -137,6 +154,7 @@ fn print_help() {
     println!("OPTIONS");
     println!("  -i, --interface <name>    Network interface to capture on (e.g. en0, eth0)");
     println!("  -p, --protocol  <list>    Comma-separated protocols to monitor (default: all)");
+    println!("  -d, --duration  <secs>    Stop after N seconds; exit 0 if healthy, 1 if issues");
     println!("  -q, --quiet               Suppress output on healthy cycles; show alerts only");
     println!("      --no-color            Disable ANSI colour output (also: NO_COLOR env var)");
     println!("  -h, --help                Show this help message\n");

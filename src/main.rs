@@ -113,6 +113,7 @@ fn main() {
         COLOR.store(false, Ordering::Relaxed);
     }
     let quiet = args.quiet;
+    let duration_secs = args.duration;
 
     let device = match args.interface {
         Some(ref name) => cli::resolve_interface_by_name(name),
@@ -165,6 +166,7 @@ fn main() {
 
     let mut state = CaptureState::new();
     let mut last_report = Instant::now();
+    let run_start = Instant::now();
 
     // ── Capture loop ────────────────────────────────
     loop {
@@ -209,6 +211,15 @@ fn main() {
 
             state.reset_window();
             last_report = Instant::now();
+
+            // --duration exit: wait until at least one full report has been printed,
+            // then exit once the requested duration has elapsed.
+            if let Some(secs) = duration_secs {
+                if run_start.elapsed().as_secs() >= secs {
+                    let healthy = state.network_health.network_score >= 100.0;
+                    std::process::exit(if healthy { 0 } else { 1 });
+                }
+            }
         }
 
         let packet = match cap.next_packet() {
