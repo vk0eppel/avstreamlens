@@ -38,7 +38,7 @@ See **[TODO.md](TODO.md)** for the full list. Quick summary:
 | Category | Items |
 |---|---|
 | Bugs / code issues | (none — all resolved) |
-| Missing features | PTPv1 grandmaster NIC MAC display; VLAN-ID filter; Dante AV video; health score review; JSON output; SAP re-announce monitor; redundant stream pairing; RTCP; PTP BMCA; SDP preload; NMOS IS-04 |
+| Missing features | PTPv1 grandmaster NIC MAC display; VLAN-ID filter; Dante AV video; Dante device metadata enrichment (mDNS TXT / ConMon); Dante SAP group 239.255.255.255 join; health score review; JSON output; SAP re-announce monitor; redundant stream pairing; RTCP; PTP BMCA; SDP preload; NMOS IS-04 |
 | Platform limitations | NDI loopback unsupported; macOS VLAN tag stripping; Windows `cmd.exe` no ANSI color; PAUSE/PFC NIC-consumed |
 
 ---
