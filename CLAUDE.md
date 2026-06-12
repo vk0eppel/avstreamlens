@@ -17,6 +17,7 @@
 | `src/parser/avdecc.rs` | AVDECC ADP (IEEE 1722.1) frame parser — entity discovery without SPAN |
 | `src/parser/lldp.rs` | LLDP TLV walker that surfaces the IEEE 802.3az EEE TLV |
 | `src/parser/mdns.rs` | mDNS service-instance name extraction (Dante `_netaudio-cmc`/`_netaudio-arc`/`_netaudio`, NDI `_ndi`) |
+| `src/parser/conmon.rs` | Dante ConMon (control & monitoring) frame parser — device liveness + channel count without SPAN |
 | `src/parser/flow_control.rs` | 802.3x PAUSE / 802.1Qbb PFC frame classifier (EtherType 0x8808) |
 | `src/protocols.rs` | Enums, constants, type definitions |
 | `src/stats.rs` | Stream statistics — RTP, TCP, PTP, network health score |
@@ -28,7 +29,7 @@
 cargo build --release   # build
 cargo fmt               # format
 cargo clippy -- -D warnings  # lint
-cargo test              # run all 128 unit tests
+cargo test              # run all 143 unit tests
 ```
 
 ## Open Work
@@ -38,7 +39,8 @@ See **[TODO.md](TODO.md)** for the full list. Quick summary:
 | Category | Items |
 |---|---|
 | Bugs / code issues | (none — all resolved) |
-| Missing features | PTPv1 grandmaster NIC MAC display; VLAN-ID filter; Dante AV video; Dante device metadata enrichment (mDNS TXT / ConMon); Dante SAP group 239.255.255.255 join; health score review; JSON output; SAP re-announce monitor; redundant stream pairing; RTCP; PTP BMCA; SDP preload; NMOS IS-04 |
+| Missing features | PTPv1 grandmaster NIC MAC display; VLAN-ID filter; Dante AV video; Dante mDNS TXT metadata enrichment; health score review; JSON output; SAP re-announce monitor; redundant stream pairing; RTCP; PTP BMCA; SDP preload; NMOS IS-04 |
+| Done, pending field check | ConMon device liveness + channel count; Dante SAP group 239.255.255.255 join; official ATP port detection (4321 / 14336–15359) |
 | Platform limitations | NDI loopback unsupported; macOS VLAN tag stripping; Windows `cmd.exe` no ANSI color; PAUSE/PFC NIC-consumed |
 
 ---
@@ -46,7 +48,7 @@ See **[TODO.md](TODO.md)** for the full list. Quick summary:
 ## Architecture
 
 ### General
-- **Test harness**: 121 unit tests in `#[cfg(test)]` modules across `parser.rs` + `parser/{sdp,ptp,avb,avdecc,lldp,mdns,flow_control}.rs`, `stats.rs`, and `capture.rs` — run with `cargo test`. Each parser submodule keeps its own fixtures and tests. `capture.rs` tests exercise handlers with hand-built IP/UDP/RTP byte buffers (see `ip_udp_rtp()` helper); no pcap dependency in tests
+- **Test harness**: 143 unit tests in `#[cfg(test)]` modules across `parser.rs` + `parser/{sdp,ptp,avb,avdecc,lldp,mdns,flow_control,conmon}.rs`, `stats.rs`, and `capture.rs` — run with `cargo test`. Each parser submodule keeps its own fixtures and tests. `capture.rs` tests exercise handlers with hand-built IP/UDP/RTP byte buffers (see `ip_udp_rtp()` helper); no pcap dependency in tests
 - Logging: timestamped `.log` files written on every run in the working directory; `Logger::log()` flushes after every write so the last report survives SIGINT
 - Bitrate computed as `byte_delta / elapsed_secs` — never assumed 1s exactly
 - All modules follow the same pattern: parse → stats → report
@@ -62,7 +64,7 @@ See **[TODO.md](TODO.md)** for the full list. Quick summary:
 - **Adding a new protocol parser** = create `parser/<name>.rs`, declare `pub mod <name>;` in `parser.rs`, re-export its public functions with `pub use <name>::...`, add a branch in `detect_protocol`. Tests live in the same file as the parser
 
 ### Capture Module (`capture.rs`)
-- **`CaptureState`** owns all per-loop HashMaps/HashSets (streams, tcp_streams, sdp_cache, ptp_domains, ndi_sources, ndi_names, dante_names, igmp_joins_seen, avtp_streams, msrp_state, mvrp_vlans, eee_ports, avdecc_entities), `network_health`, `bytes_this_window`, and the dynamic-IGMP-join queue: `pending_join_groups: Vec<Ipv4Addr>` (handlers push new `239.x.x.x` groups here; drained by `main.rs` after each dispatch) and `joined_multicast: HashSet<Ipv4Addr>` (written by `main.rs` after a successful `join_multicast_v4` so handlers can skip groups already joined). `main.rs` holds exactly one `CaptureState` for the lifetime of the process
+- **`CaptureState`** owns all per-loop HashMaps/HashSets (streams, tcp_streams, sdp_cache, ptp_domains, ndi_sources, ndi_names, dante_names, dante_conmon, igmp_joins_seen, avtp_streams, msrp_state, mvrp_vlans, eee_ports, avdecc_entities), `network_health`, `bytes_this_window`, and the dynamic-IGMP-join queue: `pending_join_groups: Vec<Ipv4Addr>` (handlers push new `239.x.x.x` groups here; drained by `main.rs` after each dispatch) and `joined_multicast: HashSet<Ipv4Addr>` (written by `main.rs` after a successful `join_multicast_v4` so handlers can skip groups already joined). `main.rs` holds exactly one `CaptureState` for the lifetime of the process
 - **One `handle_*` method per protocol** (e.g. `handle_aes67`, `handle_dante`, `handle_ptp`). Each takes already-parsed inputs (`l2_payload: &[u8]`, `frame_bytes: u64`, `avtp_seq: Option<u8>`, `now: Instant`) — never a raw `pcap::Packet`. This is what makes handlers unit-testable
 - **Handlers do not touch IO.** They mutate `CaptureState` and return `Vec<Alert>`. The dispatch layer prints + logs. The `PtpEvent` pattern in `stats.rs` is the same idea applied one layer deeper (data layer returns events; handler layer turns them into `Alert`s)
 - **`Alert { level: AlertLevel, message: String }`** with constructors `Alert::info/good/warn/error`. `emit(&[Alert], &mut Logger)` maps level → ANSI color (none/32/33/31) and prints + logs in one place. Adding a new severity or alert format is a single-site change
@@ -74,7 +76,7 @@ See **[TODO.md](TODO.md)** for the full list. Quick summary:
 
 ### Protocol Dispatch
 - Detection order (first match wins):
-  `MSRP → LLDP → Flow-control (PAUSE/PFC) → MVRP → AVTP/AVB → gPTP → IGMP → SAP → mDNS → Dante control → UDP PTP → RTP gate → **Dante audio (port heuristic)** → **Dante multicast (239.255/16 block)** → AES67 → ST2110`
+  `MSRP → LLDP → Flow-control (PAUSE/PFC) → MVRP → AVTP/AVB → gPTP → IGMP → SAP → mDNS → **Dante ConMon (8700–8708 + "Audinate" signature)** → Dante control → UDP PTP → **Dante ATP (239.255/16:4321 or both ports 14336–15359 — pre-RTP-gate, ATP is not RTP)** → RTP gate → **Dante audio (port heuristic)** → **Dante multicast (239.255/16 block)** → AES67 → ST2110`
 - **Dante audio runs before AES67/ST2110 IP checks** — Dante multicast (239.255.x.x) would otherwise match `is_st2110_multicast`. Two Dante-audio gates: `is_likely_dante_audio` (strict — both src AND dst ports even in 5000–6000, for unicast) then `is_dante_multicast` (dst in `239.255.0.0/16` AND dst port even in 5000–6000 — catches multicast transmit flows whose source port is out of range, which the strict gate misses and the ST2110 catch-all would otherwise steal)
 - **Always processed regardless of user selection**: only LLDP/EEE (`AvProtocol::is_selected()` returns `true` unconditionally only for `LldpEee`)
 - **Gated on protocol selection** via `is_selected()`:
@@ -128,6 +130,8 @@ See **[TODO.md](TODO.md)** for the full list. Quick summary:
 ### Dante
 - **Transport**: UDP unicast or multicast (239.255.x.x); discovery via mDNS (`_netaudio-cmc._udp` / `_netaudio-arc._udp` on firmware 4.x+, `_netaudio._udp` legacy)
 - **Detection**: `is_likely_dante_audio()` requires BOTH src AND dst ports in 5000–6000 (even) — prevents false positives from ephemeral source ports. Plus `is_dante_multicast()` (`239.255.0.0/16`, Dante's default multicast block): a multicast-destined flow with dst port even in 5000–6000 is classified Dante even when the source port is out of range, so multicast transmit flows aren't stolen by the ST2110 catch-all. **Tradeoff** (see TODO field-verification): an ST2110 deployment using `239.255.x.x` with an even 5000–6000 dst port would be mislabelled Dante — uncommon since `239.255/16` is Dante-specific
+- **ATP detection (official Audinate ports)**: a pre-RTP-gate check in `detect_protocol` classifies `239.255/16` dst port **4321** (multicast ATP audio) and flows with **both ports in 14336–15359** (unicast audio/video) as Dante. ATP framing is not RTP — `handle_dante` falls back to `StreamStats::update_non_rtp()` (packets/bitrate/presence only, `rtp_seen` stays false) and the report renders `N pkts | X Mbps (ATP framing — loss/jitter unavailable)` instead of fake 0% loss. `rtp_seen` also gates the "not announced (no SAP)" alert. Field verification of which ports real devices use is pending (TODO.md)
+- **ConMon (control & monitoring)**: `parser/conmon.rs::parse_conmon()` — UDP 8700–8708 (multicast `224.0.0.230–233`), validated by ASCII `"Audinate"` at payload offset 16–23 plus a BE length field at [2..4] (padding-tolerant). Extracts the sender MAC ([8..14]) and, from 8705 metering frames ("MBC" tag at 0x2a, count at 0x44), the channel count. ConMon is **link-local multicast — never IGMP-snooped** — so it proves device liveness at ~33 pkts/s from any port, no SPAN. `dante_conmon: HashMap<Ipv4Addr, ConmonDevice>` (pruned after `CONMON_PRUNE_SECS = 60` of silence); ConMon IPs are also inserted into `dante_sources`. Report: `Dante live (ConMon: N)` line in the Discovered section, names cross-referenced from `dante_names`. The ConMon check runs before the Dante-control port check (they overlap on 8700); non-ConMon payloads on 8700/8800 still classify as `DanteKind::Control`
 - **Clock**: PTPv1 via UDP ports 319/320; grandmaster from Sync body (bytes 50–55 UUID, byte 61 stratum, bytes 62–65 ident); PTPv1 layout auto-detected by **`payload[0]`**: `0x11` → nibble-packed (hdr_shift=2), else separate-byte (hdr_shift=0); subdomain → domain: _DFLT=0, _ALT1=1, _ALT2=2, _ALT3=3, anything else → 0. **Limitation**: DDM / Dante Director uses custom user-defined subdomains (e.g. `H~O$L`) that don't match these four names — they silently map to 0, so all DDM domains appear as domain 0
 - **Device names**: extracted from mDNS DNS labels via `extract_dante_name()` (tries CMC → ARC → legacy); stored in `dante_names: HashMap<Ipv4Addr, String>`; `DanteKind::Discovery { device_name }` carries name to dispatch
 - **`AvProtocol::Dante`**: `{ kind, src, dst, dst_port }` — `dst` is the destination IP; used in `handle_dante` to set `is_multicast` and fill `dst_ip`/`dst_port` via `StreamStats::new_with_info`
@@ -196,7 +200,7 @@ See **[TODO.md](TODO.md)** for the full list. Quick summary:
 - Querier absence penalizes health score only when active multicast streams exist (−10 pts); "silent" threshold is interval-aware via `NetworkHealth::querier_silent_after_secs()` ≈ 2× the observed query interval (default 260s), per RFC 3376 "Other Querier Present Interval" — a fixed 130s left too little margin on a default 125s querier
 - `igmp_query_interval_secs` tracks detected interval between consecutive queries — shown in footer as `(interval Xs)`
 - **IGMPv3 Membership Report parsing** (`IgmpType::MembershipReportV3 { groups: Vec<Ipv4Addr> }`): type `0x22` is now parsed separately from IGMPv2 Join (`0x16`). `parse_igmpv3_report()` in `parser.rs` walks the Group Records (RFC 3376 §4.2): `payload[6..7]` = num_records, then per record: `[0]` record_type, `[1]` aux_data_len, `[2-3]` num_sources, `[4-7]` multicast address; offset advances by `8 + 4*num_sources + 4*aux_data_len`. Extracted groups are pushed to `CaptureState::pending_join_groups` by `handle_igmp` (filtered to `239.x.x.x` only)
-- **Dynamic IGMP join bootstrap**: startup joins `224.0.0.22` (IGMPv3 all-routers, normally flooded) + PTP groups + SAP `224.2.127.254`. From SAP, `handle_sap` pushes stream multicast IPs from `SdpMedia.connection` ("IN IP4 x.x.x.x[/ttl]"). From IGMPv3 reports, `handle_igmp` pushes all `239.x.x.x` groups. `main.rs` drains `pending_join_groups` after each `dispatch()` call: `should_join_group()` gates by octet[1] (69→AES67, 255→Dante, other→ST2110) against `expanded_protocols`; approved groups get a `UdpSocket::join_multicast_v4` call; socket kept in `mc_sockets: Vec<UdpSocket>` (process-lifetime); success written to `state.joined_multicast`. Limitation: Dante IGMPv2 on old switches sends reports to the group address (snooped), creating a chicken/egg that the v3 path cannot resolve
+- **Dynamic IGMP join bootstrap**: startup joins `224.0.0.22` (IGMPv3 all-routers, normally flooded) + PTP groups + SAP `224.2.127.254` + Dante's SAP group `239.255.255.255` (per Audinate's port list; inside the snooped 239.255/16 block, so the join is required). From SAP, `handle_sap` pushes stream multicast IPs from `SdpMedia.connection` ("IN IP4 x.x.x.x[/ttl]"). From IGMPv3 reports, `handle_igmp` pushes all `239.x.x.x` groups. `main.rs` drains `pending_join_groups` after each `dispatch()` call: `should_join_group()` gates by octet[1] (69→AES67, 255→Dante, other→ST2110) against `expanded_protocols`; approved groups get a `UdpSocket::join_multicast_v4` call; socket kept in `mc_sockets: Vec<UdpSocket>` (process-lifetime); success written to `state.joined_multicast`. Limitation: Dante IGMPv2 on old switches sends reports to the group address (snooped), creating a chicken/egg that the v3 path cannot resolve
 
 ### LLDP / EEE
 - LLDP (0x88CC) always in BPF filter regardless of protocol selection
@@ -212,7 +216,7 @@ See **[TODO.md](TODO.md)** for the full list. Quick summary:
 - **Five sections** (all use cyan `\x1b[36m` header + emoji); log file output matches console exactly:
   1. Overview — bandwidth + stream count summary + `✓/⚠/–` status line
   2. `📡 Streams:` — unified list of all active streams (AES67, Dante, ST2110, NDI, AVB), no blank lines between entries
-  3. `📇 Discovered (mDNS):` — devices learned from multicast mDNS (Dante/NDI), shown only when ≥1 device discovered; `print_discovery()` in `report.rs`. Emits a yellow **no-SPAN diagnostic** ("Devices announced but no active flows — unicast flows need a SPAN/mirror port") when a protocol has discovered devices but zero active streams — the fingerprint of unicast flows on a non-mirrored port. Does not flip `is_healthy`, so quiet+healthy stays silent
+  3. `📇 Discovered:` — devices learned from multicast mDNS (Dante/NDI) and Dante ConMon, shown only when ≥1 device discovered; `print_discovery()` in `report.rs`. A `Dante live (ConMon: N)` line lists devices with continuous monitoring traffic (name or IP, `[N ch]` when known) — real-time liveness, unlike mDNS which may be minutes stale. Emits a yellow **no-SPAN diagnostic** ("Devices announced but no active flows — unicast flows need a SPAN/mirror port") when a protocol has discovered devices but zero active streams — the fingerprint of unicast flows on a non-mirrored port. Does not flip `is_healthy`, so quiet+healthy stays silent
   4. `🕐 Clock Sources:` — PTP domains (conditional)
   5. `🔬 Network Health — X%:` — health score + QoS/DSCP + IGMP querier + EEE
 - Stream entry format: `  ▸ Protocol  "Name"  [codec]  —  IP:port` / `    metrics line` / `    ⚠  alerts`

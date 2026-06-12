@@ -12,7 +12,7 @@ AVStreamLens reads the network passively using pcap, identifies streams and cloc
 |---|---|---|
 | **AES67** | UDP multicast (239.69.*) | Loss, jitter, SSRC changes, timing discontinuities, payload type, signal gap detection, PTPv2 clock, ts-refclk validation, DSCP |
 | **SMPTE ST 2110** | UDP multicast (239.x.x.x) | Video (2110-20), audio (2110-30), ancillary (2110-40) — same RTP metrics as AES67; video clock rate confirmed without SDP |
-| **Dante** | UDP unicast or multicast / mDNS | Device names from mDNS, audio stream RTP metrics, signal gap detection, DSCP, PTPv1 clock |
+| **Dante** | UDP unicast or multicast / mDNS / ConMon | Device names from mDNS, live-device detection + channel count from ConMon multicast (no SPAN needed), audio stream metrics (RTP, or presence/bitrate for ATP-framed flows), signal gap detection, DSCP, PTPv1 clock |
 | **NDI** | TCP (dynamic ports) | Source names from mDNS, bitrate, TCP quality, retransmissions, RST/FIN |
 | **AVB / IEEE 802.1** | L2 Ethernet | gPTP grandmaster (802.1AS), MSRP bandwidth reservations (802.1Qat), MVRP VLAN registrations (802.1Q), AVTP stream IDs, AVDECC entity discovery (IEEE 1722.1) |
 
@@ -114,6 +114,7 @@ AVStreamLens is a **passive capture tool** — it reads traffic delivered to its
 | **AVB — AVDECC entities** | ADP uses MAC `91:E0:F0:01:00:00` (globally registered, bridges MUST forward) |
 | **PTP, IGMP, SAP** | Multicast — AVStreamLens joins PTP and SAP groups at startup |
 | **Dante / NDI discovery** | mDNS multicast (link-local, always flooded) — delivered to every port |
+| **Dante device liveness (ConMon)** | Control & monitoring multicast (224.0.0.230–233, link-local, always flooded) — every live Dante device is visible at ~33 packets/s, with its channel count |
 | **Dante PTPv1 clock** | Multicast — delivered to every port |
 
 > **AVB gPTP / MSRP / MVRP are NOT delivered to every port.** They use link-local reserved MACs (`01:80:C2:00:00:0E`, `…:21`) in the IEEE range that bridges must **not** forward — they are hop-by-hop, so you only ever see the copy on your own link, not a remote grandmaster. See *Monitoring gPTP / the AVB grandmaster* below.
@@ -226,8 +227,9 @@ Choose the protocols to monitor:
     loss: 0.0%  |  2.3 Mbps
     ✓  Reserved  VLAN 100  prio 3  ✓  Listener Ready
 
-📇 Discovered (mDNS):
+📇 Discovered:
    Dante (5):  "Stage Box", "Yamaha-DM7", "TASCAM", "Amp-1", "Amp-2"
+   Dante live (ConMon: 2):  "Stage Box" [32 ch], "Yamaha-DM7" [64 ch]
    NDI   (2):  "Studio Camera", "Playback PC"
 
 🕐 Clock Sources:
@@ -246,7 +248,7 @@ Choose the protocols to monitor:
 
 **Status line** — `✓ All streams healthy` or `⚠ N issue(s)` with a brief description.
 
-**Discovered (mDNS)** — Dante and NDI devices announce themselves over multicast mDNS, which reaches every switch port. This section lists those devices even when their actual audio/video flows are not visible. On a plain (non-SPAN) port where Dante audio or NDI is unicast between other devices, you will see the devices here but no matching stream above — in that case AVStreamLens adds:
+**Discovered** — Dante and NDI devices announce themselves over multicast mDNS, which reaches every switch port. This section lists those devices even when their actual audio/video flows are not visible. The **Dante live (ConMon)** line goes further: Dante devices continuously transmit control & monitoring (ConMon) multicast at ~33 packets/s on the link-local 224.0.0.230–233 groups, which snooping switches always flood — so AVStreamLens shows in real time which devices are alive *right now* (with their channel count), not just which ones announced via mDNS at some point. On a plain (non-SPAN) port where Dante audio or NDI is unicast between other devices, you will see the devices here but no matching stream above — in that case AVStreamLens adds:
 
 ```
    ⚠  Devices announced but no active flows — unicast flows need a SPAN/mirror port

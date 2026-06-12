@@ -9,6 +9,7 @@ pub mod avdecc;
 pub mod lldp;
 pub mod mdns;
 pub mod flow_control;
+pub mod conmon;
 
 // Re-export the public API so consumers (main.rs, capture.rs) can keep using
 // `crate::parser::parse_*` and `crate::parser::extract_*` without churn.
@@ -19,6 +20,7 @@ pub use avdecc::{parse_adp, fmt_eui64, media_type_summary, sr_class_str};
 pub use lldp::parse_lldp_eee;
 pub use mdns::{extract_dante_name, extract_ndi_name, mdns_contains};
 pub use flow_control::parse_flow_control;
+pub use conmon::parse_conmon;
 
 use pnet_packet::{
     ethernet::EthernetPacket,
@@ -261,7 +263,7 @@ pub fn detect_protocol(eth: &EthernetPacket) -> Option<AvProtocol> {
         // Outgoing queries from the local machine contain the same service-label
         // bytes in the question section, so without this guard they would be
         // classified as Dante/NDI discovery with src_ip = the local machine's IP.
-        let is_mdns_response = payload.get(2).map_or(false, |b| b & 0x80 != 0);
+        let is_mdns_response = payload.get(2).is_some_and(|b| b & 0x80 != 0);
         if is_mdns_response {
             if mdns_contains(payload, b"\x09_netaudio")
                 || mdns_contains(payload, b"\x0d_netaudio-cmc")
@@ -276,6 +278,20 @@ pub fn detect_protocol(eth: &EthernetPacket) -> Option<AvProtocol> {
             }
         }
         return None;
+    }
+
+    // ── Dante ConMon (control & monitoring, ports 8700–8708) ─────────────
+    // Multicast ConMon (224.0.0.230–233) is in the link-local 224.0.0.0/24
+    // block that IGMP snooping never prunes — a continuous liveness signal
+    // for every Dante device, visible from any port without SPAN. Must run
+    // before the generic Dante-control port check, which overlaps on 8700.
+    if (8700..=8708).contains(&dst_port)
+        && let Some(cm) = parse_conmon(payload)
+    {
+        return Some(AvProtocol::Dante {
+            kind: DanteKind::ConMon { device_mac: cm.device_mac, channels: cm.channels },
+            src: src_ip, dst: dst_ip, dst_port,
+        });
     }
 
     // ── Dante Control ───────────────────────────────────
@@ -299,6 +315,19 @@ pub fn detect_protocol(eth: &EthernetPacket) -> Option<AvProtocol> {
         });
         info.src_ip = Some(src_ip);
         return Some(AvProtocol::Ptp { info });
+    }
+
+    // ── Dante ATP audio (official Audinate port allocations) ─────────────
+    // Per Audinate's port list: multicast ATP audio = 239.255.0.0/16 dst port
+    // 4321; unicast audio/video flows = UDP 14336–15359 (both endpoints
+    // allocate from this range). ATP framing is not RTP, so this must run
+    // BEFORE the RTP version gate below. The legacy RTP-gated 5000–6000
+    // heuristic further down is retained alongside — field verification of
+    // which range real devices use is pending (TODO.md).
+    if (is_dante_multicast(dst_ip) && dst_port == 4321)
+        || ((14336..=15359).contains(&dst_port) && (14336..=15359).contains(&src_port))
+    {
+        return Some(AvProtocol::Dante { kind: DanteKind::AudioStream, src: src_ip, dst: dst_ip, dst_port });
     }
 
     // ── RTP Streams ─────────────────────────────────────
@@ -558,6 +587,106 @@ mod tests {
         let frame = eth_ip_udp_rtp(Ipv4Addr::new(239, 1, 2, 3), 41000, 5006, 96);
         let eth = EthernetPacket::new(&frame).unwrap();
         assert!(matches!(detect_protocol(&eth), Some(AvProtocol::St2110 { .. })));
+    }
+
+    /// Build an Ethernet+IPv4+UDP frame with an arbitrary UDP payload
+    /// (for non-RTP protocols: ConMon, ATP).
+    fn eth_ip_udp(src: Ipv4Addr, dst: Ipv4Addr, src_port: u16, dst_port: u16, payload: &[u8]) -> Vec<u8> {
+        let udp_len = (8 + payload.len()) as u16;
+        let mut ip = vec![0u8; 20 + 8 + payload.len()];
+        ip[0] = 0x45;                                       // v4, IHL=5
+        let total = (20 + udp_len) as u16;
+        ip[2..4].copy_from_slice(&total.to_be_bytes());
+        ip[8] = 64;                                         // TTL
+        ip[9] = 0x11;                                       // UDP
+        ip[12..16].copy_from_slice(&src.octets());
+        ip[16..20].copy_from_slice(&dst.octets());
+        ip[20..22].copy_from_slice(&src_port.to_be_bytes());
+        ip[22..24].copy_from_slice(&dst_port.to_be_bytes());
+        ip[24..26].copy_from_slice(&udp_len.to_be_bytes());
+        ip[28..].copy_from_slice(payload);
+        eth_frame(&[0x08, 0x00], &[], &ip)
+    }
+
+    /// Minimal valid ConMon payload: length field + sender MAC + "Audinate".
+    fn conmon_payload(mac: [u8; 6]) -> Vec<u8> {
+        let mut p = vec![0u8; 64];
+        p[0] = 0xff; p[1] = 0xff;
+        p[2..4].copy_from_slice(&(64u16).to_be_bytes());
+        p[8..14].copy_from_slice(&mac);
+        p[16..24].copy_from_slice(b"Audinate");
+        p
+    }
+
+    // ── Dante ConMon detection ───────────────────────────────────────────────
+
+    #[test]
+    fn conmon_multicast_frame_classified_as_dante_conmon() {
+        let mac = [0x00, 0x1d, 0xc1, 0x19, 0x86, 0x2a];
+        let frame = eth_ip_udp(
+            Ipv4Addr::new(169, 254, 81, 11), Ipv4Addr::new(224, 0, 0, 232),
+            51340, 8705, &conmon_payload(mac),
+        );
+        let eth = EthernetPacket::new(&frame).unwrap();
+        match detect_protocol(&eth) {
+            Some(AvProtocol::Dante { kind: DanteKind::ConMon { device_mac, .. }, src, .. }) => {
+                assert_eq!(device_mac, mac);
+                assert_eq!(src, Ipv4Addr::new(169, 254, 81, 11));
+            }
+            other => panic!("expected Dante ConMon, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn port_8700_without_audinate_signature_stays_dante_control() {
+        // 8700 overlaps DANTE_CTRL_PORTS — a non-ConMon payload on it must keep
+        // the existing Control classification, not be dropped by the ConMon parse.
+        let frame = eth_ip_udp(
+            Ipv4Addr::new(192, 168, 1, 50), Ipv4Addr::new(192, 168, 1, 60),
+            40000, 8700, &[0u8; 32],
+        );
+        let eth = EthernetPacket::new(&frame).unwrap();
+        assert!(matches!(detect_protocol(&eth),
+            Some(AvProtocol::Dante { kind: DanteKind::Control, .. })));
+    }
+
+    // ── Dante ATP audio (official ports, non-RTP framing) ───────────────────
+
+    #[test]
+    fn atp_multicast_port_4321_classified_as_dante_audio() {
+        // Official multicast ATP audio: 239.255.0.0/16 dst port 4321, not RTP-framed.
+        // Must be classified before the RTP gate would discard it.
+        let frame = eth_ip_udp(
+            Ipv4Addr::new(169, 254, 81, 11), Ipv4Addr::new(239, 255, 10, 1),
+            14400, 4321, &[0u8; 64],
+        );
+        let eth = EthernetPacket::new(&frame).unwrap();
+        assert!(matches!(detect_protocol(&eth),
+            Some(AvProtocol::Dante { kind: DanteKind::AudioStream, .. })));
+    }
+
+    #[test]
+    fn atp_unicast_official_range_classified_as_dante_audio() {
+        // Official unicast audio/video flows: both endpoints in UDP 14336–15359.
+        let frame = eth_ip_udp(
+            Ipv4Addr::new(192, 168, 1, 50), Ipv4Addr::new(192, 168, 1, 60),
+            14400, 15000, &[0u8; 64],
+        );
+        let eth = EthernetPacket::new(&frame).unwrap();
+        assert!(matches!(detect_protocol(&eth),
+            Some(AvProtocol::Dante { kind: DanteKind::AudioStream, .. })));
+    }
+
+    #[test]
+    fn atp_unicast_requires_both_ports_in_range() {
+        // Ephemeral source port outside 14336–15359 → not claimed as Dante;
+        // non-RTP payload then falls through to None.
+        let frame = eth_ip_udp(
+            Ipv4Addr::new(192, 168, 1, 50), Ipv4Addr::new(192, 168, 1, 60),
+            40000, 15000, &[0u8; 64],
+        );
+        let eth = EthernetPacket::new(&frame).unwrap();
+        assert!(detect_protocol(&eth).is_none());
     }
 
     #[test]

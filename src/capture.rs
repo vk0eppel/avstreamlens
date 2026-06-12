@@ -25,8 +25,8 @@ use crate::protocols::{
 };
 use crate::report::Logger;
 use crate::stats::{
-    AvdeccEntity, AvtpStreamStats, NetworkHealth, PtpEvent, PtpStats, StreamQuality, StreamStats,
-    TcpStreamStats,
+    AvdeccEntity, AvtpStreamStats, ConmonDevice, NetworkHealth, PtpEvent, PtpStats, StreamQuality,
+    StreamStats, TcpStreamStats,
 };
 
 // IGMP Join dedup entries are pruned after this many seconds without re-seeing
@@ -37,6 +37,11 @@ const IGMP_JOIN_DEDUP_TTL_SECS: u64 = 300;
 // `STREAM_TIMEOUT_SECS` is the report-time "dead stream" threshold; pruning
 // waits longer so an alert is shown at least once before the entry disappears.
 const STREAM_PRUNE_SECS: u64 = STREAM_TIMEOUT_SECS * 2;
+
+// ConMon devices are pruned after this many seconds of silence. ConMon metering
+// runs at ~33 packets/s per device, so 60 s of silence means the device is gone
+// (powered off or unplugged) — generous against transient capture stalls.
+const CONMON_PRUNE_SECS: u64 = 60;
 
 /// Which clock type a protocol family is missing.
 #[derive(Debug, Clone, PartialEq)]
@@ -95,9 +100,13 @@ pub struct CaptureState {
     // NDI sender IPs learned from mDNS — used for IP-based stream detection.
     pub ndi_sources:    HashSet<Ipv4Addr>,
     pub ndi_names:      HashMap<Ipv4Addr, String>,
-    // Dante sender IPs learned from mDNS — tracked regardless of whether a name is known.
+    // Dante sender IPs learned from mDNS or ConMon — tracked regardless of whether a name is known.
     pub dante_sources:  HashSet<Ipv4Addr>,
     pub dante_names:    HashMap<Ipv4Addr, String>,
+    // Live Dante devices observed via ConMon multicast (224.0.0.230-233:8700-8708).
+    // Link-local multicast — never IGMP-snooped, so this is a continuous liveness
+    // signal from any port even when all audio flows are unicast (no SPAN).
+    pub dante_conmon:   HashMap<Ipv4Addr, ConmonDevice>,
     // Deduplicates IGMP Join console output — cleared on Leave so re-joins print again.
     pub igmp_joins_seen: HashMap<(Ipv4Addr, Ipv4Addr), Instant>,
     pub avtp_streams:    HashMap<[u8; 8], AvtpStreamStats>,
@@ -143,6 +152,7 @@ impl CaptureState {
             ndi_names: HashMap::new(),
             dante_sources: HashSet::new(),
             dante_names: HashMap::new(),
+            dante_conmon: HashMap::new(),
             igmp_joins_seen: HashMap::new(),
             avtp_streams:    HashMap::new(),
             msrp_state:      HashMap::new(),
@@ -197,6 +207,9 @@ impl CaptureState {
         if self.avtp_streams.is_empty() {
             self.mvrp_vlans.clear();
         }
+        // Drop ConMon devices that stopped announcing (metering is ~33 Hz, so
+        // a minute of silence means the device left the network).
+        self.dante_conmon.retain(|_, d| d.last_seen.elapsed().as_secs() < CONMON_PRUNE_SECS);
         // Drop IGMP Join entries from hosts that vanished without sending a Leave.
         self.igmp_joins_seen.retain(|_, t| t.elapsed() < Duration::from_secs(IGMP_JOIN_DEDUP_TTL_SECS));
         // Prune AVDECC entities whose ADP announcement has expired (valid_time + 10s grace).
@@ -439,8 +452,8 @@ impl CaptureState {
         }
     }
 
-    /// Dante: discovery, control (silent), or audio stream.
-    pub fn handle_dante(&mut self, kind: DanteKind, src: Ipv4Addr, dst: Ipv4Addr, dst_port: u16, l2_payload: &[u8]) -> Vec<Alert> {
+    /// Dante: discovery, control (silent), ConMon liveness, or audio stream.
+    pub fn handle_dante(&mut self, kind: DanteKind, src: Ipv4Addr, dst: Ipv4Addr, dst_port: u16, l2_payload: &[u8], now: Instant) -> Vec<Alert> {
         match kind {
             DanteKind::Discovery { device_name } => {
                 let is_new = !self.dante_sources.contains(&src);
@@ -456,6 +469,34 @@ impl CaptureState {
                 }
             }
             DanteKind::Control => vec![],
+            DanteKind::ConMon { device_mac, channels } => {
+                let is_new = !self.dante_conmon.contains_key(&src);
+                let entry = self.dante_conmon.entry(src).or_insert_with(|| ConmonDevice {
+                    mac: device_mac, channels: None, packets: 0, last_seen: now,
+                });
+                entry.packets += 1;
+                entry.last_seen = now;
+                entry.mac = device_mac;
+                // Channel count only rides metering frames — keep the last known
+                // value when other ConMon message types arrive.
+                if channels.is_some() { entry.channels = channels; }
+                // ConMon proves a live Dante device even before (or without) mDNS —
+                // count it as a discovered source so the device list includes it.
+                self.dante_sources.insert(src);
+                if is_new {
+                    let mac = device_mac;
+                    let mac_str = format!("{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+                        mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+                    let name = self.dante_names.get(&src)
+                        .map(|n| format!("  \"{}\"", n)).unwrap_or_default();
+                    let ch = channels.map(|c| format!("  {} ch", c)).unwrap_or_default();
+                    vec![Alert::info(format!(
+                        "🔍 Dante device live (ConMon): {}{}  [{}]{}", src, name, mac_str, ch
+                    ))]
+                } else {
+                    vec![]
+                }
+            }
             DanteKind::AudioStream => {
                 let is_mc = crate::parser::is_multicast(dst);
                 let key = format!("Dante {}:{}", src, dst_port);
@@ -471,8 +512,11 @@ impl CaptureState {
                     // Dante audio requires DSCP EF (46)
                     if ip.get_dscp() != 46 { stats.dscp_violations += 1; }
                     if ip.get_ecn() == 3 { self.network_health.ecn_congestion_marks += 1; }
-                    if let Some((seq, ts, ssrc)) = parse_rtp(udp.payload()) {
-                        stats.update(seq, ts, ssrc, udp.payload().len());
+                    match parse_rtp(udp.payload()) {
+                        Some((seq, ts, ssrc)) => stats.update(seq, ts, ssrc, udp.payload().len()),
+                        // ATP framing (official ports 4321 / 14336–15359) is not RTP —
+                        // track presence and bitrate; loss/jitter need RTP fields.
+                        None => stats.update_non_rtp(udp.payload().len(), now),
                     }
                 }
                 vec![]
@@ -790,7 +834,7 @@ pub fn dispatch(
             vec![]
         }
         AvProtocol::Dante { kind, src, dst, dst_port } => {
-            state.handle_dante(kind, src, dst, dst_port, l2_payload)
+            state.handle_dante(kind, src, dst, dst_port, l2_payload, now)
         }
         AvProtocol::Ndi { kind: NdiKind::Discovery { source_name }, src } => {
             state.handle_ndi_discovery(src, source_name)
@@ -1017,7 +1061,7 @@ mod tests {
         let src = Ipv4Addr::new(192, 168, 1, 50);
         state.dante_names.insert(src, "Stage Box".to_string());
         // empty l2_payload — name pickup happens before IP parse
-        let alerts = state.handle_dante(DanteKind::AudioStream, src, Ipv4Addr::new(192,168,1,60), 5004, &[]);
+        let alerts = state.handle_dante(DanteKind::AudioStream, src, Ipv4Addr::new(192,168,1,60), 5004, &[], Instant::now());
         assert!(alerts.is_empty());
         let s = state.streams.get("Dante 192.168.1.50:5004").expect("audio stream entry");
         assert_eq!(s.sdp_name.as_deref(), Some("Stage Box"));
@@ -1029,7 +1073,7 @@ mod tests {
         let src = Ipv4Addr::new(192, 168, 1, 50);
         let alerts = state.handle_dante(
             DanteKind::Discovery { device_name: Some("Stage Box".to_string()) },
-            src, Ipv4Addr::new(224,0,0,251), 0, &[],
+            src, Ipv4Addr::new(224,0,0,251), 0, &[], Instant::now(),
         );
         assert_eq!(alerts.len(), 1);
         assert_eq!(alerts[0].level, AlertLevel::Info);
@@ -1046,7 +1090,7 @@ mod tests {
         let src = Ipv4Addr::new(169, 254, 133, 58);
         let alerts = state.handle_dante(
             DanteKind::Discovery { device_name: None },
-            src, Ipv4Addr::new(224,0,0,251), 0, &[],
+            src, Ipv4Addr::new(224,0,0,251), 0, &[], Instant::now(),
         );
         assert_eq!(alerts.len(), 1);
         assert!(alerts[0].message.contains("unknown device"));
@@ -1061,15 +1105,92 @@ mod tests {
         let src = Ipv4Addr::new(169, 254, 133, 58);
         let first = state.handle_dante(
             DanteKind::Discovery { device_name: None },
-            src, Ipv4Addr::new(224,0,0,251), 0, &[],
+            src, Ipv4Addr::new(224,0,0,251), 0, &[], Instant::now(),
         );
         let second = state.handle_dante(
             DanteKind::Discovery { device_name: None },
-            src, Ipv4Addr::new(224,0,0,251), 0, &[],
+            src, Ipv4Addr::new(224,0,0,251), 0, &[], Instant::now(),
         );
         assert_eq!(first.len(), 1, "first discovery should emit alert");
         assert_eq!(second.len(), 0, "duplicate discovery should emit no alert");
         assert_eq!(state.dante_sources.len(), 1);
+    }
+
+    // ── Dante ConMon ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn conmon_first_detection_alerts_then_dedup_and_tracks_liveness() {
+        let mut state = CaptureState::new();
+        let src = Ipv4Addr::new(169, 254, 81, 11);
+        let mac = [0x00, 0x1d, 0xc1, 0x19, 0x86, 0x2a];
+        let first = state.handle_dante(
+            DanteKind::ConMon { device_mac: mac, channels: Some(32) },
+            src, Ipv4Addr::new(224, 0, 0, 232), 8705, &[], Instant::now(),
+        );
+        let second = state.handle_dante(
+            DanteKind::ConMon { device_mac: mac, channels: Some(32) },
+            src, Ipv4Addr::new(224, 0, 0, 232), 8705, &[], Instant::now(),
+        );
+        assert_eq!(first.len(), 1, "first ConMon sighting emits an info alert");
+        assert!(first[0].message.contains("32 ch"));
+        assert_eq!(second.len(), 0, "repeat sightings are silent");
+        let dev = state.dante_conmon.get(&src).expect("device tracked");
+        assert_eq!(dev.mac, mac);
+        assert_eq!(dev.channels, Some(32));
+        assert_eq!(dev.packets, 2);
+        assert!(state.dante_sources.contains(&src),
+            "ConMon device counts as a discovered Dante source");
+    }
+
+    #[test]
+    fn conmon_channel_count_survives_non_metering_frames() {
+        // A status frame (channels: None) after a metering frame must not erase
+        // the channel count already learned.
+        let mut state = CaptureState::new();
+        let src = Ipv4Addr::new(169, 254, 81, 11);
+        let mac = [0x00, 0x1d, 0xc1, 0x19, 0x86, 0x2a];
+        state.handle_dante(DanteKind::ConMon { device_mac: mac, channels: Some(32) },
+            src, Ipv4Addr::new(224, 0, 0, 232), 8705, &[], Instant::now());
+        state.handle_dante(DanteKind::ConMon { device_mac: mac, channels: None },
+            src, Ipv4Addr::new(224, 0, 0, 233), 8708, &[], Instant::now());
+        assert_eq!(state.dante_conmon[&src].channels, Some(32));
+    }
+
+    // ── Dante ATP (non-RTP) audio ────────────────────────────────────────────
+
+    /// Build an IPv4 + UDP buffer whose UDP payload is NOT RTP (ATP-style).
+    fn ip_udp_non_rtp(dst: [u8; 4], dst_port: u16, payload_len: usize) -> Vec<u8> {
+        let udp_len = (8 + payload_len) as u16;
+        let mut buf = vec![0u8; 20 + 8 + payload_len];
+        buf[0] = 0x45;
+        buf[1] = 46 << 2; // DSCP EF
+        let total = (20 + udp_len) as u16;
+        buf[2..4].copy_from_slice(&total.to_be_bytes());
+        buf[8] = 64;
+        buf[9] = 0x11;
+        buf[12..16].copy_from_slice(&[169, 254, 81, 11]);
+        buf[16..20].copy_from_slice(&dst);
+        buf[20..22].copy_from_slice(&14400u16.to_be_bytes());
+        buf[22..24].copy_from_slice(&dst_port.to_be_bytes());
+        buf[24..26].copy_from_slice(&udp_len.to_be_bytes());
+        // payload stays zeroed — first byte 0x00 fails the RTP version check
+        buf
+    }
+
+    #[test]
+    fn dante_atp_stream_tracked_without_rtp_metrics() {
+        // A non-RTP ATP flow (official multicast port 4321) must create a stream
+        // entry with packet/byte counts, but rtp_seen stays false so the report
+        // doesn't render fake 0% loss / 0 ms jitter as measured values.
+        let mut state = CaptureState::new();
+        let pkt = ip_udp_non_rtp([239, 255, 10, 1], 4321, 64);
+        state.handle_dante(DanteKind::AudioStream,
+            Ipv4Addr::new(169, 254, 81, 11), Ipv4Addr::new(239, 255, 10, 1), 4321, &pkt, Instant::now());
+        let s = state.streams.get("Dante 169.254.81.11:4321").expect("stream created");
+        assert_eq!(s.packets, 1);
+        assert!(!s.rtp_seen, "ATP payload must not set rtp_seen");
+        assert!(s.last_packet_time.is_some(), "presence tracked for dead-stream detection");
+        assert!(s.bytes_total > 0, "bytes tracked for bitrate");
     }
 
     // ── NDI ──────────────────────────────────────────────────────────────────
@@ -1188,7 +1309,7 @@ mod tests {
     fn ptp_ok_for_dante_with_ptpv1_clock() {
         // Dante accepts either PTPv1 or PTPv2.
         let mut state = CaptureState::new();
-        state.handle_dante(DanteKind::AudioStream, Ipv4Addr::new(192,168,1,10), Ipv4Addr::new(192,168,1,60), 5004, &[]);
+        state.handle_dante(DanteKind::AudioStream, Ipv4Addr::new(192,168,1,10), Ipv4Addr::new(192,168,1,60), 5004, &[], Instant::now());
         state.ptp_domains.insert((0, PTP_VERSION_V1), valid_ptp_stats(PTP_VERSION_V1, "PTPv1"));
         assert!(state.missing_ptp_clocks(&[ProtocolChoice::Dante]).is_empty());
     }
@@ -1262,7 +1383,7 @@ mod tests {
     fn missing_clock_separates_ptpv2_and_dante_when_both_lack_their_clock() {
         let mut state = CaptureState::new();
         seed_aes67_stream(&mut state);
-        state.handle_dante(DanteKind::AudioStream, Ipv4Addr::new(192,168,1,50), Ipv4Addr::new(192,168,1,60), 5004, &[]);
+        state.handle_dante(DanteKind::AudioStream, Ipv4Addr::new(192,168,1,50), Ipv4Addr::new(192,168,1,60), 5004, &[], Instant::now());
         let missing = state.missing_ptp_clocks(&[ProtocolChoice::AES67, ProtocolChoice::Dante]);
         assert_eq!(missing.len(), 2);
         assert!(missing.iter().any(|m| m.kind == MissingClockKind::Ptpv2 && m.affected == vec!["AES67"]));
@@ -1274,7 +1395,7 @@ mod tests {
         // A Dante stream plus only an L2 gPTP (AVB) clock — Dante still needs
         // PTPv1/PTPv2 on the IP network, so the gPTP clock must not satisfy it.
         let mut state = CaptureState::new();
-        state.handle_dante(DanteKind::AudioStream, Ipv4Addr::new(192,168,1,50), Ipv4Addr::new(192,168,1,60), 5004, &[]);
+        state.handle_dante(DanteKind::AudioStream, Ipv4Addr::new(192,168,1,50), Ipv4Addr::new(192,168,1,60), 5004, &[], Instant::now());
         state.ptp_domains.insert((0, PTP_VERSION_V2), valid_ptp_stats(PTP_VERSION_V2, "AVB"));
         let missing = state.missing_ptp_clocks(&[ProtocolChoice::Dante]);
         assert!(missing.iter().any(|m| m.kind == MissingClockKind::Ptp && m.affected == vec!["Dante"]),

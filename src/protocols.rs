@@ -282,6 +282,11 @@ pub enum DanteKind {
     Discovery { device_name: Option<String> },
     AudioStream,
     Control,
+    /// ConMon (Dante control & monitoring) multicast — 224.0.0.230–233, ports
+    /// 8700–8708, "Audinate" signature at payload offset 16. Link-local
+    /// multicast that snooping switches always flood: a continuous (~33 Hz
+    /// metering) liveness signal visible from any port, no SPAN needed.
+    ConMon { device_mac: [u8; 6], channels: Option<u8> },
 }
 #[derive(Debug, Clone, PartialEq)]
 pub enum NdiKind {

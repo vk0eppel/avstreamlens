@@ -71,6 +71,10 @@ fn join_multicast_groups(
     }
     if needs_sap {
         groups.push((Ipv4Addr::new(224, 2, 127, 254), "SAP (224.2.127.254)"));
+        // Dante announces AES67-mode sessions to 239.255.255.255 (per Audinate's
+        // official port list), not the classic SAP group above. This address is
+        // inside 239.255/16, so snooping switches prune it unless we join.
+        groups.push((Ipv4Addr::new(239, 255, 255, 255), "SAP Dante/AES67 (239.255.255.255)"));
     }
 
     let mut sockets = Vec::new();
@@ -203,7 +207,8 @@ fn main() {
                 &state.streams, &state.tcp_streams, &state.ptp_domains, &missing_ptp,
                 &mut logger, &state.network_health, state.bytes_this_window,
                 &state.avtp_streams, &state.msrp_state, &state.mvrp_vlans, &state.eee_ports,
-                &state.dante_sources, &state.dante_names, &state.ndi_sources, &state.ndi_names,
+                &state.dante_sources, &state.dante_names, &state.dante_conmon,
+                &state.ndi_sources, &state.ndi_names,
                 &state.avdecc_entities,
                 state.pause_frames_this_window, state.pfc_frames_this_window,
                 pcap_stats, state.packets_dispatched, quiet,
@@ -214,11 +219,11 @@ fn main() {
 
             // --duration exit: wait until at least one full report has been printed,
             // then exit once the requested duration has elapsed.
-            if let Some(secs) = duration_secs {
-                if run_start.elapsed().as_secs() >= secs {
-                    let healthy = state.network_health.network_score >= 100.0;
-                    std::process::exit(if healthy { 0 } else { 1 });
-                }
+            if let Some(secs) = duration_secs
+                && run_start.elapsed().as_secs() >= secs
+            {
+                let healthy = state.network_health.network_score >= 100.0;
+                std::process::exit(if healthy { 0 } else { 1 });
             }
         }
 

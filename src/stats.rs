@@ -61,6 +61,11 @@ pub struct StreamStats {
     // Out-of-order packets (negative seq delta). Distinct from loss: indicates
     // path instability or per-packet ECMP load-balancing rather than drops.
     pub reorders_this_window:           u64,
+    // True once at least one packet parsed as RTP. Dante ATP flows (official
+    // ports 4321 / 14336–15359) are not RTP-framed — they are tracked via
+    // update_non_rtp and must not render 0% loss / 0 ms jitter as if measured,
+    // nor fire the "not announced (no SAP)" alert.
+    pub rtp_seen:                       bool,
 }
 
 impl StreamStats {
@@ -101,6 +106,7 @@ impl StreamStats {
             lost_this_window:               0,
             ts_discontinuities_this_window: 0,
             reorders_this_window:           0,
+            rtp_seen:                       false,
         }
     }
     // Constructor with enhanced info — useful when SDP is available at stream start
@@ -116,6 +122,7 @@ impl StreamStats {
     /// used for exact bitrate calculation.
     pub fn update(&mut self, seq: u16, rtp_ts: u32, ssrc: u32, udp_payload_len: usize) {
         self.packets += 1;
+        self.rtp_seen = true;
 
         // ── Losses (16-bit wrapping) ──────────────────
         if let Some(last) = self.last_seq {
@@ -201,6 +208,22 @@ impl StreamStats {
         }
     }
 
+    /// Presence/bitrate tracking for flows whose payload is not RTP (Dante ATP).
+    /// No sequence, timestamp, or jitter analysis — those need RTP fields.
+    pub fn update_non_rtp(&mut self, udp_payload_len: usize, now: Instant) {
+        self.packets += 1;
+        self.last_packet_time = Some(now);
+        self.bytes_total += udp_payload_len as u64;
+        let elapsed = self.last_bitrate_check.elapsed();
+        if elapsed > Duration::from_secs(1) {
+            let bytes_delta = self.bytes_total.saturating_sub(self.bytes_at_check);
+            self.bitrate_bps = (bytes_delta as f64 * 8.0 / elapsed.as_secs_f64()) as u64;
+            self.bytes_at_check   = self.bytes_total;
+            self.packets_at_check = self.packets;
+            self.last_bitrate_check = now;
+        }
+    }
+
     pub fn loss_pct(&self) -> f64 {
         let total = self.packets + self.lost_packets;
         if total == 0 { 0.0 } else { 100.0 * self.lost_packets as f64 / total as f64 }
@@ -229,6 +252,24 @@ pub struct AvdeccEntity {
     pub valid_time_secs:       u64,
     pub available_index:       u32,
     pub last_seen:             Instant,
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// SECTION 2b' — DANTE CONMON DEVICE STATE (per source IP)
+// ═══════════════════════════════════════════════════════════════════
+
+/// Live state for one Dante device observed via ConMon multicast
+/// (224.0.0.230–233, ports 8700–8708). ConMon is in the link-local 224.0.0.0/24
+/// block that IGMP snooping never prunes, so it proves device liveness from any
+/// switch port — even when all audio flows are unicast and invisible without SPAN.
+/// Pruned from CaptureState when silent (metering runs at ~33 Hz, so a short
+/// timeout is safe).
+#[derive(Debug, Clone)]
+pub struct ConmonDevice {
+    pub mac:       [u8; 6],     // sender MAC carried in the ConMon payload
+    pub channels:  Option<u8>,  // channel count from 8705 metering frames (scale unverified)
+    pub packets:   u64,
+    pub last_seen: Instant,
 }
 
 // ═════════════════════──══════════════════──═════════════════════════

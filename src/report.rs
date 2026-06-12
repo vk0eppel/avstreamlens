@@ -17,7 +17,7 @@ fn ansi(code: &str, text: &str) -> String {
 use std::collections::HashMap;
 use std::time::Duration;
 
-use crate::stats::{AvdeccEntity, StreamStats, TcpStreamStats, PtpStats, NetworkHealth, StreamQuality, AvtpStreamStats};
+use crate::stats::{AvdeccEntity, ConmonDevice, StreamStats, TcpStreamStats, PtpStats, NetworkHealth, StreamQuality, AvtpStreamStats};
 use crate::parser::{fmt_eui64, media_type_summary, sr_class_str};
 use crate::protocols::{STREAM_TIMEOUT_SECS, MsrpDeclaration, MsrpDeclType, PTP_VERSION_V1, avtp_subtype_name, msrp_failure_reason};
 use crate::capture::{MissingClock, MissingClockKind};
@@ -71,12 +71,15 @@ fn discovered_line(label: &str, total: usize, mut names: Vec<&str>) -> String {
     format!("   {} ({}):  {}", label, total, listed)
 }
 
-/// Print the `📇 Discovered (mDNS)` section: devices learned from multicast mDNS,
-/// plus a no-SPAN diagnostic when devices are announced but no flows of that type
-/// are active (the usual fingerprint of unicast flows on a non-mirrored port).
+/// Print the `📇 Discovered` section: devices learned from multicast mDNS and
+/// Dante ConMon, plus a no-SPAN diagnostic when devices are announced but no
+/// flows of that type are active (the usual fingerprint of unicast flows on a
+/// non-mirrored port).
+#[allow(clippy::too_many_arguments)]
 fn print_discovery(
     dante_sources: &std::collections::HashSet<std::net::Ipv4Addr>,
     dante_names:   &HashMap<std::net::Ipv4Addr, String>,
+    dante_conmon:  &HashMap<std::net::Ipv4Addr, ConmonDevice>,
     ndi_sources:   &std::collections::HashSet<std::net::Ipv4Addr>,
     ndi_names:     &HashMap<std::net::Ipv4Addr, String>,
     dante_active: usize,
@@ -87,11 +90,32 @@ fn print_discovery(
     let ndi_count   = ndi_sources.len();
     if dante_count == 0 && ndi_count == 0 { return; }
 
-    logger.log("\nDiscovered (mDNS):");
-    println!("\n{}", ansi("36", "📇 Discovered (mDNS):"));
+    logger.log("\nDiscovered:");
+    println!("\n{}", ansi("36", "📇 Discovered:"));
 
     if dante_count > 0 {
         let line = discovered_line("Dante", dante_count, dante_names.values().map(|s| s.as_str()).collect());
+        logger.log(&line);
+        println!("{}", line);
+    }
+    // ConMon liveness: continuous (~33 Hz) multicast monitoring traffic that
+    // snooping switches always flood — proves which devices are alive right now,
+    // unlike mDNS announcements which may be minutes old.
+    if !dante_conmon.is_empty() {
+        let mut entries: Vec<String> = dante_conmon.iter().map(|(ip, d)| {
+            let label = dante_names.get(ip)
+                .map(|n| format!("\"{}\"", n))
+                .unwrap_or_else(|| ip.to_string());
+            match d.channels {
+                Some(c) => format!("{} [{} ch]", label, c),
+                None    => label,
+            }
+        }).collect();
+        entries.sort_unstable();
+        const SHOWN: usize = 6;
+        let mut listed = entries.iter().take(SHOWN).cloned().collect::<Vec<_>>().join(", ");
+        if entries.len() > SHOWN { listed.push_str(", …"); }
+        let line = format!("   Dante live (ConMon: {}):  {}", dante_conmon.len(), listed);
         logger.log(&line);
         println!("{}", line);
     }
@@ -189,6 +213,7 @@ pub fn print_report(
     eee_ports: &std::collections::HashMap<(String, String), (u16, u16)>,
     dante_sources: &std::collections::HashSet<std::net::Ipv4Addr>,
     dante_names: &HashMap<std::net::Ipv4Addr, String>,
+    dante_conmon: &HashMap<std::net::Ipv4Addr, ConmonDevice>,
     ndi_sources: &std::collections::HashSet<std::net::Ipv4Addr>,
     ndi_names: &HashMap<std::net::Ipv4Addr, String>,
     avdecc_entities: &HashMap<[u8; 8], AvdeccEntity>,
@@ -378,6 +403,16 @@ pub fn print_report(
             };
             logger.log(&metrics);
             println!("{}", metrics);
+        } else if s.protocol == "Dante" && !s.rtp_seen {
+            // ATP framing (official Dante ports 4321 / 14336–15359) is not RTP —
+            // showing "loss: 0.0% | jitter: 0.00 ms" would present unmeasured
+            // values as healthy. Presence and bitrate are real; say what isn't.
+            let metrics = format!(
+                "    {} pkts  |  {:.1} Mbps  (ATP framing — loss/jitter unavailable)",
+                s.packets, s.bitrate_bps as f64 / 1_000_000.0
+            );
+            logger.log(&metrics);
+            println!("{}", metrics);
         } else {
             let metrics = format!(
                 "    loss: {:.1}%  |  jitter: {:.2} ms  |  {:.1} Mbps",
@@ -467,10 +502,12 @@ pub fn print_report(
 
         // Gap 3: stream not yet announced via SAP
         // Only applies to RTP-based protocols that carry SDP (AES67, ST2110, Dante).
-        // AVB and NDI never publish SDP — skip the warning.
-        let expects_sdp = s.protocol == "AES67"
+        // AVB and NDI never publish SDP — skip the warning. Dante ATP flows
+        // (rtp_seen == false) are not RTP and never have SAP either.
+        let expects_sdp = (s.protocol == "AES67"
             || s.protocol == "Dante"
-            || s.protocol.starts_with("2110-");
+            || s.protocol.starts_with("2110-"))
+            && s.rtp_seen;
         if expects_sdp && !s.clock_hz_confirmed && s.packets > 10 {
             let alert = "    ⚠  Stream not announced (no SAP) — audio glitch detection unavailable";
             logger.log(alert);
@@ -573,7 +610,7 @@ pub fn print_report(
     // (non-SPAN) switch port where the actual unicast audio/video never arrives.
     let dante_active = streams.values().filter(|s| s.protocol == "Dante").count();
     let ndi_active   = streams.values().filter(|s| s.protocol == "NDI").count();
-    print_discovery(dante_sources, dante_names, ndi_sources, ndi_names, dante_active, ndi_active, logger);
+    print_discovery(dante_sources, dante_names, dante_conmon, ndi_sources, ndi_names, dante_active, ndi_active, logger);
     print_avdecc_entities(avdecc_entities, logger);
 
     // ── PTP / Clock Sources ─────────────────────────────────────────────────
