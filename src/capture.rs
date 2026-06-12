@@ -460,6 +460,15 @@ impl CaptureState {
                 self.dante_sources.insert(src);
                 if let Some(ref name) = device_name {
                     self.dante_names.insert(src, name.clone());
+                    // Retroactive naming: a stream observed before this device's
+                    // mDNS announcement was created nameless — backfill it now.
+                    // Name is written once (same rule as SAP session names) so
+                    // later re-announcements don't flicker the display.
+                    for s in self.streams.values_mut() {
+                        if s.protocol == "Dante" && s.src_ip == Some(src) && s.sdp_name.is_none() {
+                            s.sdp_name = Some(name.clone());
+                        }
+                    }
                 }
                 if is_new {
                     let label = device_name.as_deref().unwrap_or("unknown device");
@@ -499,10 +508,15 @@ impl CaptureState {
             }
             DanteKind::AudioStream => {
                 let is_mc = crate::parser::is_multicast(dst);
-                let key = format!("Dante {}:{}", src, dst_port);
+                // Key on src AND dst: one device can transmit several flows from
+                // the same source port to different destinations (e.g. multiple
+                // multicast groups) — keying on src:port alone merged them,
+                // interleaving their sequence numbers into false loss.
+                let key = format!("Dante {} → {}:{}", src, dst, dst_port);
                 let stats = self.streams.entry(key).or_insert_with(|| {
                     let mut s = StreamStats::new_with_info("Dante", DEFAULT_CLOCK_HZ, is_mc, dst, dst_port);
                     s.ptime_ms = 1.0; // Dante standard: 48 samples @ 48kHz = 1ms
+                    s.src_ip = Some(src);
                     s.sdp_name = self.dante_names.get(&src).cloned();
                     s
                 });
@@ -1063,8 +1077,41 @@ mod tests {
         // empty l2_payload — name pickup happens before IP parse
         let alerts = state.handle_dante(DanteKind::AudioStream, src, Ipv4Addr::new(192,168,1,60), 5004, &[], Instant::now());
         assert!(alerts.is_empty());
-        let s = state.streams.get("Dante 192.168.1.50:5004").expect("audio stream entry");
+        let s = state.streams.get("Dante 192.168.1.50 → 192.168.1.60:5004").expect("audio stream entry");
         assert_eq!(s.sdp_name.as_deref(), Some("Stage Box"));
+    }
+
+    #[test]
+    fn dante_name_backfilled_when_discovery_arrives_after_stream() {
+        // Audio observed first (no name yet), mDNS announcement second — the
+        // existing stream entry must pick up the device name retroactively.
+        let mut state = CaptureState::new();
+        let src = Ipv4Addr::new(192, 168, 1, 50);
+        state.handle_dante(DanteKind::AudioStream, src, Ipv4Addr::new(192,168,1,60), 5004, &[], Instant::now());
+        assert_eq!(state.streams["Dante 192.168.1.50 → 192.168.1.60:5004"].sdp_name, None);
+
+        state.handle_dante(
+            DanteKind::Discovery { device_name: Some("Stage Box".to_string()) },
+            src, Ipv4Addr::new(224,0,0,251), 0, &[], Instant::now(),
+        );
+        assert_eq!(
+            state.streams["Dante 192.168.1.50 → 192.168.1.60:5004"].sdp_name.as_deref(),
+            Some("Stage Box"),
+            "discovery must backfill the name on already-created streams"
+        );
+    }
+
+    #[test]
+    fn dante_flows_to_different_destinations_tracked_separately() {
+        // One device transmitting from the same source port to two multicast
+        // groups = two distinct flows. Keying on src:port alone merged them,
+        // interleaving sequence numbers into false loss.
+        let mut state = CaptureState::new();
+        let src = Ipv4Addr::new(169, 254, 81, 11);
+        state.handle_dante(DanteKind::AudioStream, src, Ipv4Addr::new(239,255,10,1), 4321, &[], Instant::now());
+        state.handle_dante(DanteKind::AudioStream, src, Ipv4Addr::new(239,255,10,2), 4321, &[], Instant::now());
+        let dante_streams = state.streams.keys().filter(|k| k.starts_with("Dante ")).count();
+        assert_eq!(dante_streams, 2, "flows to different destinations must not merge");
     }
 
     #[test]
@@ -1186,7 +1233,7 @@ mod tests {
         let pkt = ip_udp_non_rtp([239, 255, 10, 1], 4321, 64);
         state.handle_dante(DanteKind::AudioStream,
             Ipv4Addr::new(169, 254, 81, 11), Ipv4Addr::new(239, 255, 10, 1), 4321, &pkt, Instant::now());
-        let s = state.streams.get("Dante 169.254.81.11:4321").expect("stream created");
+        let s = state.streams.get("Dante 169.254.81.11 → 239.255.10.1:4321").expect("stream created");
         assert_eq!(s.packets, 1);
         assert!(!s.rtp_seen, "ATP payload must not set rtp_seen");
         assert!(s.last_packet_time.is_some(), "presence tracked for dead-stream detection");

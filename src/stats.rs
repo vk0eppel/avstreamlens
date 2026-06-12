@@ -22,6 +22,7 @@ pub struct StreamStats {
     pub sdp_rtpmap:        Option<String>,
     // Enhanced information
     pub is_multicast:      bool,
+    pub src_ip:            Option<Ipv4Addr>, // sender — set for Dante (drives retroactive mDNS naming)
     pub dst_ip:            Option<Ipv4Addr>,
     pub dst_port:          u16,
     pub media_type:        String,    // "audio", "video", "ancillary" or "unknown"
@@ -82,6 +83,7 @@ impl StreamStats {
             sdp_name:            None,
             sdp_rtpmap:          None,
             is_multicast:        false,
+            src_ip:              None,
             dst_ip:              None,
             dst_port:            0,
             media_type:          "unknown".to_string(),

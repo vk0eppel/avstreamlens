@@ -29,7 +29,7 @@
 cargo build --release   # build
 cargo fmt               # format
 cargo clippy -- -D warnings  # lint
-cargo test              # run all 143 unit tests
+cargo test              # run all 145 unit tests
 ```
 
 ## Open Work
@@ -48,7 +48,7 @@ See **[TODO.md](TODO.md)** for the full list. Quick summary:
 ## Architecture
 
 ### General
-- **Test harness**: 143 unit tests in `#[cfg(test)]` modules across `parser.rs` + `parser/{sdp,ptp,avb,avdecc,lldp,mdns,flow_control,conmon}.rs`, `stats.rs`, and `capture.rs` — run with `cargo test`. Each parser submodule keeps its own fixtures and tests. `capture.rs` tests exercise handlers with hand-built IP/UDP/RTP byte buffers (see `ip_udp_rtp()` helper); no pcap dependency in tests
+- **Test harness**: 145 unit tests in `#[cfg(test)]` modules across `parser.rs` + `parser/{sdp,ptp,avb,avdecc,lldp,mdns,flow_control,conmon}.rs`, `stats.rs`, and `capture.rs` — run with `cargo test`. Each parser submodule keeps its own fixtures and tests. `capture.rs` tests exercise handlers with hand-built IP/UDP/RTP byte buffers (see `ip_udp_rtp()` helper); no pcap dependency in tests
 - Logging: timestamped `.log` files written on every run in the working directory; `Logger::log()` flushes after every write so the last report survives SIGINT
 - Bitrate computed as `byte_delta / elapsed_secs` — never assumed 1s exactly
 - All modules follow the same pattern: parse → stats → report
@@ -133,7 +133,8 @@ See **[TODO.md](TODO.md)** for the full list. Quick summary:
 - **ATP detection (official Audinate ports)**: a pre-RTP-gate check in `detect_protocol` classifies `239.255/16` dst port **4321** (multicast ATP audio) and flows with **both ports in 14336–15359** (unicast audio/video) as Dante. ATP framing is not RTP — `handle_dante` falls back to `StreamStats::update_non_rtp()` (packets/bitrate/presence only, `rtp_seen` stays false) and the report renders `N pkts | X Mbps (ATP framing — loss/jitter unavailable)` instead of fake 0% loss. `rtp_seen` also gates the "not announced (no SAP)" alert. Field verification of which ports real devices use is pending (TODO.md)
 - **ConMon (control & monitoring)**: `parser/conmon.rs::parse_conmon()` — UDP 8700–8708 (multicast `224.0.0.230–233`), validated by ASCII `"Audinate"` at payload offset 16–23 plus a BE length field at [2..4] (padding-tolerant). Extracts the sender MAC ([8..14]) and, from 8705 metering frames ("MBC" tag at 0x2a, count at 0x44), the channel count. ConMon is **link-local multicast — never IGMP-snooped** — so it proves device liveness at ~33 pkts/s from any port, no SPAN. `dante_conmon: HashMap<Ipv4Addr, ConmonDevice>` (pruned after `CONMON_PRUNE_SECS = 60` of silence); ConMon IPs are also inserted into `dante_sources`. Report: `Dante live (ConMon: N)` line in the Discovered section, names cross-referenced from `dante_names`. The ConMon check runs before the Dante-control port check (they overlap on 8700); non-ConMon payloads on 8700/8800 still classify as `DanteKind::Control`
 - **Clock**: PTPv1 via UDP ports 319/320; grandmaster from Sync body (bytes 50–55 UUID, byte 61 stratum, bytes 62–65 ident); PTPv1 layout auto-detected by **`payload[0]`**: `0x11` → nibble-packed (hdr_shift=2), else separate-byte (hdr_shift=0); subdomain → domain: _DFLT=0, _ALT1=1, _ALT2=2, _ALT3=3, anything else → 0. **Limitation**: DDM / Dante Director uses custom user-defined subdomains (e.g. `H~O$L`) that don't match these four names — they silently map to 0, so all DDM domains appear as domain 0
-- **Device names**: extracted from mDNS DNS labels via `extract_dante_name()` (tries CMC → ARC → legacy); stored in `dante_names: HashMap<Ipv4Addr, String>`; `DanteKind::Discovery { device_name }` carries name to dispatch
+- **Device names**: extracted from mDNS DNS labels via `extract_dante_name()` (tries CMC → ARC → legacy); stored in `dante_names: HashMap<Ipv4Addr, String>`; `DanteKind::Discovery { device_name }` carries name to dispatch. **Retroactive naming**: when a name is learned, existing Dante streams from that source IP (matched via `StreamStats::src_ip`) with no name yet are backfilled — a stream seen before the device's mDNS announcement is no longer nameless forever. Name written once (same rule as SAP session names)
+- **Stream key includes src AND dst**: `"Dante {src} → {dst}:{dst_port}"` — one device can transmit several flows from the same source port to different destinations (e.g. multiple multicast groups); the old `src:port` key merged them, interleaving sequence numbers into false loss
 - **`AvProtocol::Dante`**: `{ kind, src, dst, dst_port }` — `dst` is the destination IP; used in `handle_dante` to set `is_multicast` and fill `dst_ip`/`dst_port` via `StreamStats::new_with_info`
 - **Health metrics**: all RTP metrics (same as AES67), DSCP EF(46) checked per packet
 - `requires_valid_ptp_clock()` returns `true` for Dante — "no clock source" warning fires if PTPv1 disappears
