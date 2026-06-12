@@ -111,6 +111,7 @@ fn parse_ptp_v1(payload: &[u8], hdr_shift: usize) -> Option<PtpInfo> {
     //   [46-47] utcOffset  [48] pad  [49] gmCommunicationTechnology
     //   [50-55] grandmasterClockUuid   [56-57] gmPortId   [58-59] gmSequenceId
     //   [60] pad  [61] gmClockStratum  [62-65] gmClockIdentifier (4-char ASCII)
+    let mut ptp_stratum: Option<u8> = None;
     let (grandmaster_id, clock_quality) = if message_type == 0x00 && payload.len() >= 66 {
         let uuid = &payload[50..56];
         if uuid.iter().all(|&b| b == 0) {
@@ -121,6 +122,7 @@ fn parse_ptp_v1(payload: &[u8], hdr_shift: usize) -> Option<PtpInfo> {
                 uuid[0], uuid[1], uuid[2], uuid[3], uuid[4], uuid[5]
             );
             let stratum = payload[61];
+            ptp_stratum = Some(stratum);
             let raw_ident = &payload[62..66];
             let ident = if let Ok(s) = std::str::from_utf8(raw_ident) {
                 let s = s.trim_end_matches('\0').trim();
@@ -171,6 +173,7 @@ fn parse_ptp_v1(payload: &[u8], hdr_shift: usize) -> Option<PtpInfo> {
         log_min_pdelay_req_interval: 0,
         protocol_kind:               None,
         src_ip:                      None, // set by caller
+        stratum:                     ptp_stratum,
     })
 }
 
@@ -286,6 +289,7 @@ pub fn parse_ptp(payload: &[u8]) -> Option<PtpInfo> {
         log_min_pdelay_req_interval,
         protocol_kind:     None,  // set by caller
         src_ip:            None,  // set by caller
+        stratum:           None,  // PTPv2 uses clockClass in Announce, not stratum
     })
 }
 

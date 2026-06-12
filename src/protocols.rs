@@ -93,6 +93,8 @@ pub struct PtpInfo {
     // Protocol association
     pub protocol_kind:     Option<String>,           // Parent AV protocol name (AES67, ST2110, Dante, AVB)
     pub src_ip:            Option<std::net::Ipv4Addr>, // Source IP (UDP PTP); None for L2 gPTP
+    // PTPv1 Sync only: raw grandmaster stratum (0=preferred master, 1=primary reference, …)
+    pub stratum:           Option<u8>,
 }
 
 // Protocol choice enumeration

@@ -29,7 +29,7 @@
 cargo build --release   # build
 cargo fmt               # format
 cargo clippy -- -D warnings  # lint
-cargo test              # run all 145 unit tests
+cargo test              # run all 152 unit tests
 ```
 
 ## Open Work
@@ -48,7 +48,7 @@ See **[TODO.md](TODO.md)** for the full list. Quick summary:
 ## Architecture
 
 ### General
-- **Test harness**: 145 unit tests in `#[cfg(test)]` modules across `parser.rs` + `parser/{sdp,ptp,avb,avdecc,lldp,mdns,flow_control,conmon}.rs`, `stats.rs`, and `capture.rs` — run with `cargo test`. Each parser submodule keeps its own fixtures and tests. `capture.rs` tests exercise handlers with hand-built IP/UDP/RTP byte buffers (see `ip_udp_rtp()` helper); no pcap dependency in tests
+- **Test harness**: 152 unit tests in `#[cfg(test)]` modules across `parser.rs` + `parser/{sdp,ptp,avb,avdecc,lldp,mdns,flow_control,conmon}.rs`, `stats.rs`, and `capture.rs` — run with `cargo test`. Each parser submodule keeps its own fixtures and tests. `capture.rs` tests exercise handlers with hand-built IP/UDP/RTP byte buffers (see `ip_udp_rtp()` helper); no pcap dependency in tests
 - Logging: timestamped `.log` files written on every run in the working directory; `Logger::log()` flushes after every write so the last report survives SIGINT
 - Bitrate computed as `byte_delta / elapsed_secs` — never assumed 1s exactly
 - All modules follow the same pattern: parse → stats → report
@@ -140,6 +140,8 @@ See **[TODO.md](TODO.md)** for the full list. Quick summary:
 - `requires_valid_ptp_clock()` returns `true` for Dante — "no clock source" warning fires if PTPv1 disappears
 - Default `ptime_ms = 1.0` (48 samples at 48kHz) for TS discontinuity tolerance
 - Alert `⚠ Dante clock or subscription issue` for loss > **0.1%** or jitter > 15ms (0% threshold caused false positives from pcap scheduling noise)
+- **TTL routing detection**: `StreamStats::min_ttl` (lifetime minimum) set in `handle_dante` AudioStream from `ip.get_ttl()`; report emits `⚠ Dante traffic routed (TTL N)` when `min_ttl < 64` (Linux/macOS sources start at 64; any router hop → ≤63). Windows sources (TTL=128) are not caught by this threshold — documented in code comment.
+- **Multiple preferred masters**: `PtpInfo::stratum` (added field, PTPv1 Sync only) → `PtpStats::sync_senders_this_window: HashMap<Ipv4Addr, u8>` populated in `PtpStats::update()` on PTPv1 Sync; `CaptureState::check_ptp_sync_conflict()` called from `main.rs` before `reset_window()`: two senders with stratum 0 → Error "Multiple preferred masters in domain N"; any two senders → Warn "Multiple PTP Sync senders"
 
 ### NDI
 - **Transport**: TCP (dynamic ports 5960–5980); discovery via mDNS `_ndi._tcp`

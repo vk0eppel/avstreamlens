@@ -207,6 +207,11 @@ impl CaptureState {
         if self.avtp_streams.is_empty() {
             self.mvrp_vlans.clear();
         }
+        // Clear per-window PTPv1 Sync sender census. Must happen AFTER
+        // check_ptp_sync_conflict() (called by main.rs before reset_window).
+        for ptp in self.ptp_domains.values_mut() {
+            ptp.sync_senders_this_window.clear();
+        }
         // Drop ConMon devices that stopped announcing (metering is ~33 Hz, so
         // a minute of silence means the device left the network).
         self.dante_conmon.retain(|_, d| d.last_seen.elapsed().as_secs() < CONMON_PRUNE_SECS);
@@ -526,6 +531,11 @@ impl CaptureState {
                     // Dante audio requires DSCP EF (46)
                     if ip.get_dscp() != 46 { stats.dscp_violations += 1; }
                     if ip.get_ecn() == 3 { self.network_health.ecn_congestion_marks += 1; }
+                    // TTL routing check: Dante is L2-only; track minimum TTL so the
+                    // report can alert when a router decremented it (TTL < 64 from a
+                    // Linux/macOS source means ≥ 1 router hop — misconfiguration).
+                    let ttl = ip.get_ttl();
+                    stats.min_ttl = Some(stats.min_ttl.map_or(ttl, |m| m.min(ttl)));
                     match parse_rtp(udp.payload()) {
                         Some((seq, ts, ssrc)) => stats.update(seq, ts, ssrc, udp.payload().len()),
                         // ATP framing (official ports 4321 / 14336–15359) is not RTP —
@@ -690,6 +700,44 @@ impl CaptureState {
                     stats.domain,
                     stats.version,
                     stats.protocol_kind.as_deref().unwrap_or("?")
+                )));
+            }
+        }
+        alerts
+    }
+
+    /// PTPv1 multiple-master conflict detection, called from the periodic report cycle
+    /// **before** `reset_window` (which clears `sync_senders_this_window`).
+    ///
+    /// Healthy Dante PTPv1: one device wins BMCA and is the sole Sync sender. Two
+    /// devices sending Sync in the same domain signals BMCA election instability.
+    /// Two devices both with stratum 0 (Dante "preferred master" setting) is the
+    /// common misconfiguration — a second AV engineer set their console's Dante
+    /// interface to "preferred master" without realising one was already set.
+    pub fn check_ptp_sync_conflict(&self) -> Vec<Alert> {
+        let mut alerts = Vec::new();
+        for ptp in self.ptp_domains.values() {
+            if ptp.version != crate::protocols::PTP_VERSION_V1 { continue; }
+            let senders = &ptp.sync_senders_this_window;
+            if senders.len() <= 1 { continue; }
+
+            let preferred: Vec<_> = senders.iter()
+                .filter(|(_, s)| **s == 0)
+                .map(|(ip, _)| ip.to_string())
+                .collect();
+
+            if preferred.len() >= 2 {
+                alerts.push(Alert::error(format!(
+                    "❌ Multiple preferred masters in PTP domain {} — {}  — only ONE device should have 'preferred master' enabled",
+                    ptp.domain,
+                    preferred.join(", "),
+                )));
+            } else {
+                let all_ips: Vec<_> = senders.keys().map(|ip| ip.to_string()).collect();
+                alerts.push(Alert::warn(format!(
+                    "⚠ Multiple PTP Sync senders in domain {} — {}  — clock election unstable",
+                    ptp.domain,
+                    all_ips.join(", "),
                 )));
             }
         }
@@ -1593,6 +1641,7 @@ mod tests {
             log_min_pdelay_req_interval: 0,
             protocol_kind: Some("PTPv2".to_string()),
             src_ip: None,
+            stratum: None,
         }
     }
 
@@ -1613,6 +1662,7 @@ mod tests {
             log_min_pdelay_req_interval: 0,
             protocol_kind: Some("AVB".to_string()),
             src_ip: None,
+            stratum: None,
         }
     }
 
@@ -1705,6 +1755,141 @@ mod tests {
         assert_eq!(alerts[0].level, AlertLevel::Warn);
         assert!(alerts[0].message.contains("insufficient bandwidth"));
         assert!(state.msrp_state.contains_key(&[0xAA,0xBB,0xCC,0xDD,0xEE,0xFF,0x00,0x01]));
+    }
+
+    // ── PTPv1 sync-sender / multiple-master tests ────────────────────────────
+
+    /// Build a minimal PTPv1 Sync PtpInfo with src_ip and stratum set,
+    /// as handle_ptp receives it from detect_protocol/parse_ptp.
+    fn ptpv1_sync(src: Ipv4Addr, stratum: u8, domain: u8) -> crate::protocols::PtpInfo {
+        crate::protocols::PtpInfo {
+            version:                     PTP_VERSION_V1,
+            message_type:                0x00, // Sync
+            domain,
+            clock_id:                    Some(format!("{:?}", src)),
+            grandmaster_id:              Some(format!("{:?}", src)),
+            clock_quality:               Some("Preferred grandmaster".to_string()),
+            correction_ns:               None,
+            path_delay_ns:               None,
+            message_name:                "Sync".to_string(),
+            port_id:                     Some(1),
+            sequence_id:                 1,
+            log_sync_interval:           0,
+            log_min_pdelay_req_interval: 0,
+            protocol_kind:               Some("PTPv1".to_string()),
+            src_ip:                      Some(src),
+            stratum:                     Some(stratum),
+        }
+    }
+
+    #[test]
+    fn single_ptp_sync_sender_no_conflict_alert() {
+        let mut state = CaptureState::new();
+        let kind = Some("PTPv1".to_string());
+        let info = ptpv1_sync(Ipv4Addr::new(192, 168, 1, 10), 0, 0);
+        state.handle_ptp(info);
+        let alerts = state.check_ptp_sync_conflict();
+        assert!(alerts.is_empty(), "single Sync sender should produce no alert");
+    }
+
+    #[test]
+    fn two_ptpv1_sync_senders_emits_warn() {
+        let mut state = CaptureState::new();
+        let kind = Some("PTPv1".to_string());
+        // Two devices, stratum 1 each — competing but neither is "preferred master"
+        state.handle_ptp(ptpv1_sync(Ipv4Addr::new(192, 168, 1, 10), 1, 0));
+        state.handle_ptp(ptpv1_sync(Ipv4Addr::new(192, 168, 1, 20), 1, 0));
+        let alerts = state.check_ptp_sync_conflict();
+        assert_eq!(alerts.len(), 1);
+        assert_eq!(alerts[0].level, AlertLevel::Warn);
+        assert!(alerts[0].message.contains("Multiple PTP Sync senders"));
+    }
+
+    #[test]
+    fn two_preferred_masters_emits_error() {
+        let mut state = CaptureState::new();
+        // Two devices with stratum 0 = "preferred master" in Dante — misconfiguration
+        state.handle_ptp(ptpv1_sync(Ipv4Addr::new(192, 168, 1, 10), 0, 0));
+        state.handle_ptp(ptpv1_sync(Ipv4Addr::new(192, 168, 1, 20), 0, 0));
+        let alerts = state.check_ptp_sync_conflict();
+        assert_eq!(alerts.len(), 1);
+        assert_eq!(alerts[0].level, AlertLevel::Error);
+        assert!(alerts[0].message.contains("Multiple preferred masters"));
+    }
+
+    #[test]
+    fn sync_conflict_clears_after_reset_window() {
+        let mut state = CaptureState::new();
+        state.handle_ptp(ptpv1_sync(Ipv4Addr::new(192, 168, 1, 10), 0, 0));
+        state.handle_ptp(ptpv1_sync(Ipv4Addr::new(192, 168, 1, 20), 0, 0));
+        assert!(!state.check_ptp_sync_conflict().is_empty());
+        state.reset_window();
+        // After reset, no senders recorded → no conflict
+        assert!(state.check_ptp_sync_conflict().is_empty(), "conflict must clear after reset_window");
+    }
+
+    // ── Dante TTL routing detection ──────────────────────────────────────────
+
+    /// Build an IP+UDP+RTP buffer with a configurable TTL, src and dst IPs.
+    fn ip_udp_rtp_with_ttl(ttl: u8, src_ip: [u8;4], dst_ip: [u8;4], dst_port: u16) -> Vec<u8> {
+        let mut buf = vec![0u8; 20 + 8 + 12];
+        buf[0] = 0x45;
+        buf[1] = (46 << 2) | 0; // DSCP EF, ECN 0
+        let total_len: u16 = (20 + 8 + 12) as u16;
+        buf[2..4].copy_from_slice(&total_len.to_be_bytes());
+        buf[8]  = ttl;
+        buf[9]  = 0x11; // UDP
+        buf[12..16].copy_from_slice(&src_ip);
+        buf[16..20].copy_from_slice(&dst_ip);
+        buf[20..22].copy_from_slice(&5100u16.to_be_bytes()); // src port (even, in Dante range)
+        buf[22..24].copy_from_slice(&dst_port.to_be_bytes());
+        let udp_len: u16 = (8 + 12) as u16;
+        buf[24..26].copy_from_slice(&udp_len.to_be_bytes());
+        buf[28] = 0x80; // RTP V=2
+        buf[29] = 96;
+        buf
+    }
+
+    #[test]
+    fn dante_ttl64_no_routing_alert() {
+        let mut state = CaptureState::new();
+        let pkt = ip_udp_rtp_with_ttl(64, [192,168,1,50], [192,168,1,60], 5100);
+        state.handle_dante(
+            DanteKind::AudioStream,
+            Ipv4Addr::new(192,168,1,50),
+            Ipv4Addr::new(192,168,1,60),
+            5100, &pkt, Instant::now(),
+        );
+        let key = "Dante 192.168.1.50 → 192.168.1.60:5100";
+        assert_eq!(state.streams[key].min_ttl, Some(64), "TTL 64 should be stored");
+    }
+
+    #[test]
+    fn dante_ttl63_records_min_ttl() {
+        let mut state = CaptureState::new();
+        // TTL = 63 means a Linux/macOS source went through 1 router hop
+        let pkt = ip_udp_rtp_with_ttl(63, [192,168,1,50], [192,168,1,60], 5100);
+        state.handle_dante(
+            DanteKind::AudioStream,
+            Ipv4Addr::new(192,168,1,50),
+            Ipv4Addr::new(192,168,1,60),
+            5100, &pkt, Instant::now(),
+        );
+        let key = "Dante 192.168.1.50 → 192.168.1.60:5100";
+        assert_eq!(state.streams[key].min_ttl, Some(63), "routed TTL should be stored");
+    }
+
+    #[test]
+    fn dante_min_ttl_tracks_minimum_over_packets() {
+        let mut state = CaptureState::new();
+        let src = Ipv4Addr::new(192,168,1,50);
+        let dst = Ipv4Addr::new(192,168,1,60);
+        let pkt64 = ip_udp_rtp_with_ttl(64, [192,168,1,50], [192,168,1,60], 5100);
+        let pkt60 = ip_udp_rtp_with_ttl(60, [192,168,1,50], [192,168,1,60], 5100);
+        state.handle_dante(DanteKind::AudioStream, src, dst, 5100, &pkt64, Instant::now());
+        state.handle_dante(DanteKind::AudioStream, src, dst, 5100, &pkt60, Instant::now());
+        let key = "Dante 192.168.1.50 → 192.168.1.60:5100";
+        assert_eq!(state.streams[key].min_ttl, Some(60), "should track minimum over all packets");
     }
 }
 

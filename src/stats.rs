@@ -1,6 +1,7 @@
 // AVStreamLens — src/stats.rs
 // Contains all statistical tracking structs and their associated calculation methods.
 
+use std::collections::HashMap;
 use std::net::Ipv4Addr;
 use std::time::{Duration, Instant};
 
@@ -67,6 +68,10 @@ pub struct StreamStats {
     // update_non_rtp and must not render 0% loss / 0 ms jitter as if measured,
     // nor fire the "not announced (no SAP)" alert.
     pub rtp_seen:                       bool,
+    // Minimum IP TTL observed across all packets in this stream's lifetime.
+    // Used for Dante routing detection: Dante is L2-only, so any TTL < 64 means
+    // a router decremented it — a misconfiguration that should alert the engineer.
+    pub min_ttl:                        Option<u8>,
 }
 
 impl StreamStats {
@@ -109,6 +114,7 @@ impl StreamStats {
             ts_discontinuities_this_window: 0,
             reorders_this_window:           0,
             rtp_seen:                       false,
+            min_ttl:                        None,
         }
     }
     // Constructor with enhanced info — useful when SDP is available at stream start
@@ -600,6 +606,11 @@ pub struct PtpStats {
     pub grandmaster_src_ip:            Option<std::net::Ipv4Addr>, // Source IP of the message that carried the grandmaster (Sync v1 / Announce v2) — the GM itself, not a follower
     pub last_clock_id:                 Option<String>,             // Source EUI-64 from most recent PTP message
     pub seen_sync:                     bool,                       // A real Sync (msgType 0x00) has arrived — distinguishes a clock from a Pdelay-only endpoint
+    // PTPv1 Sync sender census — cleared each 5s window by CaptureState::reset_window().
+    // Maps source IP → stratum (0=preferred master in Dante). If more than one entry
+    // survives a full window, multiple devices competed to be master. Two entries with
+    // stratum 0 is the "multiple preferred masters" misconfiguration.
+    pub sync_senders_this_window:      HashMap<std::net::Ipv4Addr, u8>,
 }
 
 /// Side-effect-free signal emitted by `PtpStats::update` / `check_timeout`.
@@ -635,6 +646,7 @@ impl PtpStats {
             grandmaster_src_ip: None,
             last_clock_id: None,
             seen_sync: false,
+            sync_senders_this_window: HashMap::new(),
         }
     }
 
@@ -697,6 +709,14 @@ impl PtpStats {
         // to a node that only emits P_Delay_Req link-measurement traffic.
         if info.message_type == 0x00 {
             self.seen_sync = true;
+            // Track every PTPv1 Sync sender this window so we can detect multiple
+            // competing masters. stratum is only populated for PTPv1 Sync messages;
+            // use 255 as a sentinel when unavailable.
+            if info.version == crate::protocols::PTP_VERSION_V1
+                && let Some(ip) = info.src_ip
+            {
+                self.sync_senders_this_window.insert(ip, info.stratum.unwrap_or(255));
+            }
         }
 
         // Delay_Resp (0x09) and P_Delay_Resp (0x03) carry path_delay in correction field.

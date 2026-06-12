@@ -181,6 +181,10 @@ fn main() {
             let timeout_alerts = state.check_ptp_timeouts();
             capture::emit(&timeout_alerts, &mut logger);
 
+            // PTPv1 multiple-master conflict — must run before reset_window clears the sender map
+            let sync_conflict_alerts = state.check_ptp_sync_conflict();
+            capture::emit(&sync_conflict_alerts, &mut logger);
+
             let anomaly_alerts = state.check_stream_count_anomaly();
             capture::emit(&anomaly_alerts, &mut logger);
 

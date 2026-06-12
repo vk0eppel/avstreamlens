@@ -467,6 +467,18 @@ pub fn print_report(
             println!("{}", ansi("33", &alert));
         }
 
+        // Routing check: Dante must stay on L2; a TTL < 64 means a router decremented
+        // it (Linux/macOS sources start at 64; any router hop → ≤ 63). Windows sources
+        // start at 128 so a routed Windows device would show 127 — not caught here.
+        if s.protocol == "Dante" && s.min_ttl.is_some_and(|t| t < 64) {
+            let alert = format!(
+                "    ⚠  Dante traffic routed (TTL {}) — Dante is L2-only; a router is in the path",
+                s.min_ttl.unwrap()
+            );
+            logger.log(&alert);
+            println!("{}", ansi("33", &alert));
+        }
+
         if s.jitter_ms() > 20.0 {
             let alert = "    ⚠  High jitter — stream quality at risk";
             logger.log(alert);
