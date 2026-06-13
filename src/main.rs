@@ -162,11 +162,8 @@ fn main() {
         logger.log(&format!("BPF filter: {}", bpf_filter));
 
         let mut state = CaptureState::new();
-        let mut mc_sockets: Vec<UdpSocket> = Vec::new();
-        let mut mc_joined: HashSet<Ipv4Addr> = HashSet::new();
-        run_loop(&mut cap, &mut state, true, Ipv4Addr::UNSPECIFIED,
-                 &expanded_protocols, ndi_selected, duration_secs, quiet,
-                 &mut logger, &mut mc_sockets, &mut mc_joined);
+        run_loop(&mut cap, &mut state, None,
+                 &expanded_protocols, quiet, &mut logger);
     } else {
         // ── Live capture mode ─────────────────────────────────────────────────
         let device = match args.interface {
@@ -202,10 +199,20 @@ fn main() {
         send_mdns_startup_probe(iface_ip, &expanded_protocols, &mut logger);
 
         let mut state = CaptureState::new();
-        run_loop(&mut cap, &mut state, false, iface_ip,
-                 &expanded_protocols, ndi_selected, duration_secs, quiet,
-                 &mut logger, &mut mc_sockets, &mut mc_joined);
+        run_loop(&mut cap, &mut state, Some(LiveConfig {
+                     iface_ip, ndi_selected, duration_secs,
+                     mc_sockets: &mut mc_sockets, mc_joined: &mut mc_joined,
+                 }), &expanded_protocols, quiet, &mut logger);
     }
+}
+
+/// Parameters used only in live-capture mode. Passed as `None` for offline replay.
+struct LiveConfig<'a> {
+    iface_ip:      Ipv4Addr,
+    ndi_selected:  bool,
+    duration_secs: Option<u64>,
+    mc_sockets:    &'a mut Vec<UdpSocket>,
+    mc_joined:     &'a mut HashSet<Ipv4Addr>,
 }
 
 /// Unified capture loop for live (`Capture<Active>`) and offline (`Capture<Offline>`).
@@ -217,16 +224,12 @@ fn main() {
 fn run_loop<T: Activated>(
     cap: &mut Capture<T>,
     state: &mut CaptureState,
-    is_offline: bool,
-    iface_ip: Ipv4Addr,
+    mut live: Option<LiveConfig<'_>>,
     expanded_protocols: &[protocols::ProtocolChoice],
-    ndi_selected: bool,
-    duration_secs: Option<u64>,
     quiet: bool,
     logger: &mut crate::report::Logger,
-    mc_sockets: &mut Vec<UdpSocket>,
-    mc_joined: &mut HashSet<Ipv4Addr>,
 ) {
+    let is_offline = live.is_none();
     let mut last_report      = Instant::now();
     let mut last_report_pcap = 0i64;   // pcap seconds; initialised on first packet
     let mut pcap_ts_init     = false;
@@ -240,7 +243,7 @@ fn run_loop<T: Activated>(
             do_report(state, expanded_protocols, pcap_stats, quiet, logger);
             last_report = Instant::now();
 
-            if let Some(secs) = duration_secs
+            if let Some(secs) = live.as_ref().and_then(|l| l.duration_secs)
                 && run_start.elapsed().as_secs() >= secs
             {
                 let healthy = state.network_health.network_score >= 100.0;
@@ -282,16 +285,16 @@ fn run_loop<T: Activated>(
         }
 
         // ── Dynamic IGMP joins (live only) ───────────────────────────────────
-        if !is_offline {
+        if let Some(ref mut lc) = live {
             for group in state.pending_join_groups.drain(..) {
-                if should_join_group(&group, expanded_protocols) && !mc_joined.contains(&group) {
+                if should_join_group(&group, expanded_protocols) && !lc.mc_joined.contains(&group) {
                     match UdpSocket::bind("0.0.0.0:0")
-                        .and_then(|s| { s.join_multicast_v4(&group, &iface_ip)?; Ok(s) })
+                        .and_then(|s| { s.join_multicast_v4(&group, &lc.iface_ip)?; Ok(s) })
                     {
                         Ok(s) => {
-                            mc_joined.insert(group);
+                            lc.mc_joined.insert(group);
                             state.joined_multicast.insert(group);
-                            mc_sockets.push(s);
+                            lc.mc_sockets.push(s);
                             logger.log(&format!("   ✓ Joined stream multicast {}", group));
                         }
                         Err(e) => {
@@ -312,7 +315,7 @@ fn run_loop<T: Activated>(
         };
 
         // ── NDI stream via known source IP ───────────────────────────────────
-        if ndi_selected
+        if live.as_ref().is_some_and(|l| l.ndi_selected)
             && let Some(ref ip) = outer_ip
             && !state.ndi_sources.is_empty()
             && ip.get_next_level_protocol() == pnet_packet::ip::IpNextHeaderProtocols::Tcp

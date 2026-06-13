@@ -484,7 +484,7 @@ impl CaptureState {
             }
             DanteKind::Control => vec![],
             DanteKind::ConMon { device_mac, channels } => {
-                let is_new = !self.dante_conmon.contains_key(&src);
+                let _is_new = !self.dante_conmon.contains_key(&src);
                 let entry = self.dante_conmon.entry(src).or_insert_with(|| ConmonDevice {
                     mac: device_mac, channels: None, packets: 0, last_seen: now,
                 });
