@@ -49,7 +49,14 @@ pub fn parse_conmon(payload: &[u8]) -> Option<ConmonInfo> {
     // Metering frame: "MBC" tag, channel count, then one meter byte per channel.
     // The bounds check ties the count to the declared frame size so a stray
     // "MBC" in another message type can't yield a garbage channel count.
-    let channels = (payload.get(0x2a..0x2d) == Some(&b"MBC"[..]))
+    //
+    // Audinate Brooklyn-class devices repeat their own sender MAC at [0x30..0x36]
+    // in the MBC block. Yamaha-proprietary devices (DSP cards, RX-HY1) put a
+    // *different* sub-device MAC there — their MBC layout differs and [0x44] is
+    // not the channel count. Suppress rather than display a wrong value.
+    let mbc_mac_matches = payload.get(0x30..0x36)
+        .is_some_and(|m| m == device_mac);
+    let channels = (payload.get(0x2a..0x2d) == Some(&b"MBC"[..]) && mbc_mac_matches)
         .then(|| payload.get(0x44).copied())
         .flatten()
         .filter(|&c| c > 0 && 0x47 + c as usize <= declared_len);
@@ -141,6 +148,30 @@ mod tests {
     #[test]
     fn short_payload_rejected() {
         assert!(parse_conmon(&metering_frame()[..20]).is_none());
+    }
+
+    /// The exact 72-byte ConMon metering payload captured on-wire (2026-06-12)
+    /// from a Yamaha DSP/RX-HY1 device, 169.254.149.65 → 224.0.0.232:8705.
+    /// The MBC block contains a sub-device MAC (ac:44:f2:6e:04:ec) rather than
+    /// the sender's own MAC (ac:44:f2:84:1e:60), indicating a Yamaha-proprietary
+    /// layout where [0x44] is NOT the channel count.
+    fn yamaha_dsp_mbc_frame() -> Vec<u8> {
+        vec![
+            0xff, 0xff, 0x00, 0x48, 0xc0, 0x8f, 0x00, 0x00, 0xac, 0x44, 0xf2, 0x84, 0x1e, 0x60,
+            0x00, 0x00, 0x41, 0x75, 0x64, 0x69, 0x6e, 0x61, 0x74, 0x65, 0x07, 0x2e, 0x10, 0x02,
+            0x00, 0x00, 0x00, 0x00, 0xc0, 0x8f, 0x00, 0x10, 0x00, 0x01, 0x00, 0x00, 0x1f, 0xc0,
+            0x4d, 0x42, 0x43, 0x01, 0x00, 0x0a, 0xac, 0x44, 0xf2, 0x6e, 0x04, 0xec, 0xff, 0xff,
+            0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x0a, 0x01, 0x07, 0x1f, 0x06, 0x00, 0x01, 0x00,
+            0x00, 0xf0,
+        ]
+    }
+
+    #[test]
+    fn yamaha_dsp_mbc_sub_device_mac_suppresses_channel_count() {
+        // MBC present but sub-device MAC ≠ sender MAC → channel count suppressed
+        let info = parse_conmon(&yamaha_dsp_mbc_frame()).expect("valid ConMon frame");
+        assert_eq!(info.device_mac, [0xac, 0x44, 0xf2, 0x84, 0x1e, 0x60]);
+        assert_eq!(info.channels, None, "sub-device MAC mismatch must suppress channel count");
     }
 
     #[test]

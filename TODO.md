@@ -44,6 +44,8 @@
 
 - **Dante primary/secondary bridge detection via ConMon MAC** — If two `ConmonDevice` entries have the same MAC (`device_mac` field) but different source IPs, the same Dante device's two redundant interfaces are both visible on the same L2 segment — the primary and secondary networks are bridged. Check in `check_dante_conmon()` or in the report: `dante_conmon.values().flat_map(…)` cross-reference by MAC. Alert: "⚠ Dante redundancy bridged: MAC xx:xx seen from N IPs — primary and secondary networks are connected". (`src/capture.rs` — new periodic check; `src/report.rs`)
 
+- **Device name extraction from ConMon name-bearing MBC frames** — On a live Dante network (2026-06-13), the Yamaha Rio3224-D2 (Audinate Brooklyn-class, MAC `00:1d:c1:19:86:2a`) periodically sends 122-byte MBC frames (declared_len=0x7a) that contain the device's short name ("Rio3224-D2") and full Dante name ("Y009-Yamaha-Rio3224-D2-19862a") embedded after the standard MBC header. These frames pass the existing Brooklyn MAC-match check (`payload[0x30..0x36] == sender_mac`). This would provide a third name-discovery path (after mDNS and startup probe) that is passive, requires no join, and works from any switch port. **Do not implement until cross-vendor verified**: the only Brooklyn device in the observed trace is Yamaha; we cannot rule out a Yamaha firmware extension vs. standard Brooklyn behaviour. Verify by observing the same 122-byte MBC pattern from a non-Yamaha Brooklyn device (Focusrite, QSC, Biamp, BSS, etc.) before writing a parser. (`src/parser/conmon.rs`, `src/capture.rs` — `handle_dante` ConMon arm)
+
 ---
 
 ## Field Verification Needed

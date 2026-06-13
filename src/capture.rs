@@ -497,19 +497,7 @@ impl CaptureState {
                 // ConMon proves a live Dante device even before (or without) mDNS —
                 // count it as a discovered source so the device list includes it.
                 self.dante_sources.insert(src);
-                if is_new {
-                    let mac = device_mac;
-                    let mac_str = format!("{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-                        mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-                    let name = self.dante_names.get(&src)
-                        .map(|n| format!("  \"{}\"", n)).unwrap_or_default();
-                    let ch = channels.map(|c| format!("  {} ch", c)).unwrap_or_default();
-                    vec![Alert::info(format!(
-                        "🔍 Dante device live (ConMon): {}{}  [{}]{}", src, name, mac_str, ch
-                    ))]
-                } else {
-                    vec![]
-                }
+                vec![]
             }
             DanteKind::AudioStream => {
                 let is_mc = crate::parser::is_multicast(dst);
@@ -1226,8 +1214,7 @@ mod tests {
             DanteKind::ConMon { device_mac: mac, channels: Some(32) },
             src, Ipv4Addr::new(224, 0, 0, 232), 8705, &[], Instant::now(),
         );
-        assert_eq!(first.len(), 1, "first ConMon sighting emits an info alert");
-        assert!(first[0].message.contains("32 ch"));
+        assert_eq!(first.len(), 0, "ConMon sightings are silent — liveness shown in periodic report");
         assert_eq!(second.len(), 0, "repeat sightings are silent");
         let dev = state.dante_conmon.get(&src).expect("device tracked");
         assert_eq!(dev.mac, mac);

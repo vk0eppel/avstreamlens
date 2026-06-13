@@ -168,6 +168,10 @@ fn main() {
     cap.filter(&bpf_filter, true)
         .expect("BPF filter failure — run as root/sudo");
 
+    // Send mDNS startup probe so device names appear in cycle 1, not after the
+    // first announcement cycle (which can take tens of seconds on quiet networks).
+    send_mdns_startup_probe(iface_ip, &expanded_protocols, &mut logger);
+
     let mut state = CaptureState::new();
     let mut last_report = Instant::now();
     let run_start = Instant::now();
@@ -373,6 +377,59 @@ fn main() {
                 state.network_health.unicast_packets += 1;
             }
         }
+    }
+}
+
+/// Send mDNS PTR queries for Dante (and optionally NDI) service types at startup.
+/// Devices respond to 224.0.0.251:5353, which pcap is already capturing — so
+/// responses land in the first few loop iterations and names appear in cycle 1.
+fn send_mdns_startup_probe(iface_ip: Ipv4Addr, expanded: &[protocols::ProtocolChoice], logger: &mut crate::report::Logger) {
+    let dante = expanded.iter().any(|c| matches!(c, protocols::ProtocolChoice::Dante));
+    let ndi   = expanded.iter().any(|c| matches!(c, protocols::ProtocolChoice::NDI));
+    if !dante && !ndi { return; }
+
+    let mut services: Vec<&str> = Vec::new();
+    if dante {
+        services.extend_from_slice(&["_netaudio-arc._udp.local", "_netaudio-cmc._udp.local", "_netaudio._udp.local"]);
+    }
+    if ndi {
+        services.push("_ndi._tcp.local");
+    }
+
+    let mut packet: Vec<u8> = Vec::new();
+    packet.extend_from_slice(&[0x00, 0x00]); // transaction ID (0 = mDNS)
+    packet.extend_from_slice(&[0x00, 0x00]); // flags: standard query
+    packet.extend_from_slice(&(services.len() as u16).to_be_bytes()); // QDCOUNT
+    packet.extend_from_slice(&[0x00, 0x00, 0x00, 0x00, 0x00, 0x00]); // AN/NS/AR = 0
+
+    for service in &services {
+        for label in service.split('.') {
+            if !label.is_empty() {
+                packet.push(label.len() as u8);
+                packet.extend_from_slice(label.as_bytes());
+            }
+        }
+        packet.push(0); // root label
+        packet.extend_from_slice(&[0x00, 0x0C]); // QTYPE = PTR (12)
+        packet.extend_from_slice(&[0x00, 0x01]); // QCLASS = IN
+    }
+
+    // Bind to the interface IP so the multicast send goes out the right interface.
+    let bind_addr = format!("{}:0", iface_ip);
+    match UdpSocket::bind(&bind_addr).or_else(|_| UdpSocket::bind("0.0.0.0:0")) {
+        Ok(sock) => {
+            let _ = sock.set_multicast_ttl_v4(255);
+            let dest = std::net::SocketAddr::from(([224, 0, 0, 251], 5353u16));
+            match sock.send_to(&packet, dest) {
+                Ok(_) => {
+                    let msg = format!("   → mDNS probe sent ({})", services.join(", "));
+                    logger.log(&msg);
+                    println!("{}", msg);
+                }
+                Err(e) => logger.log(&format!("   ⚠ mDNS probe send failed: {}", e)),
+            }
+        }
+        Err(e) => logger.log(&format!("   ⚠ mDNS probe socket failed: {}", e)),
     }
 }
 

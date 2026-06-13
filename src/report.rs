@@ -94,28 +94,20 @@ fn print_discovery(
     println!("\n{}", ansi("36", "📇 Discovered:"));
 
     if dante_count > 0 {
-        let line = discovered_line("Dante", dante_count, dante_names.values().map(|s| s.as_str()).collect());
-        logger.log(&line);
-        println!("{}", line);
-    }
-    // ConMon liveness: continuous (~33 Hz) multicast monitoring traffic that
-    // snooping switches always flood — proves which devices are alive right now,
-    // unlike mDNS announcements which may be minutes old.
-    if !dante_conmon.is_empty() {
-        let mut entries: Vec<String> = dante_conmon.iter().map(|(ip, d)| {
-            let label = dante_names.get(ip)
-                .map(|n| format!("\"{}\"", n))
-                .unwrap_or_else(|| ip.to_string());
-            match d.channels {
-                Some(c) => format!("{} [{} ch]", label, c),
-                None    => label,
-            }
-        }).collect();
-        entries.sort_unstable();
-        const SHOWN: usize = 6;
-        let mut listed = entries.iter().take(SHOWN).cloned().collect::<Vec<_>>().join(", ");
-        if entries.len() > SHOWN { listed.push_str(", …"); }
-        let line = format!("   Dante live (ConMon: {}):  {}", dante_conmon.len(), listed);
+        // Merge mDNS discovery count with ConMon liveness into one line.
+        // Suffix: "all live" when ConMon covers every discovered device,
+        // "N live" when only some have active ConMon traffic, nothing when
+        // ConMon is absent (e.g. before the first metering frame arrives).
+        let live_count = dante_conmon.len();
+        let live_suffix = if live_count == 0 {
+            String::new()
+        } else if live_count == dante_count {
+            "  · all live".to_string()
+        } else {
+            format!("  · {} live", live_count)
+        };
+        let base = discovered_line("Dante", dante_count, dante_names.values().map(|s| s.as_str()).collect());
+        let line = format!("{}{}", base, live_suffix);
         logger.log(&line);
         println!("{}", line);
     }
@@ -307,7 +299,8 @@ pub fn print_report(
     // no missing clocks, no pcap drops), suppress all stdout output.
     // The log file always receives the full report regardless of this flag.
     let pcap_drops_ok = pcap_stats.is_none_or(|(_, d, id)| d == 0 && id == 0);
-    let is_healthy = status_line.starts_with('✓') && pcap_drops_ok;
+    // '✓' = all streams healthy, '–' = no streams but no issues either — both are healthy.
+    let is_healthy = (status_line.starts_with('✓') || status_line.starts_with('–')) && pcap_drops_ok;
     if quiet && is_healthy {
         logger.log("");
         return;
