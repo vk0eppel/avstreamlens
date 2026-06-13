@@ -192,6 +192,9 @@ fn main() {
             let anomaly_alerts = state.check_stream_count_anomaly();
             capture::emit(&anomaly_alerts, &mut logger);
 
+            let bridge_alerts = state.check_dante_conmon_bridge();
+            capture::emit(&bridge_alerts, &mut logger);
+
             // ts-refclk cross-check: SDP-claimed grandmaster vs active PTP
             let sdp_alerts = ts_refclk_alerts(&state);
             capture::emit(&sdp_alerts, &mut logger);

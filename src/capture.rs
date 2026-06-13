@@ -819,6 +819,38 @@ impl CaptureState {
 
     /// Re-compute NDI per-stream bitrate by summing matching TCP flows.
     /// Called once per report cycle.
+    /// Detect accidental bridging of Dante primary and secondary networks.
+    ///
+    /// Dante redundancy requires the two networks to be fully isolated. If they
+    /// are connected (e.g. a cross-cable, a misconfigured uplink, or a device
+    /// acting as a bridge), both interfaces of the same physical device appear
+    /// on the same L2 segment. ConMon frames carry the sender MAC in the payload;
+    /// two distinct source IPs with the same MAC means two NICs of the same
+    /// device are visible simultaneously — the redundancy networks are bridged.
+    pub fn check_dante_conmon_bridge(&self) -> Vec<Alert> {
+        // Build MAC → [source IPs] map.
+        let mut mac_to_ips: HashMap<[u8; 6], Vec<Ipv4Addr>> = HashMap::new();
+        for (src_ip, device) in &self.dante_conmon {
+            mac_to_ips.entry(device.mac).or_default().push(*src_ip);
+        }
+
+        let mut alerts = Vec::new();
+        for (mac, ips) in &mac_to_ips {
+            if ips.len() < 2 { continue; }
+            let mac_str = format!("{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+                mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+            let mut ip_strs: Vec<String> = ips.iter().map(|ip| ip.to_string()).collect();
+            ip_strs.sort();
+            let name = ips.iter().find_map(|ip| self.dante_names.get(ip))
+                .map(|n| format!("  \"{}\"", n)).unwrap_or_default();
+            alerts.push(Alert::error(format!(
+                "❌ Dante redundancy bridged: MAC {}{}  seen from {} IPs ({}) — primary and secondary networks are connected",
+                mac_str, name, ips.len(), ip_strs.join(", "),
+            )));
+        }
+        alerts
+    }
+
     pub fn aggregate_ndi_bitrate(&mut self) {
         for stream in self.streams.values_mut() {
             if stream.protocol == "NDI"
@@ -1236,6 +1268,62 @@ mod tests {
         state.handle_dante(DanteKind::ConMon { device_mac: mac, channels: None },
             src, Ipv4Addr::new(224, 0, 0, 233), 8708, &[], Instant::now());
         assert_eq!(state.dante_conmon[&src].channels, Some(32));
+    }
+
+    // ── Dante ConMon redundancy bridge detection ─────────────────────────────
+
+    #[test]
+    fn conmon_bridge_no_alert_when_one_ip_per_mac() {
+        let mut state = CaptureState::new();
+        let mac = [0x00, 0x1d, 0xc1, 0x19, 0x86, 0x2a];
+        state.handle_dante(DanteKind::ConMon { device_mac: mac, channels: None },
+            Ipv4Addr::new(169, 254, 81, 11), Ipv4Addr::new(224, 0, 0, 232), 8705, &[], Instant::now());
+        assert!(state.check_dante_conmon_bridge().is_empty());
+    }
+
+    #[test]
+    fn conmon_bridge_detected_when_same_mac_two_ips() {
+        let mut state = CaptureState::new();
+        let mac = [0x00, 0x1d, 0xc1, 0x19, 0x86, 0x2a];
+        // Same device visible from two IPs (primary + secondary interface).
+        state.handle_dante(DanteKind::ConMon { device_mac: mac, channels: None },
+            Ipv4Addr::new(169, 254, 81, 11), Ipv4Addr::new(224, 0, 0, 232), 8705, &[], Instant::now());
+        state.handle_dante(DanteKind::ConMon { device_mac: mac, channels: None },
+            Ipv4Addr::new(192, 168, 1, 11), Ipv4Addr::new(224, 0, 0, 232), 8705, &[], Instant::now());
+        let alerts = state.check_dante_conmon_bridge();
+        assert_eq!(alerts.len(), 1);
+        assert!(matches!(alerts[0].level, AlertLevel::Error));
+        assert!(alerts[0].message.contains("00:1d:c1:19:86:2a"));
+        assert!(alerts[0].message.contains("169.254.81.11"));
+        assert!(alerts[0].message.contains("192.168.1.11"));
+    }
+
+    #[test]
+    fn conmon_bridge_includes_device_name_when_known() {
+        let mut state = CaptureState::new();
+        let mac = [0x00, 0x1d, 0xc1, 0x19, 0x86, 0x2a];
+        let ip1 = Ipv4Addr::new(169, 254, 81, 11);
+        let ip2 = Ipv4Addr::new(192, 168, 1, 11);
+        state.dante_names.insert(ip1, "Rio3224-D2".to_string());
+        state.handle_dante(DanteKind::ConMon { device_mac: mac, channels: None },
+            ip1, Ipv4Addr::new(224, 0, 0, 232), 8705, &[], Instant::now());
+        state.handle_dante(DanteKind::ConMon { device_mac: mac, channels: None },
+            ip2, Ipv4Addr::new(224, 0, 0, 232), 8705, &[], Instant::now());
+        let alerts = state.check_dante_conmon_bridge();
+        assert_eq!(alerts.len(), 1);
+        assert!(alerts[0].message.contains("\"Rio3224-D2\""));
+    }
+
+    #[test]
+    fn conmon_bridge_two_distinct_devices_no_false_positive() {
+        let mut state = CaptureState::new();
+        let mac_a = [0x00, 0x1d, 0xc1, 0x19, 0x86, 0x2a];
+        let mac_b = [0xac, 0x44, 0xf2, 0x84, 0x1e, 0x60];
+        state.handle_dante(DanteKind::ConMon { device_mac: mac_a, channels: None },
+            Ipv4Addr::new(169, 254, 81, 11), Ipv4Addr::new(224, 0, 0, 232), 8705, &[], Instant::now());
+        state.handle_dante(DanteKind::ConMon { device_mac: mac_b, channels: None },
+            Ipv4Addr::new(169, 254, 149, 65), Ipv4Addr::new(224, 0, 0, 232), 8705, &[], Instant::now());
+        assert!(state.check_dante_conmon_bridge().is_empty());
     }
 
     // ── Dante ATP (non-RTP) audio ────────────────────────────────────────────
