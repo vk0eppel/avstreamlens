@@ -19,7 +19,7 @@ mod stats;
 mod report;
 mod capture;
 
-use pcap::Capture;
+use pcap::{Activated, Capture};
 use pnet_packet::ethernet::EthernetPacket;
 use pnet_packet::Packet;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -118,14 +118,15 @@ fn main() {
     }
     let quiet = args.quiet;
     let duration_secs = args.duration;
+    let is_offline = args.read_file.is_some();
 
-    let device = match args.interface {
-        Some(ref name) => cli::resolve_interface_by_name(name),
-        None           => cli::select_interface(),
-    };
+    // ── Protocol selection ────────────────────────────────────────────────────
+    // When replaying a file, default to All rather than prompting interactively
+    // (the user typically just wants to analyse everything in the capture).
     let selected_protocols = match args.protocols {
         Some(p) => p,
-        None    => cli::prompt_protocol_selection(),
+        None if is_offline => vec![protocols::ProtocolChoice::All],
+        None => cli::prompt_protocol_selection(),
     };
     let protocol_names = cli::selected_protocol_names(&selected_protocols);
     let bpf_filter = cli::build_bpf_filter(&selected_protocols);
@@ -137,99 +138,108 @@ fn main() {
 
     let proto_display = cli::selected_protocol_display(&selected_protocols);
     let extras = cli::selected_extras_display(&expanded_protocols);
-    let banner = if proto_display == "all protocols" {
-        format!("📡 Listening on {}  —  all protocols", device.name)
+
+    if let Some(ref path) = args.read_file {
+        // ── Offline replay mode ───────────────────────────────────────────────
+        let mut cap = Capture::from_file(path)
+            .unwrap_or_else(|e| {
+                eprintln!("❌ Cannot open '{}': {}", path, e);
+                std::process::exit(1);
+            });
+        if let Err(e) = cap.filter(&bpf_filter, true) {
+            eprintln!("❌ BPF filter error: {}", e);
+            std::process::exit(1);
+        }
+
+        let banner = if proto_display == "all protocols" {
+            format!("📁 Replaying {}  —  all protocols", path)
+        } else {
+            format!("📁 Replaying {}  —  {}{}", path, proto_display, extras)
+        };
+        println!("{}", banner);
+        logger.log(&banner);
+        println!("🔍 BPF filter: {}", bpf_filter);
+        logger.log(&format!("BPF filter: {}", bpf_filter));
+
+        let mut state = CaptureState::new();
+        let mut mc_sockets: Vec<UdpSocket> = Vec::new();
+        let mut mc_joined: HashSet<Ipv4Addr> = HashSet::new();
+        run_loop(&mut cap, &mut state, true, Ipv4Addr::UNSPECIFIED,
+                 &expanded_protocols, ndi_selected, duration_secs, quiet,
+                 &mut logger, &mut mc_sockets, &mut mc_joined);
     } else {
-        format!("📡 Listening on {}  for {}{}  streams", device.name, proto_display, extras)
-    };
-    println!("{}", banner);
-    logger.log(&banner);
-    println!("🔍 BPF filter: {}", bpf_filter);
-    logger.log(&format!("BPF filter: {}", bpf_filter));
+        // ── Live capture mode ─────────────────────────────────────────────────
+        let device = match args.interface {
+            Some(ref name) => cli::resolve_interface_by_name(name),
+            None           => cli::select_interface(),
+        };
+        let banner = if proto_display == "all protocols" {
+            format!("📡 Listening on {}  —  all protocols", device.name)
+        } else {
+            format!("📡 Listening on {}  for {}{}  streams", device.name, proto_display, extras)
+        };
+        println!("{}", banner);
+        logger.log(&banner);
+        println!("🔍 BPF filter: {}", bpf_filter);
+        logger.log(&format!("BPF filter: {}", bpf_filter));
 
-    // ── IGMP joins — ensures IGMP-snooped switches forward PTP/SAP multicast ─
-    let iface_ip = device.addresses.iter()
-        .find_map(|a| if let std::net::IpAddr::V4(v4) = a.addr { Some(v4) } else { None })
-        .unwrap_or(Ipv4Addr::UNSPECIFIED);
-    // Keep sockets alive for the process lifetime; mutable so dynamic joins append.
-    let mut mc_sockets = join_multicast_groups(iface_ip, &expanded_protocols, &mut logger);
-    // Track which groups we've already joined to avoid duplicate sockets.
-    let mut mc_joined: HashSet<Ipv4Addr> = HashSet::new();
+        let iface_ip = device.addresses.iter()
+            .find_map(|a| if let std::net::IpAddr::V4(v4) = a.addr { Some(v4) } else { None })
+            .unwrap_or(Ipv4Addr::UNSPECIFIED);
+        let mut mc_sockets = join_multicast_groups(iface_ip, &expanded_protocols, &mut logger);
+        let mut mc_joined: HashSet<Ipv4Addr> = HashSet::new();
 
-    // ── Opening capture with BPF filter ───────────────
-    let mut cap = Capture::from_device(device.name.as_str())
-        .expect("Unable to find capture device")
-        .promisc(true)
-        .immediate_mode(true)
-        .timeout(1000)  // unblocks the loop so the 5-second report fires even on quiet networks
-        .open()
-        .expect("Unable to open capture — run as root/sudo (or as Administrator on Windows)");
+        let mut cap = Capture::from_device(device.name.as_str())
+            .expect("Unable to find capture device")
+            .promisc(true)
+            .immediate_mode(true)
+            .timeout(1000)
+            .open()
+            .expect("Unable to open capture — run as root/sudo (or as Administrator on Windows)");
+        cap.filter(&bpf_filter, true)
+            .expect("BPF filter failure — run as root/sudo");
 
-    cap.filter(&bpf_filter, true)
-        .expect("BPF filter failure — run as root/sudo");
+        send_mdns_startup_probe(iface_ip, &expanded_protocols, &mut logger);
 
-    // Send mDNS startup probe so device names appear in cycle 1, not after the
-    // first announcement cycle (which can take tens of seconds on quiet networks).
-    send_mdns_startup_probe(iface_ip, &expanded_protocols, &mut logger);
+        let mut state = CaptureState::new();
+        run_loop(&mut cap, &mut state, false, iface_ip,
+                 &expanded_protocols, ndi_selected, duration_secs, quiet,
+                 &mut logger, &mut mc_sockets, &mut mc_joined);
+    }
+}
 
-    let mut state = CaptureState::new();
-    let mut last_report = Instant::now();
-    let run_start = Instant::now();
+/// Unified capture loop for live (`Capture<Active>`) and offline (`Capture<Offline>`).
+///
+/// Live mode:   5s wall-clock timer drives reports; `TimeoutExpired` continues;
+///              dynamic IGMP joins; pcap drop stats shown.
+/// Offline mode: pcap timestamps drive 5s report windows; `NoMorePackets` prints
+///              a final report and exits; IGMP joins skipped (meaningless offline).
+fn run_loop<T: Activated>(
+    cap: &mut Capture<T>,
+    state: &mut CaptureState,
+    is_offline: bool,
+    iface_ip: Ipv4Addr,
+    expanded_protocols: &[protocols::ProtocolChoice],
+    ndi_selected: bool,
+    duration_secs: Option<u64>,
+    quiet: bool,
+    logger: &mut crate::report::Logger,
+    mc_sockets: &mut Vec<UdpSocket>,
+    mc_joined: &mut HashSet<Ipv4Addr>,
+) {
+    let mut last_report      = Instant::now();
+    let mut last_report_pcap = 0i64;   // pcap seconds; initialised on first packet
+    let mut pcap_ts_init     = false;
+    let run_start            = Instant::now();
 
-    // ── Capture loop ────────────────────────────────
     loop {
-        // Report check at the TOP of the loop so it fires even when cap.next_packet()
-        // times out (Err path hits `continue` and never reaches code below the read).
-        if last_report.elapsed() > Duration::from_secs(5) {
-            // PTP clock-loss alerts
-            let timeout_alerts = state.check_ptp_timeouts();
-            capture::emit(&timeout_alerts, &mut logger);
-
-            // PTPv1 multiple-master conflict — must run before reset_window clears the sender map
-            let sync_conflict_alerts = state.check_ptp_sync_conflict();
-            capture::emit(&sync_conflict_alerts, &mut logger);
-
-            let anomaly_alerts = state.check_stream_count_anomaly();
-            capture::emit(&anomaly_alerts, &mut logger);
-
-            let bridge_alerts = state.check_dante_conmon_bridge();
-            capture::emit(&bridge_alerts, &mut logger);
-
-            // ts-refclk cross-check: SDP-claimed grandmaster vs active PTP
-            let sdp_alerts = ts_refclk_alerts(&state);
-            capture::emit(&sdp_alerts, &mut logger);
-
-            // Aggregate NDI bitrate from matching TCP flows
-            state.aggregate_ndi_bitrate();
-
-            state.network_health.calculate_score(
-                &state.streams, &state.tcp_streams, &state.ptp_domains,
-                &state.msrp_state, &state.eee_ports,
-            );
-
-            let missing_ptp = state.missing_ptp_clocks(&expanded_protocols);
-
-            // Snapshot pcap kernel drop counters just before the report so the
-            // numbers reflect the full capture window. Failures are silently
-            // ignored — the report renders fine without them.
+        // ── Live: report at TOP so it fires even when next_packet() times out ─
+        if !is_offline && last_report.elapsed() > Duration::from_secs(5) {
             let pcap_stats = cap.stats().ok().map(|s| (s.received, s.dropped, s.if_dropped));
-
-            print_report(
-                &state.streams, &state.tcp_streams, &state.ptp_domains, &missing_ptp,
-                &mut logger, &state.network_health, state.bytes_this_window,
-                &state.avtp_streams, &state.msrp_state, &state.mvrp_vlans, &state.eee_ports,
-                &state.dante_sources, &state.dante_names, &state.dante_conmon,
-                &state.ndi_sources, &state.ndi_names,
-                &state.avdecc_entities,
-                state.pause_frames_this_window, state.pfc_frames_this_window,
-                pcap_stats, state.packets_dispatched, quiet,
-            );
-
-            state.reset_window();
+            emit_periodic_alerts(state, logger);
+            do_report(state, expanded_protocols, pcap_stats, quiet, logger);
             last_report = Instant::now();
 
-            // --duration exit: wait until at least one full report has been printed,
-            // then exit once the requested duration has elapsed.
             if let Some(secs) = duration_secs
                 && run_start.elapsed().as_secs() >= secs
             {
@@ -239,50 +249,59 @@ fn main() {
         }
 
         let packet = match cap.next_packet() {
-            Ok(p) => p,
-            Err(pcap::Error::TimeoutExpired) => continue, // expected on quiet networks
+            Ok(p)  => p,
+            Err(pcap::Error::TimeoutExpired) => continue,
+            Err(pcap::Error::NoMorePackets)  => {
+                // EOF — print whatever accumulated in the last partial window.
+                emit_periodic_alerts(state, logger);
+                do_report(state, expanded_protocols, None, quiet, logger);
+                let healthy = state.network_health.network_score >= 100.0;
+                std::process::exit(if healthy { 0 } else { 1 });
+            }
             Err(e) => {
-                // Real capture failure (interface down, permissions revoked, etc.).
-                // Log once and exit — busy-looping on a broken handle helps no one.
                 let msg = format!("❌ Capture error: {} — exiting", e);
                 if color_enabled() { eprintln!("\x1b[31m{}\x1b[0m", msg); } else { eprintln!("{}", msg); }
                 logger.log(&msg);
                 std::process::exit(1);
             }
         };
+
+        // Extract pcap timestamp before borrowing packet.data.
+        let pkt_ts = packet.header.ts.tv_sec as i64;
+
         let eth = match EthernetPacket::new(packet.data) { Some(e) => e, _ => continue };
         let now = Instant::now();
-        // VLAN-unwrapped L2 payload (handles 802.1Q / QinQ tagged frames).
         let (l2_et, l2_payload) = unwrap_vlan(&eth).unwrap_or((0, &[][..]));
         let frame_bytes = eth.packet().len() as u64;
 
         state.packets_dispatched += 1;
         if let Some(proto) = detect_protocol(&eth)
-            && proto.is_selected(&expanded_protocols)
+            && proto.is_selected(expanded_protocols)
         {
-            capture::dispatch(&mut state, proto, l2_payload, frame_bytes, now, &mut logger);
+            capture::dispatch(state, proto, l2_payload, frame_bytes, now, logger);
         }
 
-        // ── Dynamic IGMP joins — drain groups queued by handlers ────────────
-        // Handlers push newly-discovered 239.x.x.x addresses to pending_join_groups
-        // (from SAP/SDP and IGMPv3 Membership Reports). We join each one here so
-        // IGMP-snooping switches start forwarding those streams to our capture port.
-        for group in state.pending_join_groups.drain(..) {
-            if should_join_group(&group, &expanded_protocols) && !mc_joined.contains(&group) {
-                match UdpSocket::bind("0.0.0.0:0")
-                    .and_then(|s| { s.join_multicast_v4(&group, &iface_ip)?; Ok(s) })
-                {
-                    Ok(s) => {
-                        mc_joined.insert(group);
-                        state.joined_multicast.insert(group);
-                        mc_sockets.push(s);
-                        logger.log(&format!("   ✓ Joined stream multicast {}", group));
-                    }
-                    Err(e) => {
-                        logger.log(&format!("   ⚠ Could not join {} — {}", group, e));
+        // ── Dynamic IGMP joins (live only) ───────────────────────────────────
+        if !is_offline {
+            for group in state.pending_join_groups.drain(..) {
+                if should_join_group(&group, expanded_protocols) && !mc_joined.contains(&group) {
+                    match UdpSocket::bind("0.0.0.0:0")
+                        .and_then(|s| { s.join_multicast_v4(&group, &iface_ip)?; Ok(s) })
+                    {
+                        Ok(s) => {
+                            mc_joined.insert(group);
+                            state.joined_multicast.insert(group);
+                            mc_sockets.push(s);
+                            logger.log(&format!("   ✓ Joined stream multicast {}", group));
+                        }
+                        Err(e) => {
+                            logger.log(&format!("   ⚠ Could not join {} — {}", group, e));
+                        }
                     }
                 }
             }
+        } else {
+            state.pending_join_groups.clear();
         }
 
         // ── Hoist IPv4 parse — shared by NDI detection and health tracking ───
@@ -293,9 +312,6 @@ fn main() {
         };
 
         // ── NDI stream via known source IP ───────────────────────────────────
-        // The official NDI SDK uses dynamically assigned ports advertised in mDNS.
-        // Port-range matching is unreliable; we identify NDI traffic by the sender
-        // IP learned from mDNS discovery instead.
         if ndi_selected
             && let Some(ref ip) = outer_ip
             && !state.ndi_sources.is_empty()
@@ -319,9 +335,7 @@ fn main() {
             }
         }
 
-        // ── TCP Monitoring — NDI ports only ──────────────────
-        // Only track TCP flows on NDI ports (5960-5980). Unrelated TCP (HTTP, SSH, etc.)
-        // is ignored even when `tcp` is in the BPF filter, keeping the report clean.
+        // ── TCP monitoring — NDI flows only ──────────────────────────────────
         let is_tcp = outer_ip.as_ref().is_some_and(|ip| {
             ip.get_next_level_protocol() == pnet_packet::ip::IpNextHeaderProtocols::Tcp
         });
@@ -336,17 +350,13 @@ fn main() {
                 let tcp_stat = state.tcp_streams.entry(key).or_insert_with(|| crate::stats::TcpStreamStats::new(src_ip, dst_ip));
                 tcp_stat.packets += 1;
                 tcp_stat.last_seen = now;
-
                 let estimated_payload = frame_bytes.saturating_sub(40);
                 tcp_stat.bytes += estimated_payload;
-
                 if has_fin { tcp_stat.fin_packets += 1; }
                 if has_rst {
                     tcp_stat.rst_packets += 1;
                     state.network_health.tcp_retransmissions += 1;
                 }
-
-                // Wrap-aware: negative delta means seq went backward → retransmission
                 if !has_syn
                     && let Some(last_seq) = tcp_stat.last_seq
                     && (seq.wrapping_sub(last_seq) as i32) < 0
@@ -355,22 +365,18 @@ fn main() {
                     tcp_stat.retransmissions += 1;
                     state.network_health.tcp_retransmissions += 1;
                 }
-                // Advance last_seq only when seq moves forward (wrap-aware)
                 if let Some(last_seq) = tcp_stat.last_seq {
-                    if (seq.wrapping_sub(last_seq) as i32) > 0 {
-                        tcp_stat.last_seq = Some(seq);
-                    }
+                    if (seq.wrapping_sub(last_seq) as i32) > 0 { tcp_stat.last_seq = Some(seq); }
                 } else {
                     tcp_stat.last_seq = Some(seq);
                 }
                 tcp_stat.last_ack = Some(ack);
-
                 tcp_stat.update_bitrate();
                 tcp_stat.update_quality();
             }
         }
 
-        // ── Network health tracking ───────────────────────────
+        // ── Network health tracking ───────────────────────────────────────────
         state.network_health.total_packets += 1;
         state.bytes_this_window += frame_bytes;
         if let Some(ref ip) = outer_ip {
@@ -380,7 +386,57 @@ fn main() {
                 state.network_health.unicast_packets += 1;
             }
         }
+
+        // ── Offline: report based on pcap timestamp ───────────────────────────
+        // eth/outer_ip are no longer used past this point — NLL ends their borrows
+        // of packet.data before we access pkt_ts (which was copied earlier).
+        if is_offline {
+            if !pcap_ts_init {
+                last_report_pcap = pkt_ts;
+                pcap_ts_init = true;
+            } else if pkt_ts - last_report_pcap >= 5 {
+                emit_periodic_alerts(state, logger);
+                do_report(state, expanded_protocols, None, quiet, logger);
+                last_report_pcap = pkt_ts;
+            }
+        }
     }
+}
+
+/// Periodic check helpers called before every report cycle.
+fn emit_periodic_alerts(state: &mut CaptureState, logger: &mut crate::report::Logger) {
+    capture::emit(&state.check_ptp_timeouts(),        logger);
+    capture::emit(&state.check_ptp_sync_conflict(),   logger);
+    capture::emit(&state.check_stream_count_anomaly(), logger);
+    capture::emit(&state.check_dante_conmon_bridge(), logger);
+    capture::emit(&ts_refclk_alerts(state),           logger);
+    state.aggregate_ndi_bitrate();
+}
+
+/// Score, render, and reset a 5s report window.
+fn do_report(
+    state: &mut CaptureState,
+    expanded_protocols: &[protocols::ProtocolChoice],
+    pcap_stats: Option<(u32, u32, u32)>,
+    quiet: bool,
+    logger: &mut crate::report::Logger,
+) {
+    state.network_health.calculate_score(
+        &state.streams, &state.tcp_streams, &state.ptp_domains,
+        &state.msrp_state, &state.eee_ports,
+    );
+    let missing_ptp = state.missing_ptp_clocks(expanded_protocols);
+    print_report(
+        &state.streams, &state.tcp_streams, &state.ptp_domains, &missing_ptp,
+        logger, &state.network_health, state.bytes_this_window,
+        &state.avtp_streams, &state.msrp_state, &state.mvrp_vlans, &state.eee_ports,
+        &state.dante_sources, &state.dante_names, &state.dante_conmon,
+        &state.ndi_sources, &state.ndi_names,
+        &state.avdecc_entities,
+        state.pause_frames_this_window, state.pfc_frames_this_window,
+        pcap_stats, state.packets_dispatched, quiet,
+    );
+    state.reset_window();
 }
 
 /// Send mDNS PTR queries for Dante (and optionally NDI) service types at startup.

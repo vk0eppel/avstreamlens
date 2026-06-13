@@ -71,6 +71,12 @@ sudo ./target/release/avstreamlens -i en0 -p aes67 --duration 30 && echo OK
 sudo ./target/release/avstreamlens --help
 ```
 
+**Offline pcap replay** (no root required — analyse a file captured earlier):
+```
+./target/release/avstreamlens --read capture.pcapng
+./target/release/avstreamlens -r site_visit.pcap --protocol dante
+```
+
 On startup:
 1. Select the network interface to monitor (or supply `--interface`)
 2. Select which protocols to watch (or supply `--protocol`, or press Enter for all)
@@ -84,6 +90,7 @@ On startup:
 |---|---|---|
 | `--interface <name>` | `-i` | pcap device name to capture on (e.g. `en0`, `eth0`) |
 | `--protocol <list>` | `-p` | Comma-separated protocols: `all` `audio` `video` `aes67` `avb` `dante` `ndi` `st2110` |
+| `--read <file>` | `-r` | Replay a `.pcap` / `.pcapng` file offline — **no root required** |
 | `--duration <secs>` | `-d` | Stop after N seconds; exit 0 if healthy (100%), exit 1 if any issues detected |
 | `--quiet` | `-q` | Silent on healthy cycles; print the full report only when issues are detected |
 | `--no-color` | | Disable ANSI colour output (also honoured via the `NO_COLOR` env var) |
@@ -94,6 +101,45 @@ Protocol names are case-insensitive. The interactive-mode numbers (0–7) are al
 `--quiet` is useful for long-running monitoring sessions piped to a log file or `tail -f`: no output is produced on healthy cycles, so the terminal stays clean and each new report is immediately visible as an issue. The log file always receives the full report regardless of `--quiet`.
 
 `--duration` enables one-shot scripted health checks. AVStreamLens captures for N seconds (at least one full 5-second report cycle), then exits with code 0 if the network health score is 100% or code 1 if any issue was detected. Pair with `--quiet` to suppress the intermediate report output: `avstreamlens -i en0 -p aes67 --duration 30 --quiet && echo OK`.
+
+---
+
+## Capture Methods
+
+### Live capture (requires root / sudo)
+
+AVStreamLens opens a live pcap handle on the selected interface in promiscuous mode. It joins multicast groups dynamically so IGMP-snooped switches deliver stream traffic to the capture port without a SPAN. Reports print every 5 seconds; use Ctrl-C to stop.
+
+```
+sudo ./target/release/avstreamlens -i en0 -p dante
+```
+
+**To avoid typing sudo every time on macOS** (non-persistent, resets on reboot):
+```
+sudo chmod o+r /dev/bpf*
+./target/release/avstreamlens -i en0 -p dante
+```
+
+**On Linux** (permanent, survives reboots):
+```
+sudo setcap cap_net_raw+ep ./target/release/avstreamlens
+./target/release/avstreamlens -i eth0 -p dante
+```
+
+### Offline pcap replay (no root needed)
+
+Capture a `.pcap` or `.pcapng` file on-site with Wireshark or tcpdump, then replay it anywhere — no network interface, no root required. 5-second report windows are driven by the pcap packet timestamps, so you see the same view as a live capture would have produced. The tool exits at EOF and prints a final report.
+
+```
+# Capture on-site:
+sudo tcpdump -i en0 -w site_visit.pcap
+
+# Analyse later (no sudo):
+./target/release/avstreamlens --read site_visit.pcap --protocol dante
+./target/release/avstreamlens -r site_visit.pcapng
+```
+
+Protocol defaults to `all` when `--read` is given without `--protocol`. BPF filter is still applied. mDNS startup probe and IGMP joins are skipped (not meaningful for offline data). Device names from mDNS will only appear if mDNS traffic was captured in the file — there is no live probe to trigger responses.
 
 ---
 
@@ -228,8 +274,7 @@ Choose the protocols to monitor:
     ✓  Reserved  VLAN 100  prio 3  ✓  Listener Ready
 
 📇 Discovered:
-   Dante (5):  "Stage Box", "Yamaha-DM7", "TASCAM", "Amp-1", "Amp-2"
-   Dante live (ConMon: 2):  "Stage Box" [32 ch], "Yamaha-DM7" [64 ch]
+   Dante (5):  "Stage Box", "Yamaha-DM7", "TASCAM", "Amp-1", "Amp-2"  · 2 live
    NDI   (2):  "Studio Camera", "Playback PC"
 
 🕐 Clock Sources:
@@ -248,7 +293,7 @@ Choose the protocols to monitor:
 
 **Status line** — `✓ All streams healthy` or `⚠ N issue(s)` with a brief description.
 
-**Discovered** — Dante and NDI devices announce themselves over multicast mDNS, which reaches every switch port. This section lists those devices even when their actual audio/video flows are not visible. The **Dante live (ConMon)** line goes further: Dante devices continuously transmit control & monitoring (ConMon) multicast at ~33 packets/s on the link-local 224.0.0.230–233 groups, which snooping switches always flood — so AVStreamLens shows in real time which devices are alive *right now* (with their channel count), not just which ones announced via mDNS at some point. On a plain (non-SPAN) port where Dante audio or NDI is unicast between other devices, you will see the devices here but no matching stream above — in that case AVStreamLens adds:
+**Discovered** — Dante and NDI devices announce themselves over multicast mDNS, which reaches every switch port. This section lists those devices even when their actual audio/video flows are not visible. The `· N live` suffix on the Dante line shows real-time liveness from ConMon: Dante devices transmit control & monitoring multicast at ~33 packets/s on the link-local 224.0.0.230–233 groups, which snooping switches always flood — so AVStreamLens knows which devices are alive *right now*, not just which announced via mDNS at some point (`· all live` when every discovered device is also active in ConMon). On a plain (non-SPAN) port where Dante audio or NDI is unicast between other devices, you will see the devices here but no matching stream above — in that case AVStreamLens adds:
 
 ```
    ⚠  Devices announced but no active flows — unicast flows need a SPAN/mirror port

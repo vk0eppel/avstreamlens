@@ -126,17 +126,17 @@ fn parse_ptp_v1(payload: &[u8], hdr_shift: usize) -> Option<PtpInfo> {
             let raw_ident = &payload[62..66];
             let ident = if let Ok(s) = std::str::from_utf8(raw_ident) {
                 let s = s.trim_end_matches('\0').trim();
-                // Only treat the gmClockIdentifier as a real clock-source code
-                // (GPS, ATOM, NTP, DFLT, HAND, INIT…) when it looks like one: at
-                // least 2 ASCII alphanumeric characters. Dante leaves junk in these
-                // bytes — a lone printable byte like "@" (0x40) is graphic but not an
-                // identifier, and it varies frame-to-frame. The old graphic-char test
-                // let it through as "Preferred grandmaster  @".
-                if s.len() >= 2 && s.chars().all(|c| c.is_ascii_alphanumeric()) {
-                    s.to_string()
-                } else {
-                    String::new()
-                }
+                // Only show the gmClockIdentifier when it matches a known IEEE 1588
+                // clock-source code. Dante leaves arbitrary junk bytes here that
+                // vary frame-to-frame (confirmed field data 2026-05-30 and 2026-06-13:
+                // "FR", "FV", "@", etc.). An allowlist avoids displaying any of them.
+                // `s` has already been trimmed, so compare against trimmed forms.
+                const KNOWN_IDENTS: &[&str] = &[
+                    "GPS", "ATOM", "NTP", "HAND", "INIT", "DFLT",
+                    "PPS", "ACTS", "USNO", "PTB", "TDF", "DCF",
+                    "MSF", "WWVB", "GOES", "GLN", "LORC",
+                ];
+                if KNOWN_IDENTS.contains(&s) { s.to_string() } else { String::new() }
             } else {
                 String::new()
             };
@@ -447,6 +447,22 @@ mod tests {
         );
         let q = parse_ptp(&p).unwrap().clock_quality.unwrap();
         assert_eq!(q, "Preferred grandmaster", "high-byte ident should be suppressed, got: {}", q);
+    }
+
+    #[test]
+    fn ptpv1_two_char_junk_ident_suppressed() {
+        // Dante emits 2-char ASCII sequences like "FR" and "FV" that passed the old
+        // is_ascii_alphanumeric + len≥2 filter. The allowlist must reject them.
+        for junk in [b"FR\0\0", b"FV\0\0", b"XX\0\0", b"AB\0\0"] {
+            let p = ptpv1_nibble_sync(
+                [0x00, 0x00, 0x00, 0x01, 0x00, 0x1d],
+                0,
+                junk,
+            );
+            let q = parse_ptp(&p).unwrap().clock_quality.unwrap();
+            assert_eq!(q, "Preferred grandmaster",
+                "junk ident {:?} must be suppressed, got: {}", junk, q);
+        }
     }
 
     #[test]

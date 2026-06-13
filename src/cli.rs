@@ -23,6 +23,9 @@ pub struct CliArgs {
     pub quiet: bool,
     /// `--duration <seconds>` — stop after N seconds and exit 0 (healthy) or 1 (issues).
     pub duration: Option<u64>,
+    /// `--read <path>` — replay a .pcap file offline instead of live capture.
+    /// No root required. Timing driven by pcap timestamps; exits at EOF.
+    pub read_file: Option<String>,
 }
 
 /// Parse command-line arguments.  Exits with a helpful message on bad input.
@@ -41,6 +44,7 @@ pub fn parse_cli_args() -> CliArgs {
     let mut protocols = None;
     let mut quiet = false;
     let mut duration = None;
+    let mut read_file = None;
     let mut i = 0;
 
     while i < args.len() {
@@ -85,6 +89,15 @@ pub fn parse_cli_args() -> CliArgs {
                     std::process::exit(1);
                 }
             }
+            "--read" | "-r" => {
+                if i + 1 < args.len() {
+                    read_file = Some(args[i + 1].clone());
+                    i += 2;
+                } else {
+                    eprintln!("❌ --read requires a file path (e.g. --read capture.pcap)");
+                    std::process::exit(1);
+                }
+            }
             other => {
                 eprintln!("❌ Unknown argument: {}  (run with --help for usage)", other);
                 std::process::exit(1);
@@ -92,7 +105,7 @@ pub fn parse_cli_args() -> CliArgs {
         }
     }
 
-    CliArgs { interface, protocols, no_color, quiet, duration }
+    CliArgs { interface, protocols, no_color, quiet, duration, read_file }
 }
 
 /// Resolve a device by exact pcap name (e.g. `en0`).
@@ -154,6 +167,7 @@ fn print_help() {
     println!("OPTIONS");
     println!("  -i, --interface <name>    Network interface to capture on (e.g. en0, eth0)");
     println!("  -p, --protocol  <list>    Comma-separated protocols to monitor (default: all)");
+    println!("  -r, --read      <file>    Replay a .pcap file offline — no root required");
     println!("  -d, --duration  <secs>    Stop after N seconds; exit 0 if healthy, 1 if issues");
     println!("  -q, --quiet               Suppress output on healthy cycles; show alerts only");
     println!("      --no-color            Disable ANSI colour output (also: NO_COLOR env var)");
@@ -164,7 +178,8 @@ fn print_help() {
     println!("EXAMPLES");
     println!("  sudo avstreamlens --interface en0 --protocol aes67,dante");
     println!("  sudo avstreamlens -i eth0 -p all");
-    println!("  sudo avstreamlens -i eth0 -p audio\n");
+    println!("  avstreamlens --read capture.pcap --protocol dante");
+    println!("  avstreamlens -r site_visit.pcap\n");
     println!("  Without flags, AVStreamLens prompts interactively.");
 }
 

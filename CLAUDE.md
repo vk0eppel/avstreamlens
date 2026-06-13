@@ -9,7 +9,7 @@
 |---|---|
 | `src/main.rs` | Entry point — owns pcap handle, 5s report timer, post-dispatch IPv4/TCP tracking, dynamic IGMP join drain. Thin driver |
 | `src/capture.rs` | `CaptureState` + per-protocol handlers + `dispatch()` + `emit()` — all per-loop state and protocol-handler logic |
-| `src/cli.rs` | CLI arg parsing (`--interface`, `--protocol`, `--duration`, `--quiet`, `--no-color`, `--help`), interactive interface/protocol selection, BPF filter building |
+| `src/cli.rs` | CLI arg parsing (`--interface`, `--protocol`, `--read`, `--duration`, `--quiet`, `--no-color`, `--help`), interactive interface/protocol selection, BPF filter building |
 | `src/parser.rs` | Top-level `detect_protocol` dispatcher + RTP + TCP + VLAN unwrap + multicast helpers; re-exports submodule API |
 | `src/parser/sdp.rs` | SAP envelope (RFC 2974), SDP body (RFC 4566), `ts-refclk` normalisation |
 | `src/parser/ptp.rs` | PTPv1 (IEEE 1588-2002) + PTPv2 (IEEE 1588-2008) message parser — used for both UDP PTP and L2 gPTP |
@@ -29,7 +29,7 @@
 cargo build --release   # build
 cargo fmt               # format
 cargo clippy -- -D warnings  # lint
-cargo test              # run all 152 unit tests
+cargo test              # run all 163 unit tests
 ```
 
 ## Open Work
@@ -56,7 +56,7 @@ See **[TODO.md](TODO.md)** for the full list. Quick summary:
 ### Parser Layout (`parser.rs` + `parser/`)
 - **`parser.rs`** holds the `detect_protocol` dispatcher and only the small, shared bits: VLAN unwrap, multicast classification, RTP, TCP, the Dante port heuristic, ST2110 PT/port classifier. Submodules are declared with `pub mod ...` and their public functions are re-exported with `pub use ...::*` so external consumers (`main.rs`, `capture.rs`) keep using `crate::parser::parse_foo` regardless of which submodule `parse_foo` lives in
 - **`parser/sdp.rs`** — SAP envelope (RFC 2974) → SDP body (RFC 4566); `parse_ts_refclk` normalises `ptp=IEEE1588-2008:<id>:<domain>` to colon-separated lowercase bytes matching `PtpStats::last_grandmaster`
-- **`parser/ptp.rs`** — `parse_ptp` auto-detects PTPv1 vs PTPv2 from byte 1 low nibble; PTPv1 has two wire encodings (separate-byte vs nibble-packed) selected by byte 0 == 0x11
+- **`parser/ptp.rs`** — `parse_ptp` auto-detects PTPv1 vs PTPv2 from byte 1 low nibble; PTPv1 has two wire encodings (separate-byte vs nibble-packed) selected by byte 0 == 0x11. PTPv1 `gmClockIdentifier` is filtered against a hard allowlist of known IEEE 1588 clock-source codes (`GPS`, `ATOM`, `NTP`, `HAND`, `INIT`, `DFLT`, `PPS`, `ACTS`, …) — Dante leaves arbitrary junk bytes here (`FR`, `FV`, `@`, high bytes) that vary frame-to-frame; the allowlist suppresses all of them cleanly
 - **`parser/avb.rs`** — `parse_avtp_stream_id` (sv-bit guarded), `parse_msrp` (TalkerAdvertise/TalkerFailed/Listener), `parse_mvrp` (VLAN registration). MSRP/MVRP share the IEEE 802.1Q vector-attribute format
 - **`parser/lldp.rs`** — TLV walker; emits `AvProtocol::LldpEee` only when the EEE TLV (OUI 00-12-0F, subtype 0x05) is present AND a wake-up time is non-zero
 - **`parser/mdns.rs`** — `extract_mdns_instance_name` finds the DNS-label-encoded service needle, then walks length-prefixed labels backward to find the longest valid printable-ASCII instance name. Used by `extract_dante_name` (tries `\x0d_netaudio-cmc` → `\x0d_netaudio-arc` → `\x09_netaudio`) and `extract_ndi_name` (needle `\x04_ndi`). **QR-bit guard in `detect_protocol`**: mDNS packets are only classified as Dante/NDI discovery when DNS flags byte `payload[2] & 0x80 != 0` (QR=1, response). Without this, outgoing mDNS queries from the local machine — which contain the same service-label bytes in the question section — would register the local machine's IP as a discovered Dante/NDI device. **Startup mDNS probe** (`main.rs::send_mdns_startup_probe`): at startup, AVStreamLens sends a PTR query for `_netaudio-arc._udp.local`, `_netaudio-cmc._udp.local`, `_netaudio._udp.local` to `224.0.0.251:5353`. Devices respond unicast (from port 5353, to our random port) with compressed DNS PTR records. The `detect_protocol` check includes `src_port == 5353` so these unicast responses are classified. `extract_dante_name` falls back to `extract_instance_from_ptr_response` which parses the DNS structure (skip questions → walk answer records → read first label of first PTR RDATA) instead of byte-searching for the service needle, which is replaced by a compression pointer in responses
@@ -91,7 +91,7 @@ See **[TODO.md](TODO.md)** for the full list. Quick summary:
 - UDP PTP `protocol_kind` labels: version-based not application-based — PTPv1 → `"PTPv1"`, PTPv2 → `"PTPv2"`, L2 gPTP → `"AVB"`
 
 ### Capture Loop & Stream Lifecycle
-- **Report block is at the TOP of the loop**, before `cap.next_packet()` — so it fires even when pcap times out on quiet L2-only networks (e.g. AVB-only; `Err(_) => continue` would otherwise skip it)
+- **Report block is at the TOP of the loop for live capture**, before `cap.next_packet()` — so it fires even when pcap times out on quiet L2-only networks. For offline replay the report is triggered by pcap timestamp delta (every 5s of capture time) at the BOTTOM of the loop, after packet processing; a final report is printed at EOF (`pcap::Error::NoMorePackets`)
 - `streams` and `tcp_streams` pruned after each 5s report: silent >20s removed; TCP `Terminated` removed immediately
 - `ptp_domains` and `sdp_cache` never pruned (bounded by design)
 - Per-window counters reset after each 5s report: `gap_events`, `max_iat_ms`, `pt_mismatches`, `dscp_violations`, `ssrc_changes`, `lost_this_window`, `ts_discontinuities_this_window`, `reorders_this_window` (StreamStats) + `pause_frames_this_window`, `pfc_frames_this_window` (CaptureState) — alerts and score penalties reflect the current window, not the stream's lifetime
@@ -101,16 +101,17 @@ See **[TODO.md](TODO.md)** for the full list. Quick summary:
 - **VLAN-tagged frames**: `unwrap_vlan()` in `parser.rs` peels 802.1Q / 802.1ad / QinQ tags before dispatch — L2 AVB protocols work on tagged networks. No VLAN-ID filtering is implemented; the app processes whatever VLANs the capture interface receives. Operator-facing guidance (trunk vs access vs SPAN, macOS tag-stripping, QinQ caveat) lives in README.md under "Capture Setup — Monitoring One or Multiple VLANs"
 
 ### CLI Flags & Interface Listing
-- **`parse_cli_args()`** reads `std::env::args()` before any interactive prompt. Recognised flags: `--interface`/`-i`, `--protocol`/`-p`, `--duration`/`-d`, `--quiet`/`-q`, `--no-color`/`--no-colour`, `--help`/`-h`. Unknown flags exit with an error. Returns `CliArgs { interface, protocols, duration, quiet, no_color }`
+- **`parse_cli_args()`** reads `std::env::args()` before any interactive prompt. Recognised flags: `--interface`/`-i`, `--protocol`/`-p`, `--read`/`-r`, `--duration`/`-d`, `--quiet`/`-q`, `--no-color`/`--no-colour`, `--help`/`-h`. Unknown flags exit with an error. Returns `CliArgs { interface, protocols, read_file, duration, quiet, no_color }`
 - `--interface <name>` — passed to `resolve_interface_by_name()`, which does an exact match against the pcap device list and exits with a clear message if not found. Bypasses the interactive listing entirely
 - `--protocol <list>` — comma-separated names (`all`, `audio`, `video`, `aes67`, `avb`, `dante`, `ndi`, `st2110`, case-insensitive) or interactive-mode numbers (0–7). Parsed by `parse_protocol_str()`. Bypasses the interactive protocol prompt entirely
 - `--duration` / `-d <seconds>` — run for exactly N seconds then exit with code 0 (health score = 100%) or 1 (any penalty). The exit check fires after each 5s report cycle, so at least one full window is always captured. Enables scripted health checks: `avstreamlens -i en0 -p aes67 --duration 30 && echo OK`
 - `--quiet` / `-q` — when set, `print_report` suppresses all stdout output on fully healthy cycles (no stream issues, no missing clocks, no pcap drops). When issues are present the full report is printed. The log file always receives the full report regardless of this flag. Designed for `tail -f`/log-aggregator use
+- **`--read` / `-r <file>`** — offline pcap replay from a `.pcap` or `.pcapng` file. **No root required.** Opens via `pcap::Capture::from_file()`; BPF filter still applied; 5s report windows driven by pcap packet timestamps (`packet.header.ts.tv_sec`) rather than wall clock; exits with 0/1 at EOF after a final report. Protocol defaults to `All` when `--read` is given without `--protocol` (avoids interactive prompt). IGMP joins and mDNS startup probe are skipped. `cap.stats()` not called (pcap drop line shows `None`). The capture loop is a generic `run_loop<T: pcap::Activated>()` in `main.rs` — both `pcap::Active` and `pcap::Offline` implement `Activated`, so live and offline share one loop body with `is_offline: bool` for the few behavioral differences. Periodic check helpers extracted into `emit_periodic_alerts()` and `do_report()` to avoid duplication between the top-of-loop and EOF paths
 - **Interactive fallback**: when interface/protocol flags are absent `main.rs` calls `select_interface()` / `prompt_protocol_selection()` as before — the interactive path is fully intact
 - Interface list filtered: `lo`/`lo0`, `utun*`, `awdl*`, `llw*`, `bridge*`, `vpn*`, `docker*`, `veth*`, `virbr*`, `ap1`, `anpi*` (iPhone USB), `gif*` (IPv6 tunnel), `stf*` (6to4 tunnel)
 - `lo`/`lo0` excluded: macOS loopback uses DLT_NULL (4-byte BSD null header, no Ethernet frame) — incompatible with Ethernet parser; mDNS multicast also does not flow over loopback
 - macOS port names via `macos_port_names()` → `networksetup -listallhardwareports`; IPv4 address shown; Enter selects interface 0 by default
-- Startup banner via `cli::selected_protocol_display()` — e.g. `📡 Listening on en0  for AES67, Dante  (+ PTP, IGMP)  streams`; the `(+ PTP, IGMP)` suffix is shown only when those protocols are relevant to the selection
+- Startup banner: live mode → `📡 Listening on en0  for AES67, Dante  (+ PTP, IGMP)  streams`; offline mode → `📁 Replaying file.pcapng  —  Dante  (+ PTP, IGMP)`. The `(+ PTP, IGMP)` suffix is shown only when those protocols are relevant to the selection
 
 ---
 
@@ -219,7 +220,7 @@ See **[TODO.md](TODO.md)** for the full list. Quick summary:
 - **Five sections** (all use cyan `\x1b[36m` header + emoji); log file output matches console exactly:
   1. Overview — bandwidth + stream count summary + `✓/⚠/–` status line
   2. `📡 Streams:` — unified list of all active streams (AES67, Dante, ST2110, NDI, AVB), no blank lines between entries
-  3. `📇 Discovered:` — devices learned from multicast mDNS (Dante/NDI) and Dante ConMon, shown only when ≥1 device discovered; `print_discovery()` in `report.rs`. A `Dante live (ConMon: N)` line lists devices with continuous monitoring traffic (name or IP, `[N ch]` when known) — real-time liveness, unlike mDNS which may be minutes stale. Emits a yellow **no-SPAN diagnostic** ("Devices announced but no active flows — unicast flows need a SPAN/mirror port") when a protocol has discovered devices but zero active streams — the fingerprint of unicast flows on a non-mirrored port. Does not flip `is_healthy`, so quiet+healthy stays silent
+  3. `📇 Discovered:` — devices learned from multicast mDNS (Dante/NDI) and Dante ConMon, shown only when ≥1 device discovered; `print_discovery()` in `report.rs`. Dante mDNS and ConMon are merged into a single line: `Dante (N): "Name1", ...  · all live` (or `· M live` when only M of N are active in ConMon). No channel count is displayed (field data showed incorrect counts on non-Brooklyn hardware). Emits a yellow **no-SPAN diagnostic** ("Devices announced but no active flows — unicast flows need a SPAN/mirror port") when a protocol has discovered devices but zero active streams — the fingerprint of unicast flows on a non-mirrored port. Does not flip `is_healthy`, so quiet+healthy stays silent
   4. `🕐 Clock Sources:` — PTP domains (conditional)
   5. `🔬 Network Health — X%:` — health score + QoS/DSCP + IGMP querier + EEE
 - Stream entry format: `  ▸ Protocol  "Name"  [codec]  —  IP:port` / `    metrics line` / `    ⚠  alerts`
