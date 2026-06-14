@@ -442,6 +442,7 @@ pub struct NetworkHealth {
     pub ecn_congestion_marks: u64,
     // IGMP / snooping
     pub last_igmp_query: Option<Instant>,
+    pub igmp_querier_ip: Option<std::net::Ipv4Addr>,
     pub igmp_query_interval_secs: Option<u64>, // computed from last two queries
 }
 
@@ -455,6 +456,7 @@ impl NetworkHealth {
             network_score: 100.0,
             ecn_congestion_marks: 0,
             last_igmp_query: None,
+            igmp_querier_ip: None,
             igmp_query_interval_secs: None,
         }
     }

@@ -39,7 +39,7 @@ See **[TODO.md](TODO.md)** for the full list. Quick summary:
 | Category | Items |
 |---|---|
 | Bugs / code issues | (none — all resolved) |
-| Missing features | PTPv1 grandmaster NIC MAC display; VLAN-ID filter; Dante AV video; Dante mDNS TXT metadata enrichment; health score review; JSON output; SAP re-announce monitor; redundant stream pairing; RTCP; PTP BMCA; SDP preload; NMOS IS-04 |
+| Missing features | 802.1p PCP checking (AVB mandatory, AES67/ST2110 advisory); Dante DVS detection via DSCP=0; PTPv1 grandmaster NIC MAC display; VLAN-ID filter; Dante AV video; Dante mDNS TXT metadata enrichment; health score review; JSON output; SAP re-announce monitor; redundant stream pairing; RTCP; PTP BMCA; SDP preload; NMOS IS-04 |
 | Done, pending field check | ConMon device liveness + channel count; Dante SAP group 239.255.255.255 join; official ATP port detection (4321 / 14336–15359) |
 | Platform limitations | NDI loopback unsupported; macOS VLAN tag stripping; Windows `cmd.exe` no ANSI color; PAUSE/PFC NIC-consumed |
 
@@ -94,11 +94,11 @@ See **[TODO.md](TODO.md)** for the full list. Quick summary:
 - **Report block is at the TOP of the loop for live capture**, before `cap.next_packet()` — so it fires even when pcap times out on quiet L2-only networks. For offline replay the report is triggered by pcap timestamp delta (every 5s of capture time) at the BOTTOM of the loop, after packet processing; a final report is printed at EOF (`pcap::Error::NoMorePackets`)
 - `streams` and `tcp_streams` pruned after each 5s report: silent >20s removed; TCP `Terminated` removed immediately
 - `ptp_domains` and `sdp_cache` never pruned (bounded by design)
-- Per-window counters reset after each 5s report: `gap_events`, `max_iat_ms`, `pt_mismatches`, `dscp_violations`, `ssrc_changes`, `lost_this_window`, `ts_discontinuities_this_window`, `reorders_this_window` (StreamStats) + `pause_frames_this_window`, `pfc_frames_this_window` (CaptureState) — alerts and score penalties reflect the current window, not the stream's lifetime
+- Per-window counters reset after each 5s report: `gap_events`, `max_iat_ms`, `pt_mismatches`, `dscp_violations`, `pcp_violations`, `ssrc_changes`, `lost_this_window`, `ts_discontinuities_this_window`, `reorders_this_window` (StreamStats) + `pause_frames_this_window`, `pfc_frames_this_window` (CaptureState) — alerts and score penalties reflect the current window, not the stream's lifetime. Exception: `observed_dscp: Option<u8>` is set once on the first packet and never reset — it is a lifetime property of the stream used at report time to distinguish Dante DVS (DSCP=0) from misconfigured hardware (wrong non-zero DSCP)
 - **Alert dedup pattern**: cumulative counters (`lost_packets`, `ts_discontinuities`) keep growing forever; alerts fire only when the corresponding `*_this_window` delta is non-zero. Without this, a single old loss re-alerted every 5s for the rest of the run. Apply the same pattern when adding alerts on any cumulative metric. Exception: `reorders_this_window` is not cumulative (reorders don't accumulate to a lifetime total) — its alert fires when the per-window count is non-zero AND the reorder rate exceeds 1%
 - All protocol arms set `last_packet_time = Some(now)` so pruning applies uniformly
 - IGMP Join deduplication: `igmp_joins_seen: HashMap<(Ipv4Addr, Ipv4Addr), Instant>` — cleared on Leave; entries older than 5 minutes pruned each report cycle (handles hosts that disappear without sending Leave); Queries/Unknowns always print
-- **VLAN-tagged frames**: `unwrap_vlan()` in `parser.rs` peels 802.1Q / 802.1ad / QinQ tags before dispatch — L2 AVB protocols work on tagged networks. No VLAN-ID filtering is implemented; the app processes whatever VLANs the capture interface receives. Operator-facing guidance (trunk vs access vs SPAN, macOS tag-stripping, QinQ caveat) lives in README.md under "Capture Setup — Monitoring One or Multiple VLANs"
+- **VLAN-tagged frames**: `unwrap_vlan()` in `parser.rs` peels 802.1Q / 802.1ad / QinQ tags before dispatch — L2 AVB protocols work on tagged networks. Return type is `Option<(u16, Option<u8>, &[u8])>` — EtherType, PCP of the outermost tag (None if untagged), stripped payload. PCP is threaded as an extra `pcp: Option<u8>` parameter to `dispatch()` and from there to the handlers that need it (`handle_avb`, `handle_aes67`, `handle_st2110`). For QinQ the outermost tag's PCP is used — that is the value the switch acts on for queuing. No VLAN-ID filtering is implemented; the app processes whatever VLANs the capture interface receives. Operator-facing guidance (trunk vs access vs SPAN, macOS tag-stripping, QinQ caveat) lives in README.md under "Capture Setup — Monitoring One or Multiple VLANs"
 
 ### CLI Flags & Interface Listing
 - **`parse_cli_args()`** reads `std::env::args()` before any interactive prompt. Recognised flags: `--interface`/`-i`, `--protocol`/`-p`, `--read`/`-r`, `--duration`/`-d`, `--quiet`/`-q`, `--no-color`/`--no-colour`, `--help`/`-h`. Unknown flags exit with an error. Returns `CliArgs { interface, protocols, read_file, duration, quiet, no_color }`
@@ -121,7 +121,7 @@ See **[TODO.md](TODO.md)** for the full list. Quick summary:
 - **Transport**: UDP multicast 239.69.*
 - **Detection**: `is_aes67_multicast(dst_ip)` after RTP version check
 - **Clock**: PTPv2 via UDP ports 319/320; ts-refclk cross-check validates SDP-claimed grandmaster against wire
-- **Health metrics**: loss (RFC 3550 seq, signed-delta — negative delta = reorder, counted separately in `reorders_this_window`, not added to loss), jitter (RFC 3550 EWMA, sign-preserving), SSRC changes, TS discontinuities, signal gaps, payload type validation, DSCP EF(46) per-stream; reorder alert fires when `reorders_this_window / total_packets > 1%`
+- **Health metrics**: loss (RFC 3550 seq, signed-delta — negative delta = reorder, counted separately in `reorders_this_window`, not added to loss), jitter (RFC 3550 EWMA, sign-preserving), SSRC changes, TS discontinuities, signal gaps, payload type validation, DSCP EF(46) per-stream, 802.1p PCP=6 advisory (warn only, no score penalty); reorder alert fires when `reorders_this_window / total_packets > 1%`
 - `clock_hz_confirmed` gates TS discontinuity detection — set at stream creation if SDP found, or retroactively when SAP arrives
 - `expected_pt` from SDP `a=rtpmap`; `pt_mismatches` counts mismatches per packet within the 5s window
 - Signal gap: `gap_events` fires when IAT > 50ms; alert requires **≥2 events per 5s window** (single spike = pcap scheduling noise); `max_iat_ms` tracks worst case; both reset per 5s window
@@ -133,11 +133,12 @@ See **[TODO.md](TODO.md)** for the full list. Quick summary:
 - **Detection**: `is_likely_dante_audio()` requires BOTH src AND dst ports in 5000–6000 (even) — prevents false positives from ephemeral source ports. Plus `is_dante_multicast()` (`239.255.0.0/16`, Dante's default multicast block): a multicast-destined flow with dst port even in 5000–6000 is classified Dante even when the source port is out of range, so multicast transmit flows aren't stolen by the ST2110 catch-all. **Tradeoff** (see TODO field-verification): an ST2110 deployment using `239.255.x.x` with an even 5000–6000 dst port would be mislabelled Dante — uncommon since `239.255/16` is Dante-specific
 - **ATP detection (official Audinate ports)**: a pre-RTP-gate check in `detect_protocol` classifies `239.255/16` dst port **4321** (multicast ATP audio) and flows with **both ports in 14336–15359** (unicast audio/video) as Dante. ATP framing is not RTP — `handle_dante` falls back to `StreamStats::update_non_rtp()` (packets/bitrate/presence only, `rtp_seen` stays false) and the report renders `N pkts | X Mbps (ATP framing — loss/jitter unavailable)` instead of fake 0% loss. `rtp_seen` also gates the "not announced (no SAP)" alert. Field verification of which ports real devices use is pending (TODO.md)
 - **ConMon (control & monitoring)**: `parser/conmon.rs::parse_conmon()` — UDP 8700–8708 (multicast `224.0.0.230–233`), validated by ASCII `"Audinate"` at payload offset 16–23 plus a BE length field at [2..4] (padding-tolerant). Extracts the sender MAC ([8..14]) and, from 8705 metering frames ("MBC" tag at 0x2a, count at 0x44), the channel count. ConMon is **link-local multicast — never IGMP-snooped** — so it proves device liveness at ~33 pkts/s from any port, no SPAN. `dante_conmon: HashMap<Ipv4Addr, ConmonDevice>` (pruned after `CONMON_PRUNE_SECS = 60` of silence); ConMon IPs are also inserted into `dante_sources`. Report: `Dante live (ConMon: N)` line in the Discovered section, names cross-referenced from `dante_names`. The ConMon check runs before the Dante-control port check (they overlap on 8700); non-ConMon payloads on 8700/8800 still classify as `DanteKind::Control`
+- **DSCP hierarchy** (Audinate official): CS7 (56) for time-critical PTP events; EF (46) for audio and regular PTP; Best Effort (0) intentionally used by Dante Virtual Soundcard (DVS) — software Dante does not apply DSCP markings to avoid bursting high-priority traffic from a general-purpose OS. A Dante audio stream arriving at DSCP=0 is flagged as `⚠ Likely Dante Virtual Soundcard`. No PCP requirement — Dante's QoS mechanism is DSCP-only.
 - **Clock**: PTPv1 via UDP ports 319/320; grandmaster from Sync body (bytes 50–55 UUID, byte 61 stratum, bytes 62–65 ident); PTPv1 layout auto-detected by **`payload[0]`**: `0x11` → nibble-packed (hdr_shift=2), else separate-byte (hdr_shift=0); subdomain → domain: _DFLT=0, _ALT1=1, _ALT2=2, _ALT3=3, anything else → 0. **Limitation**: DDM / Dante Director uses custom user-defined subdomains (e.g. `H~O$L`) that don't match these four names — they silently map to 0, so all DDM domains appear as domain 0
 - **Device names**: extracted from mDNS DNS labels via `extract_dante_name()` (tries CMC → ARC → legacy); stored in `dante_names: HashMap<Ipv4Addr, String>`; `DanteKind::Discovery { device_name }` carries name to dispatch. **Retroactive naming**: when a name is learned, existing Dante streams from that source IP (matched via `StreamStats::src_ip`) with no name yet are backfilled — a stream seen before the device's mDNS announcement is no longer nameless forever. Name written once (same rule as SAP session names)
 - **Stream key includes src AND dst**: `"Dante {src} → {dst}:{dst_port}"` — one device can transmit several flows from the same source port to different destinations (e.g. multiple multicast groups); the old `src:port` key merged them, interleaving sequence numbers into false loss
 - **`AvProtocol::Dante`**: `{ kind, src, dst, dst_port }` — `dst` is the destination IP; used in `handle_dante` to set `is_multicast` and fill `dst_ip`/`dst_port` via `StreamStats::new_with_info`
-- **Health metrics**: all RTP metrics (same as AES67), DSCP EF(46) checked per packet
+- **Health metrics**: all RTP metrics (same as AES67), DSCP EF(46) checked per packet, 802.1p PCP=6 advisory (warn only, no score penalty; same rule as AES67)
 - `requires_valid_ptp_clock()` returns `true` for Dante — "no clock source" warning fires if PTPv1 disappears
 - Default `ptime_ms = 1.0` (48 samples at 48kHz) for TS discontinuity tolerance
 - Alert `⚠ Dante clock or subscription issue` for loss > **0.1%** or jitter > 15ms (0% threshold caused false positives from pcap scheduling noise)
@@ -168,6 +169,7 @@ See **[TODO.md](TODO.md)** for the full list. Quick summary:
 - **AVTP**: `avtp_streams: HashMap<[u8;8], AvtpStreamStats>` per stream_id (sv=1, bytes 4–11); subtype decoded via `avtp_subtype_name()` (0x00=IEC 61883, 0x02=CRF, 0x7E=MAAP…); sequence loss via `AvtpStreamStats::update_seq()` on byte 2 counter (8-bit wrap-safe, signed-i8 reorder filter mirrors the RTP fix); bitrate from Ethernet frame sizes
 - **MSRP**: `parse_msrp()` extracts TalkerAdvertise (bandwidth, VLAN, priority), TalkerFailed (failure code at `first_value[33]`), Listener state; `msrp_state: HashMap<[u8;8], MsrpDeclaration>`; TalkerFailed alert immediate, decoded via `protocols::msrp_failure_reason()` over the full 802.1Qat Table 35-6 set (1–19, e.g. 8 = egress port not AVB-capable) with a numeric fallback — always shows `(code N: reason)`
 - **MVRP**: `parse_mvrp()` extracts VLAN IDs; `mvrp_vlans: HashSet<u16>` — presence confirms L2 VLAN QoS; alert if AVTP active but no MVRP
+- **PCP (802.1p)**: mandatory per IEEE 802.1BA — AVTP streams must use PCP=3 (SR Class A) or PCP=2 (SR Class B). Wrong PCP means the Credit-Based Shaper assigns traffic to the wrong queue, breaking deterministic latency. Penalty: −15/stream (same as TCP Critical). PCP is read from the outermost VLAN tag; untagged frames produce no alert (AVB requires 802.1Q by spec, so absence of a tag is itself a misconfiguration, but reported separately via the MVRP check)
 - `avtp_streams` pruned per cycle; `msrp_state` pruned to match surviving `avtp_streams` entries; `mvrp_vlans` cleared when `avtp_streams` is empty (MVRP is periodic — the switch re-registers within seconds when AVB resumes)
 
 ### mDNS name extraction (shared)
@@ -228,9 +230,14 @@ See **[TODO.md](TODO.md)** for the full list. Quick summary:
   - NDI: metrics = `quality  |  X Mbps  |  retrans: N` (TCP quality, no RTP metrics)
   - AVB: metrics = `loss: X%  |  X Mbps` + MSRP/VLAN reservation state inline
 - DSCP: validated **per stream** against protocol-appropriate expected values; alert inline in Streams section when wrong; footer shows summary across all streams
-  - AES67 / Dante / ST2110-30 audio / ST2110-40 anc: EF (46) required
+  - AES67 / ST2110-30 audio / ST2110-40 anc: EF (46) required
   - ST2110-20 video: EF (46), CS5 (40), or AF41 (34) accepted
+  - Dante hardware: EF (46) for audio/PTP; CS7 (56) for time-critical PTP events. DSCP=0 → `⚠ Likely Dante Virtual Soundcard` (software Dante intentionally sends Best Effort). `observed_dscp: Option<u8>` on `StreamStats` (set once, never reset) distinguishes DVS (0) from misconfigured hardware (wrong non-zero value)
   - NDI / AVB: no DSCP check (TCP / Layer 2)
+- PCP (802.1p): validated per stream when the frame carries a VLAN tag; outermost tag used for QinQ
+  - AVB: PCP=3 required for SR Class A, PCP=2 for SR Class B — mandatory per IEEE 802.1BA; wrong value breaks CBS shaper queue assignment; penalty −15/stream
+  - AES67 / ST2110: PCP=6 expected — advisory only; warn alert, no score penalty
+  - Dante / NDI: no PCP check
 - ECN congestion marks: penalise score (−2 each, capped −20) **and** shown as `⚠  ECN: N congestion mark(s)` in Network Health section
 - EEE: shown only when detected — absence is NOT reported (switch may not send LLDP, so absence ≠ disabled)
 - Clock Sources: protocol label prominent; domain number only when multiple domains
@@ -256,6 +263,8 @@ See **[TODO.md](TODO.md)** for the full list. Quick summary:
 | TCP Terminated | −25/stream |
 | TCP retransmissions | −0.5 each, capped at −10 |
 | DSCP wrong (per stream with violations) | −5/stream, capped at −20 |
+| AVB wrong PCP (per stream) | −15/stream |
+| AES67 / ST2110 wrong PCP | no score penalty (warn only) |
 | ECN congestion marks | −2 each, capped at −20 |
 | IGMP querier absent (multicast active) | −10 |
 | PTP clock confirmed lost | −25/domain |

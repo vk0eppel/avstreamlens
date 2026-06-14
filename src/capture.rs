@@ -676,6 +676,7 @@ impl CaptureState {
                     self.network_health.igmp_query_interval_secs = Some(last.elapsed().as_secs());
                 }
                 self.network_health.last_igmp_query = Some(now);
+                self.network_health.igmp_querier_ip = Some(src);
                 alerts.push(Alert::info(format!("❓ IGMP Query: {} → group {}", src, group)));
             }
             IgmpType::Unknown(t) => {
