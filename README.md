@@ -162,6 +162,8 @@ AVStreamLens is a **passive capture tool** — it reads traffic delivered to its
 | **Dante / NDI discovery** | mDNS multicast (link-local, always flooded) — delivered to every port |
 | **Dante device liveness (ConMon)** | Control & monitoring multicast (224.0.0.230–233, link-local, always flooded) — every live Dante device is visible at ~33 packets/s, with its channel count |
 | **Dante PTPv1 clock** | Multicast — delivered to every port |
+| **Dante IP misconfiguration** | mDNS + ConMon reveal device IPs — AVStreamLens flags 169.254.x.x (DHCP failure) and subnet splits automatically |
+| **Dante clock sync status** | PTPv1 `Delay_Req` is multicast — AVStreamLens counts how many discovered devices are actively syncing ("N of M") |
 
 > **AVB gPTP / MSRP / MVRP are NOT delivered to every port.** They use link-local reserved MACs (`01:80:C2:00:00:0E`, `…:21`) in the IEEE range that bridges must **not** forward — they are hop-by-hop, so you only ever see the copy on your own link, not a remote grandmaster. See *Monitoring gPTP / the AVB grandmaster* below.
 

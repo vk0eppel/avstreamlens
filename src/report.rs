@@ -110,6 +110,19 @@ fn print_discovery(
         let line = format!("{}{}", base, live_suffix);
         logger.log(&line);
         println!("{}", line);
+
+        // List IPs for devices not yet name-resolved.
+        let mut unnamed: Vec<String> = dante_sources
+            .iter()
+            .filter(|ip| !dante_names.contains_key(ip))
+            .map(|ip| ip.to_string())
+            .collect();
+        if !unnamed.is_empty() {
+            unnamed.sort_unstable();
+            let unnamed_line = format!("   ({} unnamed: {})", unnamed.len(), unnamed.join(", "));
+            logger.log(&unnamed_line);
+            println!("{}", unnamed_line);
+        }
     }
     if ndi_count > 0 {
         let line = discovered_line("NDI  ", ndi_count, ndi_names.values().map(|s| s.as_str()).collect());

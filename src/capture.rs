@@ -130,6 +130,11 @@ pub struct CaptureState {
     // handlers can avoid pushing the same group more than once.
     pub pending_join_groups: Vec<Ipv4Addr>,
     pub joined_multicast:    HashSet<Ipv4Addr>,
+    // PTPv1 Delay_Req census: tracks which Dante devices are actively syncing.
+    // Key = source IP of a Delay_Req sender; value = last seen Instant.
+    // Populated in handle_ptp; pruned in reset_window; compared to dante_sources
+    // in check_dante_follower_census to surface devices not locked to the clock.
+    pub ptpv1_followers: HashMap<Ipv4Addr, Instant>,
     // Rolling history of total stream counts (RTP + TCP + AVTP) at the end of
     // each 5s window, used to detect sudden flood-style anomalies. Capped at 3
     // entries; the oldest is dropped when a fourth would be added.
@@ -165,6 +170,7 @@ impl CaptureState {
             packets_dispatched: 0,
             pending_join_groups: Vec::new(),
             joined_multicast:    HashSet::new(),
+            ptpv1_followers:     HashMap::new(),
             stream_count_history: Vec::new(),
         }
     }
@@ -215,6 +221,9 @@ impl CaptureState {
         // Drop ConMon devices that stopped announcing (metering is ~33 Hz, so
         // a minute of silence means the device left the network).
         self.dante_conmon.retain(|_, d| d.last_seen.elapsed().as_secs() < CONMON_PRUNE_SECS);
+        // PTPv1 followers: Delay_Req rate is ~1/s; prune after 15s to survive
+        // inter-cycle gaps without false-positive census drops.
+        self.ptpv1_followers.retain(|_, t| t.elapsed().as_secs() < 15);
         // Drop IGMP Join entries from hosts that vanished without sending a Leave.
         self.igmp_joins_seen.retain(|_, t| t.elapsed() < Duration::from_secs(IGMP_JOIN_DEDUP_TTL_SECS));
         // Prune AVDECC entities whose ADP announcement has expired (valid_time + 10s grace).
@@ -341,6 +350,14 @@ impl CaptureState {
 
     /// PTP: update the (domain, version) entry, return Detected/Changed alert if any.
     pub fn handle_ptp(&mut self, info: PtpInfo) -> Vec<Alert> {
+        // PTPv1 Delay_Req (msg 0x01) — sender is a clock follower.
+        if info.version == crate::protocols::PTP_VERSION_V1
+            && info.message_type == 0x01
+            && let Some(ip) = info.src_ip
+        {
+            self.ptpv1_followers.insert(ip, Instant::now());
+        }
+
         let kind   = info.protocol_kind.clone();
         let src_ip = info.src_ip;
         let stats  = self.ptp_domains
@@ -851,6 +868,90 @@ impl CaptureState {
         alerts
     }
 
+    pub fn check_dante_ip_config(&self) -> Vec<Alert> {
+        if self.dante_sources.len() < 2 {
+            return vec![];
+        }
+
+        let mut alerts = Vec::new();
+
+        let is_link_local = |ip: &Ipv4Addr| {
+            let o = ip.octets();
+            o[0] == 169 && o[1] == 254
+        };
+
+        let link_local: Vec<Ipv4Addr> = self.dante_sources.iter().filter(|ip| is_link_local(ip)).copied().collect();
+        let routable:   Vec<Ipv4Addr> = self.dante_sources.iter().filter(|ip| !is_link_local(ip)).copied().collect();
+
+        if !link_local.is_empty() && !routable.is_empty() {
+            // Mixed: some devices have DHCP, others fell back to link-local.
+            let mut sorted = link_local.clone();
+            sorted.sort();
+            for ip in sorted {
+                let name = self.dante_names.get(&ip)
+                    .map(|n| format!("\"{}\" ", n))
+                    .unwrap_or_default();
+                alerts.push(Alert::error(format!(
+                    "❌ Dante device {}({}) has no DHCP address — subscriptions to/from this device will fail",
+                    name, ip,
+                )));
+            }
+        } else if link_local.len() >= 2 && routable.is_empty() {
+            // All link-local — DHCP may be down network-wide.
+            alerts.push(Alert::warn(format!(
+                "⚠ All {} Dante devices on link-local (169.254.x.x) — DHCP may be down network-wide",
+                link_local.len(),
+            )));
+        }
+
+        // Subnet split: routable IPs in more than one /24.
+        if routable.len() >= 2 {
+            let mut subnets: std::collections::HashSet<[u8; 3]> = std::collections::HashSet::new();
+            for ip in &routable {
+                let o = ip.octets();
+                subnets.insert([o[0], o[1], o[2]]);
+            }
+            if subnets.len() > 1 {
+                let mut labels: Vec<String> = subnets.iter()
+                    .map(|s| format!("{}.{}.{}.0/24", s[0], s[1], s[2]))
+                    .collect();
+                labels.sort();
+                alerts.push(Alert::warn(format!(
+                    "⚠ Dante devices span {} subnets ({}) — cross-subnet subscriptions require routing",
+                    subnets.len(), labels.join(", "),
+                )));
+            }
+        }
+
+        alerts
+    }
+
+    /// Alert when fewer Dante devices than expected are sending PTPv1 Delay_Req.
+    /// The grandmaster never sends Delay_Req, so N == M-1 is healthy.
+    /// Only fires once at least one follower has been seen (avoids false positives
+    /// at startup before the first Delay_Req arrives).
+    pub fn check_dante_follower_census(&self) -> Vec<Alert> {
+        let total = self.dante_sources.len();
+        let syncing = self.ptpv1_followers.len();
+
+        // Need a PTPv1 domain, at least 2 discovered devices, and at least one follower seen.
+        let has_ptpv1 = self.ptp_domains.keys().any(|(_, v)| *v == crate::protocols::PTP_VERSION_V1);
+        if !has_ptpv1 || total < 2 || syncing == 0 {
+            return vec![];
+        }
+
+        // syncing + 1 (for the GM) < total means at least one follower is missing.
+        if syncing + 1 < total {
+            let missing = total - syncing - 1;
+            return vec![Alert::warn(format!(
+                "⚠ Only {} of {} Dante devices syncing to clock — {} may not be locked",
+                syncing, total, missing,
+            ))];
+        }
+
+        vec![]
+    }
+
     pub fn aggregate_ndi_bitrate(&mut self) {
         for stream in self.streams.values_mut() {
             if stream.protocol == "NDI"
@@ -1324,6 +1425,128 @@ mod tests {
         state.handle_dante(DanteKind::ConMon { device_mac: mac_b, channels: None },
             Ipv4Addr::new(169, 254, 149, 65), Ipv4Addr::new(224, 0, 0, 232), 8705, &[], Instant::now());
         assert!(state.check_dante_conmon_bridge().is_empty());
+    }
+
+    // ── Dante IP misconfiguration detection ──────────────────────────────────
+
+    #[test]
+    fn ip_config_no_alert_with_fewer_than_two_devices() {
+        let mut state = CaptureState::new();
+        state.dante_sources.insert(Ipv4Addr::new(169, 254, 1, 1));
+        assert!(state.check_dante_ip_config().is_empty());
+    }
+
+    #[test]
+    fn ip_config_all_link_local_warns() {
+        let mut state = CaptureState::new();
+        state.dante_sources.insert(Ipv4Addr::new(169, 254, 1, 1));
+        state.dante_sources.insert(Ipv4Addr::new(169, 254, 1, 2));
+        let alerts = state.check_dante_ip_config();
+        assert_eq!(alerts.len(), 1);
+        assert!(matches!(alerts[0].level, AlertLevel::Warn));
+        assert!(alerts[0].message.contains("169.254.x.x"));
+    }
+
+    #[test]
+    fn ip_config_mixed_link_local_and_routable_errors_per_device() {
+        let mut state = CaptureState::new();
+        let ll = Ipv4Addr::new(169, 254, 1, 5);
+        state.dante_sources.insert(ll);
+        state.dante_sources.insert(Ipv4Addr::new(192, 168, 1, 10));
+        let alerts = state.check_dante_ip_config();
+        assert_eq!(alerts.len(), 1);
+        assert!(matches!(alerts[0].level, AlertLevel::Error));
+        assert!(alerts[0].message.contains("169.254.1.5"));
+    }
+
+    #[test]
+    fn ip_config_mixed_includes_device_name() {
+        let mut state = CaptureState::new();
+        let ll = Ipv4Addr::new(169, 254, 1, 5);
+        state.dante_sources.insert(ll);
+        state.dante_names.insert(ll, "StageBox".to_string());
+        state.dante_sources.insert(Ipv4Addr::new(192, 168, 1, 10));
+        let alerts = state.check_dante_ip_config();
+        assert!(alerts[0].message.contains("\"StageBox\""));
+    }
+
+    #[test]
+    fn ip_config_same_subnet_no_alert() {
+        let mut state = CaptureState::new();
+        state.dante_sources.insert(Ipv4Addr::new(192, 168, 1, 10));
+        state.dante_sources.insert(Ipv4Addr::new(192, 168, 1, 20));
+        assert!(state.check_dante_ip_config().is_empty());
+    }
+
+    #[test]
+    fn ip_config_subnet_split_warns() {
+        let mut state = CaptureState::new();
+        state.dante_sources.insert(Ipv4Addr::new(192, 168, 1, 10));
+        state.dante_sources.insert(Ipv4Addr::new(10, 0, 0, 5));
+        let alerts = state.check_dante_ip_config();
+        assert_eq!(alerts.len(), 1);
+        assert!(matches!(alerts[0].level, AlertLevel::Warn));
+        assert!(alerts[0].message.contains("2 subnets"));
+        assert!(alerts[0].message.contains("192.168.1.0/24"));
+        assert!(alerts[0].message.contains("10.0.0.0/24"));
+    }
+
+    // ── Dante PTPv1 follower census ──────────────────────────────────────────
+
+    fn make_ptpv1_domain(state: &mut CaptureState) {
+        use crate::protocols::PTP_VERSION_V1;
+        state.ptp_domains.insert((0, PTP_VERSION_V1), {
+            let mut s = crate::stats::PtpStats::new(0, PTP_VERSION_V1);
+            s.clock_valid = true;
+            s
+        });
+    }
+
+    #[test]
+    fn follower_census_no_alert_without_ptpv1_domain() {
+        let mut state = CaptureState::new();
+        state.dante_sources.insert(Ipv4Addr::new(192, 168, 1, 1));
+        state.dante_sources.insert(Ipv4Addr::new(192, 168, 1, 2));
+        state.ptpv1_followers.insert(Ipv4Addr::new(192, 168, 1, 2), Instant::now());
+        assert!(state.check_dante_follower_census().is_empty());
+    }
+
+    #[test]
+    fn follower_census_no_alert_when_no_followers_seen_yet() {
+        let mut state = CaptureState::new();
+        make_ptpv1_domain(&mut state);
+        state.dante_sources.insert(Ipv4Addr::new(192, 168, 1, 1));
+        state.dante_sources.insert(Ipv4Addr::new(192, 168, 1, 2));
+        // No Delay_Req seen yet — startup grace, no alert.
+        assert!(state.check_dante_follower_census().is_empty());
+    }
+
+    #[test]
+    fn follower_census_no_alert_when_all_accounted_for() {
+        let mut state = CaptureState::new();
+        make_ptpv1_domain(&mut state);
+        // 3 devices: 1 GM + 2 followers — healthy.
+        state.dante_sources.insert(Ipv4Addr::new(192, 168, 1, 1));
+        state.dante_sources.insert(Ipv4Addr::new(192, 168, 1, 2));
+        state.dante_sources.insert(Ipv4Addr::new(192, 168, 1, 3));
+        state.ptpv1_followers.insert(Ipv4Addr::new(192, 168, 1, 2), Instant::now());
+        state.ptpv1_followers.insert(Ipv4Addr::new(192, 168, 1, 3), Instant::now());
+        assert!(state.check_dante_follower_census().is_empty());
+    }
+
+    #[test]
+    fn follower_census_alerts_when_device_not_syncing() {
+        let mut state = CaptureState::new();
+        make_ptpv1_domain(&mut state);
+        // 4 devices: 1 GM + 2 followers + 1 not syncing.
+        for i in 1..=4 { state.dante_sources.insert(Ipv4Addr::new(192, 168, 1, i)); }
+        state.ptpv1_followers.insert(Ipv4Addr::new(192, 168, 1, 2), Instant::now());
+        state.ptpv1_followers.insert(Ipv4Addr::new(192, 168, 1, 3), Instant::now());
+        let alerts = state.check_dante_follower_census();
+        assert_eq!(alerts.len(), 1);
+        assert!(matches!(alerts[0].level, AlertLevel::Warn));
+        assert!(alerts[0].message.contains("2 of 4"));
+        assert!(alerts[0].message.contains("1 may not be locked"));
     }
 
     // ── Dante ATP (non-RTP) audio ────────────────────────────────────────────
