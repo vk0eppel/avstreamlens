@@ -133,6 +133,16 @@ pub struct CaptureState {
     // Per-window set of source IPs that sent an IGMP General Query.
     // Reset in reset_window; checked in check_igmp_multiple_queriers before reset.
     pub igmp_querier_ips_this_window: HashSet<Ipv4Addr>,
+    // IGMP querier version detected from query payload length (2 or 3).
+    // Retained across windows (last known version, not reset per window).
+    pub igmp_querier_version: Option<u8>,
+    // Set when any IGMPv3 report (type 0x22) is seen this window.
+    pub igmp_v3_report_seen_this_window: bool,
+    // Consecutive report cycles where ConMon is active but no mDNS/PTP/streams seen.
+    // Resets to 0 when the condition clears.
+    pub filter_unregistered_suspect_cycles: u32,
+    // Multicast byte count for the current 5s window (for 80 Mbps threshold check).
+    pub multicast_bytes_this_window: u64,
     // PTPv1 Delay_Req census: tracks which Dante devices are actively syncing.
     // Key = source IP of a Delay_Req sender; value = last seen Instant.
     // Populated in handle_ptp; pruned in reset_window; compared to dante_sources
@@ -174,6 +184,10 @@ impl CaptureState {
             pending_join_groups: Vec::new(),
             joined_multicast:    HashSet::new(),
             igmp_querier_ips_this_window: HashSet::new(),
+            igmp_querier_version: None,
+            igmp_v3_report_seen_this_window: false,
+            filter_unregistered_suspect_cycles: 0,
+            multicast_bytes_this_window: 0,
             ptpv1_followers:     HashMap::new(),
             stream_count_history: Vec::new(),
         }
@@ -232,6 +246,8 @@ impl CaptureState {
         // check_igmp_multiple_queriers() which reads this set.
         self.igmp_querier_ips_this_window.clear();
         self.network_health.multiple_queriers_this_window = false;
+        self.igmp_v3_report_seen_this_window = false;
+        self.multicast_bytes_this_window = 0;
         // Drop IGMP Join entries from hosts that vanished without sending a Leave.
         self.igmp_joins_seen.retain(|_, t| t.elapsed() < Duration::from_secs(IGMP_JOIN_DEDUP_TTL_SECS));
         // Prune AVDECC entities whose ADP announcement has expired (valid_time + 10s grace).
@@ -676,9 +692,10 @@ impl CaptureState {
                         self.pending_join_groups.push(group);
                     }
                 }
+                self.igmp_v3_report_seen_this_window = true;
                 // No console output — infrastructure detail, not user-visible.
             }
-            IgmpType::Query => {
+            IgmpType::Query { version } => {
                 // Track interval between consecutive queries (RFC 3376 default 125s).
                 if let Some(last) = self.network_health.last_igmp_query {
                     self.network_health.igmp_query_interval_secs = Some(last.elapsed().as_secs());
@@ -686,7 +703,9 @@ impl CaptureState {
                 self.network_health.last_igmp_query = Some(now);
                 self.network_health.igmp_querier_ip = Some(src);
                 self.igmp_querier_ips_this_window.insert(src);
-                alerts.push(Alert::info(format!("❓ IGMP Query: {} → group {}", src, group)));
+                // Track querier version for v2/v3 mismatch detection.
+                self.igmp_querier_version = Some(version);
+                alerts.push(Alert::info(format!("❓ IGMP Query (v{}): {} → group {}", version, src, group)));
             }
             IgmpType::Unknown(t) => {
                 alerts.push(Alert::info(format!("❔ IGMP Unknown(0x{:02x}): {} → group {}", t, src, group)));
@@ -790,6 +809,75 @@ impl CaptureState {
             "❌ Multiple IGMP queriers detected: {} — querier conflict causes multicast group desync; disable querier on all but one switch",
             sorted.join(", "),
         ))]
+    }
+
+    /// Advisory when an IGMPv2 querier is paired with IGMPv3 hosts.
+    /// Mac built-in Ethernet always sends IGMPv3 reports (0x22); some managed switches
+    /// only speak IGMPv2 and may silently drop those reports, starving Mac hosts of
+    /// Dante/AES67 multicast. Fires when querier version == 2 AND v3 reports are seen.
+    pub fn check_igmp_version_mismatch(&self) -> Vec<Alert> {
+        if self.igmp_querier_version == Some(2) && self.igmp_v3_report_seen_this_window {
+            return vec![Alert::warn(
+                "⚠ IGMPv2 querier with IGMPv3 hosts — Mac built-in Ethernet sends IGMPv3 reports that an IGMPv2 querier may not process; affected Macs may lose Dante/AES67 multicast (workaround: use a USB/Thunderbolt Ethernet adapter)".to_string(),
+            )];
+        }
+        vec![]
+    }
+
+    /// Alert when ConMon (link-local, always-visible) shows live Dante devices but no
+    /// mDNS, PTP, or audio streams are visible — the fingerprint of a switch with
+    /// "Filter Unregistered Multicast" (or "Block Unknown Multicast") enabled, which
+    /// drops non-link-local multicast while link-local `224.0.0.x` still floods.
+    /// Fires after ≥2 consecutive cycles with this condition to avoid false positives
+    /// on startup before mDNS/PTP traffic has arrived.
+    pub fn check_filter_unregistered_multicast(&mut self) -> Vec<Alert> {
+        let conmon_active = !self.dante_conmon.is_empty();
+        let no_mdns       = self.dante_names.is_empty();
+        let no_ptp        = self.ptp_domains.values().all(|p| p.packets == 0);
+        let no_streams    = self.streams.is_empty() && self.avtp_streams.is_empty();
+
+        if conmon_active && no_mdns && no_ptp && no_streams {
+            self.filter_unregistered_suspect_cycles += 1;
+        } else {
+            self.filter_unregistered_suspect_cycles = 0;
+        }
+
+        if self.filter_unregistered_suspect_cycles >= 2 {
+            return vec![Alert::warn(
+                "⚠ Dante devices detected via ConMon but no mDNS, PTP, or streams visible — check switch for \"Filter Unregistered Multicast\" or \"Block Unknown Multicast\" and disable it".to_string(),
+            )];
+        }
+        vec![]
+    }
+
+    /// Alert when multicast bandwidth exceeds 80 Mbps without an IGMP querier.
+    /// Audinate's threshold: networks above 80 Mbps of multicast traffic require
+    /// IGMP snooping to prevent flooding; unmanaged switches are acceptable below it.
+    pub fn check_high_multicast_bandwidth(&self) -> Vec<Alert> {
+        let mbps = self.multicast_bytes_this_window as f64 * 8.0 / 5.0 / 1_000_000.0;
+        if mbps > 80.0 && self.network_health.last_igmp_query.is_none() {
+            return vec![Alert::warn(format!(
+                "⚠ Multicast bandwidth {:.0} Mbps exceeds 80 Mbps threshold — IGMP snooping required at this traffic level; enable querier on the switch",
+                mbps,
+            ))];
+        }
+        vec![]
+    }
+
+    /// Alert when Dante devices are discovered via ConMon or mDNS but no PTP traffic
+    /// has been seen and no IGMP querier is present — the classic symptom of a snooping
+    /// switch blocking PTP multicast (224.0.1.129 / 224.0.0.107) because no host has
+    /// joined those groups via IGMP. Not fired in offline mode (pcap can't join groups).
+    pub fn check_igmp_snooping_blocking_ptp(&self, is_offline: bool) -> Vec<Alert> {
+        if is_offline { return vec![]; }
+        let has_dante_devices = !self.dante_sources.is_empty() || !self.dante_conmon.is_empty();
+        if !has_dante_devices { return vec![]; }
+        let has_ptp = self.ptp_domains.values().any(|p| p.packets > 0);
+        if has_ptp { return vec![]; }
+        if self.network_health.last_igmp_query.is_some() { return vec![]; }
+        vec![Alert::warn(
+            "⚠ Dante devices found but no PTP clock and no IGMP querier — a snooping switch may be blocking PTP multicast (224.0.1.129); enable IGMP querier on the switch".to_string(),
+        )]
     }
 
     /// Stream-count anomaly detection, called from the periodic report cycle
@@ -1615,6 +1703,121 @@ mod tests {
         state.reset_window();
         assert!(!state.network_health.multiple_queriers_this_window);
         assert!(state.igmp_querier_ips_this_window.is_empty());
+    }
+
+    // ── IGMPv2/v3 mismatch, filter-unregistered-multicast, snooping-blocking-ptp ──
+
+    #[test]
+    fn igmp_version_mismatch_fires_warn_when_v2_querier_and_v3_report() {
+        let mut state = CaptureState::new();
+        state.igmp_querier_version = Some(2);
+        state.igmp_v3_report_seen_this_window = true;
+        let alerts = state.check_igmp_version_mismatch();
+        assert_eq!(alerts.len(), 1);
+        assert!(matches!(alerts[0].level, AlertLevel::Warn));
+        assert!(alerts[0].message.contains("IGMPv2"));
+    }
+
+    #[test]
+    fn igmp_version_mismatch_silent_when_v3_querier() {
+        let mut state = CaptureState::new();
+        state.igmp_querier_version = Some(3);
+        state.igmp_v3_report_seen_this_window = true;
+        assert!(state.check_igmp_version_mismatch().is_empty());
+    }
+
+    #[test]
+    fn igmp_version_mismatch_silent_without_v3_reports() {
+        let mut state = CaptureState::new();
+        state.igmp_querier_version = Some(2);
+        assert!(state.check_igmp_version_mismatch().is_empty());
+    }
+
+    #[test]
+    fn filter_unregistered_multicast_fires_after_two_cycles() {
+        let mut state = CaptureState::new();
+        // Populate ConMon to simulate device presence.
+        state.dante_conmon.insert(Ipv4Addr::new(192, 168, 1, 1), ConmonDevice {
+            mac: [0, 0, 0, 0, 0, 0],
+            channels: None,
+            packets: 0,
+            last_seen: std::time::Instant::now(),
+        });
+        // First cycle: no alert yet.
+        assert!(state.check_filter_unregistered_multicast().is_empty());
+        assert_eq!(state.filter_unregistered_suspect_cycles, 1);
+        // Second cycle: alert fires.
+        let alerts = state.check_filter_unregistered_multicast();
+        assert_eq!(alerts.len(), 1);
+        assert!(matches!(alerts[0].level, AlertLevel::Warn));
+        assert!(alerts[0].message.contains("Filter Unregistered Multicast"));
+    }
+
+    #[test]
+    fn filter_unregistered_multicast_clears_when_streams_appear() {
+        let mut state = CaptureState::new();
+        state.dante_conmon.insert(Ipv4Addr::new(192, 168, 1, 1), ConmonDevice {
+            mac: [0, 0, 0, 0, 0, 0],
+            channels: None,
+            packets: 0,
+            last_seen: std::time::Instant::now(),
+        });
+        state.check_filter_unregistered_multicast(); // cycle 1
+        assert_eq!(state.filter_unregistered_suspect_cycles, 1);
+        // A stream appears — condition clears.
+        state.streams.insert("test".to_string(), StreamStats::new("Dante", 1.0));
+        state.check_filter_unregistered_multicast();
+        assert_eq!(state.filter_unregistered_suspect_cycles, 0);
+    }
+
+    #[test]
+    fn igmp_snooping_blocking_ptp_fires_when_dante_found_but_no_ptp_no_querier() {
+        let mut state = CaptureState::new();
+        state.dante_sources.insert(Ipv4Addr::new(192, 168, 1, 10));
+        let alerts = state.check_igmp_snooping_blocking_ptp(false);
+        assert_eq!(alerts.len(), 1);
+        assert!(matches!(alerts[0].level, AlertLevel::Warn));
+    }
+
+    #[test]
+    fn igmp_snooping_blocking_ptp_silent_in_offline_mode() {
+        let mut state = CaptureState::new();
+        state.dante_sources.insert(Ipv4Addr::new(192, 168, 1, 10));
+        assert!(state.check_igmp_snooping_blocking_ptp(true).is_empty());
+    }
+
+    #[test]
+    fn igmp_snooping_blocking_ptp_silent_when_querier_present() {
+        let mut state = CaptureState::new();
+        state.dante_sources.insert(Ipv4Addr::new(192, 168, 1, 10));
+        state.network_health.last_igmp_query = Some(std::time::Instant::now());
+        assert!(state.check_igmp_snooping_blocking_ptp(false).is_empty());
+    }
+
+    #[test]
+    fn high_multicast_bandwidth_fires_when_above_threshold_without_querier() {
+        let mut state = CaptureState::new();
+        // 80 Mbps over 5s = 80_000_000 / 8 * 5 = 50_000_000 bytes. Use 51MB to exceed.
+        state.multicast_bytes_this_window = 51_000_000;
+        let alerts = state.check_high_multicast_bandwidth();
+        assert_eq!(alerts.len(), 1);
+        assert!(matches!(alerts[0].level, AlertLevel::Warn));
+        assert!(alerts[0].message.contains("80 Mbps"));
+    }
+
+    #[test]
+    fn high_multicast_bandwidth_silent_when_querier_present() {
+        let mut state = CaptureState::new();
+        state.multicast_bytes_this_window = 51_000_000;
+        state.network_health.last_igmp_query = Some(std::time::Instant::now());
+        assert!(state.check_high_multicast_bandwidth().is_empty());
+    }
+
+    #[test]
+    fn high_multicast_bandwidth_silent_below_threshold() {
+        let mut state = CaptureState::new();
+        state.multicast_bytes_this_window = 1_000_000;
+        assert!(state.check_high_multicast_bandwidth().is_empty());
     }
 
     // ── Dante PTPv1 follower census ──────────────────────────────────────────

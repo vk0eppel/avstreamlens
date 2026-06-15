@@ -239,7 +239,7 @@ fn run_loop<T: Activated>(
         // ── Live: report at TOP so it fires even when next_packet() times out ─
         if !is_offline && last_report.elapsed() > Duration::from_secs(5) {
             let pcap_stats = cap.stats().ok().map(|s| (s.received, s.dropped, s.if_dropped));
-            emit_periodic_alerts(state, logger);
+            emit_periodic_alerts(state, is_offline, logger);
             do_report(state, expanded_protocols, pcap_stats, quiet, logger);
             last_report = Instant::now();
 
@@ -256,7 +256,7 @@ fn run_loop<T: Activated>(
             Err(pcap::Error::TimeoutExpired) => continue,
             Err(pcap::Error::NoMorePackets)  => {
                 // EOF — print whatever accumulated in the last partial window.
-                emit_periodic_alerts(state, logger);
+                emit_periodic_alerts(state, is_offline, logger);
                 do_report(state, expanded_protocols, None, quiet, logger);
                 let healthy = state.network_health.network_score >= 100.0;
                 std::process::exit(if healthy { 0 } else { 1 });
@@ -385,6 +385,7 @@ fn run_loop<T: Activated>(
         if let Some(ref ip) = outer_ip {
             if is_multicast(ip.get_destination()) {
                 state.network_health.multicast_packets += 1;
+                state.multicast_bytes_this_window += frame_bytes;
             } else {
                 state.network_health.unicast_packets += 1;
             }
@@ -398,7 +399,7 @@ fn run_loop<T: Activated>(
                 last_report_pcap = pkt_ts;
                 pcap_ts_init = true;
             } else if pkt_ts - last_report_pcap >= 5 {
-                emit_periodic_alerts(state, logger);
+                emit_periodic_alerts(state, is_offline, logger);
                 do_report(state, expanded_protocols, None, quiet, logger);
                 last_report_pcap = pkt_ts;
             }
@@ -407,7 +408,7 @@ fn run_loop<T: Activated>(
 }
 
 /// Periodic check helpers called before every report cycle.
-fn emit_periodic_alerts(state: &mut CaptureState, logger: &mut crate::report::Logger) {
+fn emit_periodic_alerts(state: &mut CaptureState, is_offline: bool, logger: &mut crate::report::Logger) {
     capture::emit(&state.check_ptp_timeouts(),        logger);
     capture::emit(&state.check_ptp_sync_conflict(),   logger);
     capture::emit(&state.check_stream_count_anomaly(), logger);
@@ -416,6 +417,10 @@ fn emit_periodic_alerts(state: &mut CaptureState, logger: &mut crate::report::Lo
     capture::emit(&state.check_dante_follower_census(),    logger);
     capture::emit(&state.check_igmp_query_interval(),      logger);
     capture::emit(&state.check_igmp_multiple_queriers(),   logger);
+    capture::emit(&state.check_igmp_version_mismatch(),    logger);
+    capture::emit(&state.check_filter_unregistered_multicast(), logger);
+    capture::emit(&state.check_high_multicast_bandwidth(), logger);
+    capture::emit(&state.check_igmp_snooping_blocking_ptp(is_offline), logger);
     capture::emit(&ts_refclk_alerts(state),           logger);
     state.aggregate_ndi_bitrate();
 }

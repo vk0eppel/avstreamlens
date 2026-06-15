@@ -69,7 +69,7 @@ pub enum FlowControlKind {
 pub enum IgmpType {
     Join,                                        // IGMPv2 Membership Report (0x16)
     Leave,                                       // Leave Group (0x17)
-    Query,                                       // Membership Query (0x11)
+    Query { version: u8 },                       // Membership Query (0x11); v2 payload=8B, v3 payload≥12B
     MembershipReportV3 { groups: Vec<Ipv4Addr> }, // IGMPv3 Report (0x22) — multiple Group Records
     Unknown(u8),
 }

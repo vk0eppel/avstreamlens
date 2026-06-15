@@ -230,7 +230,9 @@ pub fn detect_protocol(eth: &EthernetPacket) -> Option<AvProtocol> {
             crate::protocols::IgmpType::Unknown(0)
         } else {
             match igmp_payload[0] {
-                0x11 => crate::protocols::IgmpType::Query,
+                0x11 => crate::protocols::IgmpType::Query {
+                    version: if igmp_payload.len() >= 12 { 3 } else { 2 },
+                },
                 0x16 => crate::protocols::IgmpType::Join,
                 0x17 => crate::protocols::IgmpType::Leave,
                 0x22 => parse_igmpv3_report(igmp_payload),
@@ -724,7 +726,7 @@ mod tests {
         assert!(
             matches!(
                 proto,
-                Some(AvProtocol::Igmp { igmp_type: crate::protocols::IgmpType::Query, .. })
+                Some(AvProtocol::Igmp { igmp_type: crate::protocols::IgmpType::Query { .. }, .. })
             ),
             "IGMPv3 query with Router Alert (IHL=6) must be detected as a Query"
         );
