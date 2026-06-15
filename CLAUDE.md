@@ -273,3 +273,19 @@ See **[TODO.md](TODO.md)** for the full list. Quick summary:
 | PTP grandmaster changed | −10/domain × changes, capped at 3 |
 | MSRP TalkerFailed (AVB) | −20/failed reservation |
 | EEE active on switch port | −15/port, capped at −30 |
+
+---
+
+## Agent skills
+
+### Issue tracker
+
+Issues live in GitHub Issues for this repo. See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Default label vocabulary (needs-triage, needs-info, ready-for-agent, ready-for-human, wontfix). See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Single-context layout — one `CONTEXT.md` + `docs/adr/` at the repo root. See `docs/agents/domain.md`.
