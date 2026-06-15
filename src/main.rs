@@ -414,6 +414,8 @@ fn emit_periodic_alerts(state: &mut CaptureState, logger: &mut crate::report::Lo
     capture::emit(&state.check_dante_conmon_bridge(), logger);
     capture::emit(&state.check_dante_ip_config(),          logger);
     capture::emit(&state.check_dante_follower_census(),    logger);
+    capture::emit(&state.check_igmp_query_interval(),      logger);
+    capture::emit(&state.check_igmp_multiple_queriers(),   logger);
     capture::emit(&ts_refclk_alerts(state),           logger);
     state.aggregate_ndi_bitrate();
 }

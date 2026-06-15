@@ -507,6 +507,8 @@ pub struct NetworkHealth {
     pub last_igmp_query: Option<Instant>,
     pub igmp_querier_ip: Option<std::net::Ipv4Addr>,
     pub igmp_query_interval_secs: Option<u64>, // computed from last two queries
+    // Set by check_igmp_multiple_queriers when ≥2 distinct querier IPs seen this window.
+    pub multiple_queriers_this_window: bool,
 }
 
 impl NetworkHealth {
@@ -521,6 +523,7 @@ impl NetworkHealth {
             last_igmp_query: None,
             igmp_querier_ip: None,
             igmp_query_interval_secs: None,
+            multiple_queriers_this_window: false,
         }
     }
 
@@ -607,6 +610,9 @@ impl NetworkHealth {
                 Some(t) if t.elapsed().as_secs() > silent_after => score -= 10.0,
                 _ => {}
             }
+        }
+        if self.multiple_queriers_this_window {
+            score -= 15.0;
         }
 
         // ── PTP clock health ──────────────────────────────────────────────────

@@ -130,6 +130,9 @@ pub struct CaptureState {
     // handlers can avoid pushing the same group more than once.
     pub pending_join_groups: Vec<Ipv4Addr>,
     pub joined_multicast:    HashSet<Ipv4Addr>,
+    // Per-window set of source IPs that sent an IGMP General Query.
+    // Reset in reset_window; checked in check_igmp_multiple_queriers before reset.
+    pub igmp_querier_ips_this_window: HashSet<Ipv4Addr>,
     // PTPv1 Delay_Req census: tracks which Dante devices are actively syncing.
     // Key = source IP of a Delay_Req sender; value = last seen Instant.
     // Populated in handle_ptp; pruned in reset_window; compared to dante_sources
@@ -170,6 +173,7 @@ impl CaptureState {
             packets_dispatched: 0,
             pending_join_groups: Vec::new(),
             joined_multicast:    HashSet::new(),
+            igmp_querier_ips_this_window: HashSet::new(),
             ptpv1_followers:     HashMap::new(),
             stream_count_history: Vec::new(),
         }
@@ -224,6 +228,10 @@ impl CaptureState {
         // PTPv1 followers: Delay_Req rate is ~1/s; prune after 15s to survive
         // inter-cycle gaps without false-positive census drops.
         self.ptpv1_followers.retain(|_, t| t.elapsed().as_secs() < 15);
+        // Reset per-window IGMP querier tracking. Must happen AFTER
+        // check_igmp_multiple_queriers() which reads this set.
+        self.igmp_querier_ips_this_window.clear();
+        self.network_health.multiple_queriers_this_window = false;
         // Drop IGMP Join entries from hosts that vanished without sending a Leave.
         self.igmp_joins_seen.retain(|_, t| t.elapsed() < Duration::from_secs(IGMP_JOIN_DEDUP_TTL_SECS));
         // Prune AVDECC entities whose ADP announcement has expired (valid_time + 10s grace).
@@ -677,6 +685,7 @@ impl CaptureState {
                 }
                 self.network_health.last_igmp_query = Some(now);
                 self.network_health.igmp_querier_ip = Some(src);
+                self.igmp_querier_ips_this_window.insert(src);
                 alerts.push(Alert::info(format!("❓ IGMP Query: {} → group {}", src, group)));
             }
             IgmpType::Unknown(t) => {
@@ -734,20 +743,53 @@ impl CaptureState {
 
             if preferred.len() >= 2 {
                 alerts.push(Alert::error(format!(
-                    "❌ Multiple preferred masters in PTP domain {} — {}  — only ONE device should have 'preferred master' enabled",
+                    "❌ Multiple Preferred Leaders in PTP domain {} ({}) — if one device has an external word clock and another is set as Preferred Leader, the word-clock device will lose sync and be muted unless both share the same external reference; disable Preferred Leader on all but one device",
                     ptp.domain,
                     preferred.join(", "),
                 )));
             } else {
                 let all_ips: Vec<_> = senders.keys().map(|ip| ip.to_string()).collect();
                 alerts.push(Alert::warn(format!(
-                    "⚠ Multiple PTP Sync senders in domain {} — {}  — clock election unstable",
+                    "⚠ Multiple PTP Sync senders in domain {} ({}) — possible IGMP snooping partition or 'Sync to External' mismatch; check that only one device is the clock leader",
                     ptp.domain,
                     all_ips.join(", "),
                 )));
             }
         }
         alerts
+    }
+
+    /// Advisory when the IGMP query interval exceeds Audinate's recommended 30s.
+    /// Longer intervals slow multicast convergence after a device join.
+    /// Only fires once the interval has been measured (two consecutive queries seen).
+    pub fn check_igmp_query_interval(&self) -> Vec<Alert> {
+        if let Some(interval) = self.network_health.igmp_query_interval_secs
+            && interval > 60
+        {
+            return vec![Alert::info(format!(
+                "ℹ IGMP query interval {}s — Audinate recommends 30s for Dante networks; longer intervals slow multicast convergence after device join",
+                interval,
+            ))];
+        }
+        vec![]
+    }
+
+    /// Multiple IGMP queriers on the same LAN cause multicast group lists to
+    /// desync across switches, leading to lost PTP/audio traffic.
+    /// Tracked per window in `igmp_querier_ips_this_window`; sets
+    /// `network_health.multiple_queriers_this_window` for score penalty.
+    pub fn check_igmp_multiple_queriers(&mut self) -> Vec<Alert> {
+        let mut sorted: Vec<String> = self.igmp_querier_ips_this_window
+            .iter().map(|ip| ip.to_string()).collect();
+        if sorted.len() < 2 {
+            return vec![];
+        }
+        self.network_health.multiple_queriers_this_window = true;
+        sorted.sort();
+        vec![Alert::error(format!(
+            "❌ Multiple IGMP queriers detected: {} — querier conflict causes multicast group desync; disable querier on all but one switch",
+            sorted.join(", "),
+        ))]
     }
 
     /// Stream-count anomaly detection, called from the periodic report cycle
@@ -878,7 +920,7 @@ impl CaptureState {
 
         let is_link_local = |ip: &Ipv4Addr| {
             let o = ip.octets();
-            o[0] == 169 && o[1] == 254
+            (o[0] == 169 && o[1] == 254) || (o[0] == 172 && o[1] == 31)
         };
 
         let link_local: Vec<Ipv4Addr> = self.dante_sources.iter().filter(|ip| is_link_local(ip)).copied().collect();
@@ -900,7 +942,7 @@ impl CaptureState {
         } else if link_local.len() >= 2 && routable.is_empty() {
             // All link-local — DHCP may be down network-wide.
             alerts.push(Alert::warn(format!(
-                "⚠ All {} Dante devices on link-local (169.254.x.x) — DHCP may be down network-wide",
+                "⚠ All {} Dante devices on link-local (169.254.x.x / 172.31.x.x) — DHCP may be down network-wide",
                 link_local.len(),
             )));
         }
@@ -918,7 +960,7 @@ impl CaptureState {
                     .collect();
                 labels.sort();
                 alerts.push(Alert::warn(format!(
-                    "⚠ Dante devices span {} subnets ({}) — cross-subnet subscriptions require routing",
+                    "⚠ Dante devices span {} subnets ({}) — mDNS discovery and PTP sync are multicast-only and cannot cross subnet boundaries; use Dante Domain Manager (DDM) or Dante Director for cross-subnet operation",
                     subnets.len(), labels.join(", "),
                 )));
             }
@@ -1490,6 +1532,89 @@ mod tests {
         assert!(alerts[0].message.contains("2 subnets"));
         assert!(alerts[0].message.contains("192.168.1.0/24"));
         assert!(alerts[0].message.contains("10.0.0.0/24"));
+    }
+
+    #[test]
+    fn ip_config_172_31_treated_as_link_local() {
+        let mut state = CaptureState::new();
+        state.dante_sources.insert(Ipv4Addr::new(172, 31, 0, 1));
+        state.dante_sources.insert(Ipv4Addr::new(172, 31, 0, 2));
+        let alerts = state.check_dante_ip_config();
+        assert_eq!(alerts.len(), 1);
+        assert!(matches!(alerts[0].level, AlertLevel::Warn));
+    }
+
+    #[test]
+    fn ip_config_172_31_mixed_with_routable_errors() {
+        let mut state = CaptureState::new();
+        let ll = Ipv4Addr::new(172, 31, 0, 5);
+        state.dante_sources.insert(ll);
+        state.dante_sources.insert(Ipv4Addr::new(192, 168, 1, 10));
+        let alerts = state.check_dante_ip_config();
+        assert_eq!(alerts.len(), 1);
+        assert!(matches!(alerts[0].level, AlertLevel::Error));
+        assert!(alerts[0].message.contains("172.31.0.5"));
+    }
+
+    #[test]
+    fn ip_config_subnet_split_warns_ddm() {
+        let mut state = CaptureState::new();
+        state.dante_sources.insert(Ipv4Addr::new(192, 168, 1, 10));
+        state.dante_sources.insert(Ipv4Addr::new(10, 0, 0, 5));
+        let alerts = state.check_dante_ip_config();
+        assert!(alerts[0].message.contains("Domain Manager"));
+    }
+
+    // ── IGMP interval advisory and multiple-querier detection ────────────────
+
+    #[test]
+    fn igmp_query_interval_advisory_fires_above_60s() {
+        let mut state = CaptureState::new();
+        state.network_health.igmp_query_interval_secs = Some(125);
+        let alerts = state.check_igmp_query_interval();
+        assert_eq!(alerts.len(), 1);
+        assert!(alerts[0].message.contains("125s"));
+        assert!(alerts[0].message.contains("30s"));
+    }
+
+    #[test]
+    fn igmp_query_interval_advisory_silent_at_30s() {
+        let mut state = CaptureState::new();
+        state.network_health.igmp_query_interval_secs = Some(30);
+        assert!(state.check_igmp_query_interval().is_empty());
+    }
+
+    #[test]
+    fn igmp_multiple_queriers_fires_error_and_sets_flag() {
+        let mut state = CaptureState::new();
+        state.igmp_querier_ips_this_window.insert(Ipv4Addr::new(10, 0, 0, 1));
+        state.igmp_querier_ips_this_window.insert(Ipv4Addr::new(10, 0, 0, 2));
+        let alerts = state.check_igmp_multiple_queriers();
+        assert_eq!(alerts.len(), 1);
+        assert!(matches!(alerts[0].level, AlertLevel::Error));
+        assert!(alerts[0].message.contains("10.0.0.1"));
+        assert!(alerts[0].message.contains("10.0.0.2"));
+        assert!(state.network_health.multiple_queriers_this_window);
+    }
+
+    #[test]
+    fn igmp_single_querier_no_alert() {
+        let mut state = CaptureState::new();
+        state.igmp_querier_ips_this_window.insert(Ipv4Addr::new(10, 0, 0, 1));
+        assert!(state.check_igmp_multiple_queriers().is_empty());
+        assert!(!state.network_health.multiple_queriers_this_window);
+    }
+
+    #[test]
+    fn igmp_multiple_querier_flag_clears_on_reset_window() {
+        let mut state = CaptureState::new();
+        state.igmp_querier_ips_this_window.insert(Ipv4Addr::new(10, 0, 0, 1));
+        state.igmp_querier_ips_this_window.insert(Ipv4Addr::new(10, 0, 0, 2));
+        state.check_igmp_multiple_queriers();
+        assert!(state.network_health.multiple_queriers_this_window);
+        state.reset_window();
+        assert!(!state.network_health.multiple_queriers_this_window);
+        assert!(state.igmp_querier_ips_this_window.is_empty());
     }
 
     // ── Dante PTPv1 follower census ──────────────────────────────────────────
@@ -2084,7 +2209,6 @@ mod tests {
     #[test]
     fn single_ptp_sync_sender_no_conflict_alert() {
         let mut state = CaptureState::new();
-        let kind = Some("PTPv1".to_string());
         let info = ptpv1_sync(Ipv4Addr::new(192, 168, 1, 10), 0, 0);
         state.handle_ptp(info);
         let alerts = state.check_ptp_sync_conflict();
@@ -2094,14 +2218,13 @@ mod tests {
     #[test]
     fn two_ptpv1_sync_senders_emits_warn() {
         let mut state = CaptureState::new();
-        let kind = Some("PTPv1".to_string());
         // Two devices, stratum 1 each — competing but neither is "preferred master"
         state.handle_ptp(ptpv1_sync(Ipv4Addr::new(192, 168, 1, 10), 1, 0));
         state.handle_ptp(ptpv1_sync(Ipv4Addr::new(192, 168, 1, 20), 1, 0));
         let alerts = state.check_ptp_sync_conflict();
         assert_eq!(alerts.len(), 1);
         assert_eq!(alerts[0].level, AlertLevel::Warn);
-        assert!(alerts[0].message.contains("Multiple PTP Sync senders"));
+        assert!(alerts[0].message.contains("Multiple PTP Sync senders in domain"));
     }
 
     #[test]
@@ -2113,7 +2236,7 @@ mod tests {
         let alerts = state.check_ptp_sync_conflict();
         assert_eq!(alerts.len(), 1);
         assert_eq!(alerts[0].level, AlertLevel::Error);
-        assert!(alerts[0].message.contains("Multiple preferred masters"));
+        assert!(alerts[0].message.contains("Multiple Preferred Leaders"));
     }
 
     #[test]
