@@ -122,7 +122,7 @@ See **[TODO.md](TODO.md)** for the full list. Quick summary:
 - **Detection**: `is_aes67_multicast(dst_ip)` after RTP version check
 - **Clock**: PTPv2 via UDP ports 319/320; ts-refclk cross-check validates SDP-claimed grandmaster against wire
 - **Health metrics**: loss (RFC 3550 seq, signed-delta — negative delta = reorder, counted separately in `reorders_this_window`, not added to loss), jitter (RFC 3550 EWMA, sign-preserving), SSRC changes, TS discontinuities, signal gaps, payload type validation, DSCP EF(46) per-stream, 802.1p PCP=6 advisory (warn only, no score penalty); reorder alert fires when `reorders_this_window / total_packets > 1%`
-- `clock_hz_confirmed` gates TS discontinuity detection — set at stream creation if SDP found, or retroactively when SAP arrives
+- `clock_hz_confirmed` gates TS discontinuity detection — set (1) at stream creation if SDP found, (2) retroactively when SAP arrives, or (3) automatically inferred from consecutive RTP timestamp deltas: `StreamStats::try_infer_clock_hz()` collects 8 positive deltas in `ts_delta_samples: Vec<i64>`, takes the mode, and matches against a priority-ordered table of known (clock_hz, ptime_ms) pairs (48 kHz first: Δ6/12/24/48/96/192/384/480/960; then 44.1 kHz: Δ441/882). Sets `clock_hz`, `ptime_ms`, `clock_hz_confirmed` on match. Stops accumulating once confirmed; SDP always takes precedence
 - `expected_pt` from SDP `a=rtpmap`; `pt_mismatches` counts mismatches per packet within the 5s window
 - Signal gap: `gap_events` fires when IAT > 50ms; alert requires **≥2 events per 5s window** (single spike = pcap scheduling noise); `max_iat_ms` tracks worst case; both reset per 5s window
 - PTP correction field stored as `last_offset_ns` (nanoseconds, after ÷65536); alert if abs > 1µs
@@ -169,7 +169,7 @@ See **[TODO.md](TODO.md)** for the full list. Quick summary:
 - **AVTP**: `avtp_streams: HashMap<[u8;8], AvtpStreamStats>` per stream_id (sv=1, bytes 4–11); subtype decoded via `avtp_subtype_name()` (0x00=IEC 61883, 0x02=CRF, 0x7E=MAAP…); sequence loss via `AvtpStreamStats::update_seq()` on byte 2 counter (8-bit wrap-safe, signed-i8 reorder filter mirrors the RTP fix); bitrate from Ethernet frame sizes
 - **MSRP**: `parse_msrp()` extracts TalkerAdvertise (bandwidth, VLAN, priority), TalkerFailed (failure code at `first_value[33]`), Listener state; `msrp_state: HashMap<[u8;8], MsrpDeclaration>`; TalkerFailed alert immediate, decoded via `protocols::msrp_failure_reason()` over the full 802.1Qat Table 35-6 set (1–19, e.g. 8 = egress port not AVB-capable) with a numeric fallback — always shows `(code N: reason)`
 - **MVRP**: `parse_mvrp()` extracts VLAN IDs; `mvrp_vlans: HashSet<u16>` — presence confirms L2 VLAN QoS; alert if AVTP active but no MVRP
-- **PCP (802.1p)**: mandatory per IEEE 802.1BA — AVTP streams must use PCP=3 (SR Class A) or PCP=2 (SR Class B). Wrong PCP means the Credit-Based Shaper assigns traffic to the wrong queue, breaking deterministic latency. Penalty: −15/stream (same as TCP Critical). PCP is read from the outermost VLAN tag; untagged frames produce no alert (AVB requires 802.1Q by spec, so absence of a tag is itself a misconfiguration, but reported separately via the MVRP check)
+- **PCP (802.1p)**: IEEE 802.1BA does not mandate specific PCP values in data frames — the authoritative source is the MSRP TalkerAdvertise `priority` field (already parsed, `first_value[20] >> 5`), which declares the PCP value the talker will use. The switch configures the CBS shaper from that reservation. The correct check is therefore: **observed frame PCP ≠ MSRP-declared priority for that stream_id** → the frame lands in the wrong queue, CBS doesn't protect it. Without a TalkerAdvertise in `msrp_state` for the stream, the expected PCP is unknown and no check fires. Penalty: −15/stream. PCP read from outermost VLAN tag; untagged frames produce no alert
 - `avtp_streams` pruned per cycle; `msrp_state` pruned to match surviving `avtp_streams` entries; `mvrp_vlans` cleared when `avtp_streams` is empty (MVRP is periodic — the switch re-registers within seconds when AVB resumes)
 
 ### mDNS name extraction (shared)
@@ -189,7 +189,7 @@ See **[TODO.md](TODO.md)** for the full list. Quick summary:
 - gPTP display: ✓ grandmaster from Announce, ○ clock source EUI-64 (`last_clock_id`, set from any PTPv2 message), ❌ no traffic. The ○ line distinguishes `seen_sync` (a real Sync 0x00 arrived → "Sync seen, no Announce") from a Pdelay-only endpoint (only P_Delay_Req 0x02 → "peer-delay requests only — link partner may not be gPTP-capable") — the latter, with no Pdelay_Resp, fingerprints a non-AVB switch port
 - Clock quality formatted at parse time: PTPv2 class → `ptp_class_str()` (6=locked, 7=free-running, 135=holdover, 165=default, 187/255=slave-only) + `ptp_accuracy_str()` (e.g. 0x20=< 100ns); PTPv1 stratum + ident (GPS, ATOM…)
 - Correction field stored as nanoseconds (`÷ 65536`); shown in Clock Sources if non-zero; alert if abs > 1µs
-- **Path-delay tracking**: `min_path_delay_ns` / `max_path_delay_ns` recorded from every `Delay_Resp` (0x09) and `P_Delay_Resp` (0x03); reset on grandmaster change so the spread reflects the current clock. Reported as `path delay: 500ns – 1.2µs (spread 700ns)`. Alerts: spread > 10µs → "unstable link (EEE, half-duplex, or cable)"; absolute > 1ms → "too many hops between this node and grandmaster"
+- **Path-delay tracking**: `min_path_delay_ns` / `max_path_delay_ns` recorded from every `Delay_Resp` (0x09) and `P_Delay_Resp` (0x03); reset on grandmaster change so the spread reflects the current clock. Reported as `path delay: 500ns – 1.2µs (spread 700ns)  ~N hops` where `N = min_path_delay_ns / 5_000` (rough: 5µs per gigabit switch), suppressed at N=0. Alerts: spread > 10µs → "unstable link (EEE, half-duplex, or cable)"; absolute > 1ms → "too many hops between this node and grandmaster". **Dante latency advisory** (PTPv1 only, N ≥ 3): `ℹ N hops: Dante latency should be ≥ Xms` using Audinate's published minimums — N 3–4 → 0.5ms, N 5–9 → 2ms, N ≥ 10 → 5ms
 - `ts-refclk` cross-check: every 5s, `parse_ts_refclk()` extracts claimed grandmaster EUI-64+domain from SDP and compares against active `ptp_domains`
 
 ### SAP / SDP
@@ -226,6 +226,7 @@ See **[TODO.md](TODO.md)** for the full list. Quick summary:
   4. `🕐 Clock Sources:` — PTP domains (conditional)
   5. `🔬 Network Health — X%:` — health score + QoS/DSCP + IGMP querier + EEE
 - Stream entry format: `  ▸ Protocol  "Name"  [codec]  —  IP:port` / `    metrics line` / `    ⚠  alerts`
+  - Protocol label: ST2110 subtypes shown as `ST2110-20` etc.; AES67 streams whose `src_ip` is in `dante_sources` shown as `AES67 (Dante: "Name")` or `AES67 (Dante)` — identifies Dante devices operating in AES67 mode
   - RTP streams (AES67/Dante/ST2110): metrics = `loss: X%  |  jitter: X ms  |  X Mbps`
   - NDI: metrics = `quality  |  X Mbps  |  retrans: N` (TCP quality, no RTP metrics)
   - AVB: metrics = `loss: X%  |  X Mbps` + MSRP/VLAN reservation state inline
@@ -235,7 +236,7 @@ See **[TODO.md](TODO.md)** for the full list. Quick summary:
   - Dante hardware: EF (46) for audio/PTP; CS7 (56) for time-critical PTP events. DSCP=0 → `⚠ Likely Dante Virtual Soundcard` (software Dante intentionally sends Best Effort). `observed_dscp: Option<u8>` on `StreamStats` (set once, never reset) distinguishes DVS (0) from misconfigured hardware (wrong non-zero value)
   - NDI / AVB: no DSCP check (TCP / Layer 2)
 - PCP (802.1p): validated per stream when the frame carries a VLAN tag; outermost tag used for QinQ
-  - AVB: PCP=3 required for SR Class A, PCP=2 for SR Class B — mandatory per IEEE 802.1BA; wrong value breaks CBS shaper queue assignment; penalty −15/stream
+  - AVB: observed PCP compared against MSRP TalkerAdvertise `priority` for the same stream_id — mismatch means the frame lands in the wrong CBS queue; penalty −15/stream. No hardcoded expected value; no alert when no MSRP reservation is known for the stream
   - AES67 / ST2110: PCP=6 expected — advisory only; warn alert, no score penalty
   - Dante / NDI: no PCP check
 - ECN congestion marks: penalise score (−2 each, capped −20) **and** shown as `⚠  ECN: N congestion mark(s)` in Network Health section
@@ -263,8 +264,8 @@ See **[TODO.md](TODO.md)** for the full list. Quick summary:
 | TCP Terminated | −25/stream |
 | TCP retransmissions | −0.5 each, capped at −10 |
 | DSCP wrong (per stream with violations) | −5/stream, capped at −20 |
-| AVB wrong PCP (per stream) | −15/stream |
-| AES67 / ST2110 wrong PCP | no score penalty (warn only) |
+| AVB PCP ≠ MSRP-declared priority (per stream) | −15/stream |
+| AES67 / ST2110 wrong PCP (≠ 6) | no score penalty (warn only) |
 | ECN congestion marks | −2 each, capped at −20 |
 | IGMP querier absent (multicast active) | −10 |
 | PTP clock confirmed lost | −25/domain |

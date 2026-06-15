@@ -10,9 +10,9 @@ AVStreamLens reads the network passively using pcap, identifies streams and cloc
 
 | Protocol | Transport | What is monitored |
 |---|---|---|
-| **AES67** | UDP multicast (239.69.*) | Loss, jitter, SSRC changes, timing discontinuities, payload type, signal gap detection, PTPv2 clock, ts-refclk validation, DSCP |
+| **AES67** | UDP multicast (239.69.*) | Loss, jitter, SSRC changes, timing discontinuities, payload type, signal gap detection, PTPv2 clock, ts-refclk validation, DSCP; streams from a known Dante device labelled `AES67 (Dante: "Name")` |
 | **SMPTE ST 2110** | UDP multicast (239.x.x.x) | Video (2110-20), audio (2110-30), ancillary (2110-40) — same RTP metrics as AES67; video clock rate confirmed without SDP |
-| **Dante** | UDP unicast or multicast / mDNS / ConMon | Device names from mDNS, live-device detection + channel count from ConMon multicast (no SPAN needed), audio stream metrics (RTP, or presence/bitrate for ATP-framed flows), signal gap detection, DSCP (flags Dante Virtual Soundcard via DSCP=0), PTPv1 clock |
+| **Dante** | UDP unicast or multicast / mDNS / ConMon | Device names from mDNS, live-device detection + channel count from ConMon multicast (no SPAN needed), audio stream metrics (RTP, or presence/bitrate for ATP-framed flows), signal gap detection, DSCP (flags Dante Virtual Soundcard via DSCP=0), PTPv1 clock; Dante devices in AES67 mode appear in the AES67 section with a `(Dante)` tag |
 | **NDI** | TCP (dynamic ports) | Source names from mDNS, bitrate, TCP quality, retransmissions, RST/FIN |
 | **AVB / IEEE 802.1** | L2 Ethernet | gPTP grandmaster (802.1AS), MSRP bandwidth reservations (802.1Qat), MVRP VLAN registrations (802.1Q), AVTP stream IDs, AVDECC entity discovery (IEEE 1722.1) |
 
@@ -324,6 +324,8 @@ This distinguishes "wrong interface / nothing here" from "the devices are presen
 - `⚠  Large PTP correction field — transparent clock or path issue`
 - `⚠  PTP path-delay variance > 10µs — unstable link (EEE, half-duplex, or cable)`
 - `⚠  PTP path delay > 1ms — too many hops between this node and grandmaster`
+- `    path delay: 14.2µs – 15.1µs  (spread 0.9µs)  ~3 hops` — rough hop count (5µs per switch) shown inline on the path delay line
+- `ℹ  3 hops: Dante latency should be ≥ 0.5ms` — Dante-only advisory when hop count suggests the configured latency may be too low (Audinate minimums: 3–4 hops → 0.5ms, 5–9 hops → 2ms, ≥10 hops → 5ms)
 
 *Network infrastructure:*
 - `⚠  Stream count spike: N streams (avg last 3 windows: M) — possible runaway multicast flood`

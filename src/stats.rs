@@ -72,6 +72,9 @@ pub struct StreamStats {
     // Used for Dante routing detection: Dante is L2-only, so any TTL < 64 means
     // a router decremented it — a misconfiguration that should alert the engineer.
     pub min_ttl:                        Option<u8>,
+    // Scratch buffer for clock-rate inference from RTP timestamp deltas.
+    // Cleared once clock_hz_confirmed is set; empty thereafter.
+    pub ts_delta_samples:               Vec<i64>,
 }
 
 impl StreamStats {
@@ -115,6 +118,7 @@ impl StreamStats {
             reorders_this_window:           0,
             rtp_seen:                       false,
             min_ttl:                        None,
+            ts_delta_samples:               Vec::new(),
         }
     }
     // Constructor with enhanced info — useful when SDP is available at stream start
@@ -175,6 +179,23 @@ impl StreamStats {
             self.last_ts_diff = Some(actual_diff);
         }
 
+        // ── Clock-rate inference from RTP timestamp delta ─────────
+        // Collects consecutive positive deltas until we accumulate enough to take
+        // a mode and match against known (clock_hz, ptime_ms) pairs. Stops once
+        // clock_hz_confirmed is set (either by SDP or by this inference).
+        if !self.clock_hz_confirmed
+            && let Some(last_ts) = self.last_rtp_ts
+        {
+            let delta = rtp_ts.wrapping_sub(last_ts) as i32 as i64;
+            if delta > 0 {
+                self.ts_delta_samples.push(delta);
+                if self.ts_delta_samples.len() >= 8 {
+                    self.try_infer_clock_hz();
+                    self.ts_delta_samples.clear();
+                }
+            }
+        }
+
         // ── RFC 3550 §6.4.1 Jitter + IAT burst detection ──────────
         let now = Instant::now();
 
@@ -229,6 +250,48 @@ impl StreamStats {
             self.bytes_at_check   = self.bytes_total;
             self.packets_at_check = self.packets;
             self.last_bitrate_check = now;
+        }
+    }
+
+    fn try_infer_clock_hz(&mut self) {
+        // Known (clock_hz, ptime_ms) pairs that produce integer RTP timestamp
+        // deltas. 48 kHz is checked first — it is the dominant rate on AES67 and
+        // Dante networks and shares delta values with 96 kHz at the same ptimes.
+        const KNOWN: &[(f64, f64)] = &[
+            (48000.0, 1.0),   // Δ 48  — most common AES67 / Dante
+            (48000.0, 0.5),   // Δ 24
+            (48000.0, 2.0),   // Δ 96
+            (48000.0, 4.0),   // Δ 192
+            (48000.0, 8.0),   // Δ 384
+            (48000.0, 10.0),  // Δ 480
+            (48000.0, 20.0),  // Δ 960
+            (48000.0, 0.25),  // Δ 12
+            (48000.0, 0.125), // Δ 6
+            (44100.0, 10.0),  // Δ 441
+            (44100.0, 20.0),  // Δ 882
+        ];
+
+        let mut sorted = self.ts_delta_samples.clone();
+        sorted.sort_unstable();
+
+        let mut best = sorted[0];
+        let mut best_count = 1usize;
+        let mut cur = sorted[0];
+        let mut cur_count = 1usize;
+        for &v in sorted.iter().skip(1) {
+            if v == cur { cur_count += 1; } else { cur = v; cur_count = 1; }
+            if cur_count > best_count { best = cur; best_count = cur_count; }
+        }
+        let mode = best;
+
+        for &(hz, ptime) in KNOWN {
+            let expected = (hz * ptime / 1000.0).round() as i64;
+            if expected == mode {
+                self.clock_hz = hz;
+                self.ptime_ms = ptime;
+                self.clock_hz_confirmed = true;
+                return;
+            }
         }
     }
 
@@ -887,6 +950,78 @@ mod tests {
         s.update(1, 48, 0xAAAA, 100);
         s.update(2, 96, 0xAAAA, 100);
         assert_eq!(s.ssrc_changes, 0);
+    }
+
+    // ── clock-rate inference ─────────────────────────────────────────────────
+
+    #[test]
+    fn clock_rate_inferred_48k_1ms() {
+        let mut s = aes67();
+        assert!(!s.clock_hz_confirmed);
+        // 9 packets: first establishes baseline, next 8 produce deltas of 48
+        for i in 0..9u16 {
+            s.update(i, i as u32 * 48, 1, 100);
+        }
+        assert!(s.clock_hz_confirmed, "should confirm 48 kHz from delta=48");
+        assert!((s.clock_hz - 48000.0).abs() < 1.0);
+        assert!((s.ptime_ms - 1.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn clock_rate_inferred_48k_4ms() {
+        let mut s = aes67();
+        for i in 0..9u16 {
+            s.update(i, i as u32 * 192, 1, 100);
+        }
+        assert!(s.clock_hz_confirmed);
+        assert!((s.clock_hz - 48000.0).abs() < 1.0);
+        assert!((s.ptime_ms - 4.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn clock_rate_inferred_44k1_10ms() {
+        let mut s = aes67();
+        for i in 0..9u16 {
+            s.update(i, i as u32 * 441, 1, 100);
+        }
+        assert!(s.clock_hz_confirmed);
+        assert!((s.clock_hz - 44100.0).abs() < 1.0);
+        assert!((s.ptime_ms - 10.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn clock_rate_not_inferred_from_unknown_delta() {
+        let mut s = aes67();
+        for i in 0..9u16 {
+            s.update(i, i as u32 * 100, 1, 100); // 100 doesn't match any known pair
+        }
+        assert!(!s.clock_hz_confirmed, "should not confirm on unrecognised delta");
+    }
+
+    #[test]
+    fn clock_rate_inferred_despite_one_noisy_sample() {
+        let mut s = aes67();
+        // 7 normal packets (delta=48), then 1 late arrival (delta=96), then normal again
+        let ts_sequence = [0u32, 48, 96, 144, 192, 240, 288, 384, 432];
+        for (i, &ts) in ts_sequence.iter().enumerate() {
+            s.update(i as u16, ts, 1, 100);
+        }
+        // deltas collected: 48,48,48,48,48,48,96,48 → mode=48 → 48 kHz
+        assert!(s.clock_hz_confirmed);
+        assert!((s.clock_hz - 48000.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn clock_rate_inference_stops_after_sdp_confirms() {
+        let mut s = aes67();
+        s.clock_hz = 96000.0;
+        s.ptime_ms = 1.0;
+        s.clock_hz_confirmed = true; // SDP set this
+        // Feed packets that would infer 48 kHz — inference should not run
+        for i in 0..9u16 {
+            s.update(i, i as u32 * 48, 1, 100);
+        }
+        assert!((s.clock_hz - 96000.0).abs() < 1.0, "SDP value should be preserved");
     }
 
     // ── loss_pct ─────────────────────────────────────────────────────────────

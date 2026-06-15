@@ -359,9 +359,17 @@ pub fn print_report(
         // AVB aggregate entries are superseded by per-AVTP-stream rendering below
         if s.protocol == "AVB" || s.protocol.starts_with("AVB ") { continue; }
 
-        // Protocol label: prefix ST2110 subtypes clearly
+        // Protocol label: prefix ST2110 subtypes clearly; tag AES67 streams whose
+        // source IP is a known Dante device (AES67-mode Dante).
         let proto_label = if s.protocol.starts_with("2110-") {
             format!("ST{}", s.protocol)
+        } else if s.protocol == "AES67"
+            && s.src_ip.map(|ip| dante_sources.contains(&ip)).unwrap_or(false)
+        {
+            s.src_ip
+                .and_then(|ip| dante_names.get(&ip))
+                .map(|n| format!("AES67 (Dante: \"{}\")", n))
+                .unwrap_or_else(|| "AES67 (Dante)".to_string())
         } else {
             s.protocol.clone()
         };
@@ -638,7 +646,7 @@ pub fn print_report(
 
         let multi_domain = ptp_domains.len() > 1;
 
-        for ((domain, _version), stats) in ptp_domains.iter() {
+        for ((domain, version), stats) in ptp_domains.iter() {
             let gm_icon = if stats.clock_valid { "✓" } else if stats.last_grandmaster.is_some() { "⚠" } else { "❌" };
 
             // Primary label: protocol association (Dante, AES67/ST2110, AVB, …)
@@ -737,10 +745,13 @@ pub fn print_report(
                 } else {
                     format!("{}ns", ns)
                 };
+                // Rough hop estimate: ~5µs per gigabit switch.
+                let hops = (min / 5_000).max(0) as u32;
+                let hops_str = if hops > 0 { format!("  ~{} hop{}", hops, if hops == 1 { "" } else { "s" }) } else { String::new() };
                 let line = if min == max {
-                    format!("    path delay: {}", fmt(max))
+                    format!("    path delay: {}{}", fmt(max), hops_str)
                 } else {
-                    format!("    path delay: {} – {}  (spread {})", fmt(min), fmt(max), fmt(spread_ns))
+                    format!("    path delay: {} – {}  (spread {}){}", fmt(min), fmt(max), fmt(spread_ns), hops_str)
                 };
                 logger.log(&line);
                 println!("{}", line);
@@ -753,6 +764,13 @@ pub fn print_report(
                     let alert = "    ⚠  PTP path delay > 1ms — too many hops between this node and grandmaster";
                     logger.log(alert);
                     println!("{}", ansi("33", alert));
+                }
+                // Dante-specific latency advisory: Audinate's recommended minimums by hop count.
+                if *version == PTP_VERSION_V1 && hops >= 3 {
+                    let min_latency = if hops >= 10 { "5ms" } else if hops >= 5 { "2ms" } else { "0.5ms" };
+                    let advisory = format!("    ℹ  {} hops: Dante latency should be ≥ {}", hops, min_latency);
+                    logger.log(&advisory);
+                    println!("{}", advisory);
                 }
             }
 
