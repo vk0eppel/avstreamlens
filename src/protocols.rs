@@ -54,7 +54,7 @@ pub enum AvProtocol {
     Sap    { src: Ipv4Addr, sdp: SdpSession },
     AvdeccAdp(AvdeccAdp),
     Ptp    { info: PtpInfo },
-    Igmp   { src: Ipv4Addr, group: Ipv4Addr, igmp_type: IgmpType },
+    Igmp   { src: Ipv4Addr, src_mac: [u8; 6], group: Ipv4Addr, igmp_type: IgmpType },
     LldpEee { chassis_id: String, port_id: String, tx_wake_us: u16, rx_wake_us: u16 },
     FlowControl { kind: FlowControlKind },
 }

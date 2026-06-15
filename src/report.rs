@@ -826,7 +826,11 @@ pub fn print_report(
                 let ip_str = health.igmp_querier_ip
                     .map(|ip| format!(" {}", ip))
                     .unwrap_or_default();
-                format!("IGMP: ✓ querier{} {}s ago{}", ip_str, secs, interval_str)
+                let mac_str = health.igmp_querier_mac
+                    .map(|m| format!(" [{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}]",
+                        m[0], m[1], m[2], m[3], m[4], m[5]))
+                    .unwrap_or_default();
+                format!("IGMP: ✓ querier{}{} {}s ago{}", ip_str, mac_str, secs, interval_str)
             }
         }
     };

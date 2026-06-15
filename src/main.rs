@@ -199,6 +199,9 @@ fn main() {
         send_mdns_startup_probe(iface_ip, &expanded_protocols, &mut logger);
 
         let mut state = CaptureState::new();
+        state.local_ips = device.addresses.iter()
+            .filter_map(|a| if let std::net::IpAddr::V4(v4) = a.addr { Some(v4) } else { None })
+            .collect();
         run_loop(&mut cap, &mut state, Some(LiveConfig {
                      iface_ip, ndi_selected, duration_secs,
                      mc_sockets: &mut mc_sockets, mc_joined: &mut mc_joined,

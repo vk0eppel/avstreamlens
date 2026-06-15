@@ -224,6 +224,8 @@ pub fn detect_protocol(eth: &EthernetPacket) -> Option<AvProtocol> {
         && ip.get_next_level_protocol().0 == crate::protocols::IP_PROTO_IGMP
     {
         let src = ip.get_source();
+        let m = eth.get_source();
+        let src_mac = [m.0, m.1, m.2, m.3, m.4, m.5];
         let group = ip.get_destination();
         let igmp_payload = ip.payload();
         let igmp_type = if igmp_payload.is_empty() {
@@ -239,7 +241,7 @@ pub fn detect_protocol(eth: &EthernetPacket) -> Option<AvProtocol> {
                 t    => crate::protocols::IgmpType::Unknown(t),
             }
         };
-        return Some(AvProtocol::Igmp { src, group, igmp_type });
+        return Some(AvProtocol::Igmp { src, src_mac, group, igmp_type });
     }
 
     // Try to extract IPv4/UDP layers

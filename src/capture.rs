@@ -152,6 +152,9 @@ pub struct CaptureState {
     // each 5s window, used to detect sudden flood-style anomalies. Capped at 3
     // entries; the oldest is dropped when a fourth would be added.
     stream_count_history: Vec<usize>,
+    // IPv4 addresses of the capture interface itself — excluded from device
+    // discovery so the tool doesn't report itself as a Dante/NDI device.
+    pub local_ips: HashSet<Ipv4Addr>,
 }
 
 impl Default for CaptureState {
@@ -190,6 +193,7 @@ impl CaptureState {
             multicast_bytes_this_window: 0,
             ptpv1_followers:     HashMap::new(),
             stream_count_history: Vec::new(),
+            local_ips:           HashSet::new(),
         }
     }
 
@@ -502,6 +506,7 @@ impl CaptureState {
     pub fn handle_dante(&mut self, kind: DanteKind, src: Ipv4Addr, dst: Ipv4Addr, dst_port: u16, l2_payload: &[u8], now: Instant) -> Vec<Alert> {
         match kind {
             DanteKind::Discovery { device_name } => {
+                if self.local_ips.contains(&src) { return vec![]; }
                 let is_new = !self.dante_sources.contains(&src);
                 self.dante_sources.insert(src);
                 if let Some(ref name) = device_name {
@@ -525,6 +530,7 @@ impl CaptureState {
             }
             DanteKind::Control => vec![],
             DanteKind::ConMon { device_mac, channels } => {
+                if self.local_ips.contains(&src) { return vec![]; }
                 let _is_new = !self.dante_conmon.contains_key(&src);
                 let entry = self.dante_conmon.entry(src).or_insert_with(|| ConmonDevice {
                     mac: device_mac, channels: None, packets: 0, last_seen: now,
@@ -579,6 +585,7 @@ impl CaptureState {
 
     /// NDI mDNS discovery — registers the source IP and emits a discovery line.
     pub fn handle_ndi_discovery(&mut self, src: Ipv4Addr, source_name: Option<String>) -> Vec<Alert> {
+        if self.local_ips.contains(&src) { return vec![]; }
         self.ndi_sources.insert(src);
         if let Some(ref name) = source_name {
             self.ndi_names.insert(src, name.clone());
@@ -667,7 +674,7 @@ impl CaptureState {
     }
 
     /// IGMP: Join (deduped), Leave, Query (tracks interval), Unknown.
-    pub fn handle_igmp(&mut self, src: Ipv4Addr, group: Ipv4Addr, igmp_type: IgmpType, now: Instant) -> Vec<Alert> {
+    pub fn handle_igmp(&mut self, src: Ipv4Addr, src_mac: [u8; 6], group: Ipv4Addr, igmp_type: IgmpType, now: Instant) -> Vec<Alert> {
         let mut alerts = Vec::new();
         match igmp_type {
             IgmpType::Join => {
@@ -702,6 +709,7 @@ impl CaptureState {
                 }
                 self.network_health.last_igmp_query = Some(now);
                 self.network_health.igmp_querier_ip = Some(src);
+                self.network_health.igmp_querier_mac = Some(src_mac);
                 self.igmp_querier_ips_this_window.insert(src);
                 // Track querier version for v2/v3 mismatch detection.
                 self.igmp_querier_version = Some(version);
@@ -1163,8 +1171,8 @@ pub fn dispatch(
         AvProtocol::LldpEee { chassis_id, port_id, tx_wake_us, rx_wake_us } => {
             state.handle_lldp_eee(chassis_id, port_id, tx_wake_us, rx_wake_us)
         }
-        AvProtocol::Igmp { src, group, igmp_type } => {
-            state.handle_igmp(src, group, igmp_type, now)
+        AvProtocol::Igmp { src, src_mac, group, igmp_type } => {
+            state.handle_igmp(src, src_mac, group, igmp_type, now)
         }
         AvProtocol::FlowControl { kind } => {
             state.handle_flow_control(kind);
@@ -1934,8 +1942,8 @@ mod tests {
         let mut state = CaptureState::new();
         let src   = Ipv4Addr::new(192, 168, 1, 10);
         let group = Ipv4Addr::new(239, 69, 0, 1);
-        let a1 = state.handle_igmp(src, group, IgmpType::Join, Instant::now());
-        let a2 = state.handle_igmp(src, group, IgmpType::Join, Instant::now());
+        let a1 = state.handle_igmp(src, [0u8; 6], group, IgmpType::Join, Instant::now());
+        let a2 = state.handle_igmp(src, [0u8; 6], group, IgmpType::Join, Instant::now());
         assert_eq!(a1.len(), 1, "first Join emits");
         assert_eq!(a2.len(), 0, "second Join is deduped");
     }
@@ -1945,9 +1953,9 @@ mod tests {
         let mut state = CaptureState::new();
         let src   = Ipv4Addr::new(192, 168, 1, 10);
         let group = Ipv4Addr::new(239, 69, 0, 1);
-        state.handle_igmp(src, group, IgmpType::Join,  Instant::now());
-        state.handle_igmp(src, group, IgmpType::Leave, Instant::now());
-        let a3 = state.handle_igmp(src, group, IgmpType::Join, Instant::now());
+        state.handle_igmp(src, [0u8; 6], group, IgmpType::Join,  Instant::now());
+        state.handle_igmp(src, [0u8; 6], group, IgmpType::Leave, Instant::now());
+        let a3 = state.handle_igmp(src, [0u8; 6], group, IgmpType::Join, Instant::now());
         assert_eq!(a3.len(), 1, "Join after Leave is no longer deduped");
     }
 
