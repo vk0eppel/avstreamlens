@@ -287,7 +287,7 @@ Choose the protocols to monitor:
   ✓  AVB  —  grandmaster 00:1a:e5:ff:fe:ab:cd:ef
 
 🔬 Network Health — 97%:
-   QoS: ✓ all streams correctly marked  |  IGMP: ✓ querier 192.168.1.1 42s ago  (interval 125s)
+   QoS: ✓ all streams correctly marked  |  IGMP: ✓ querier 192.168.1.1 [d0:69:9e:10:10:e4] 42s ago  (interval 125s)
    ⚠  EEE active on 1 switch port(s) — may cause audio/video glitches
       port "Gi0/1"  chassis 00:1a:2b:3c:4d:5e  Tx wake: 16µs  Rx wake: 16µs
    📦 48 120 pkts received  |  0 kernel drop(s)  |  0 interface drop(s)
@@ -303,6 +303,12 @@ Choose the protocols to monitor:
 
 This distinguishes "wrong interface / nothing here" from "the devices are present but their flows are unicast and need a mirror port" — see [Capture Setup](#capture-setup--choosing-the-right-switch-port).
 
+Some devices respond to Dante mDNS queries without being real Dante audio endpoints — a common example is a console's management NIC on the same network segment as its Dante interface. AVStreamLens detects these by waiting 15 seconds (3 report windows): if an mDNS-discovered IP shows no ConMon activity and no active streams, it is moved out of the main Dante list and shown as:
+
+```
+   ⚠  Unverified (mDNS only, no ConMon): 169.254.118.122 "AC44F2C8DDF9" — may be a management NIC or non-Dante device
+```
+
 **Alerts** appear inline when problems are detected. Alerts on cumulative metrics (loss, timing discontinuities) include both a per-window count and the lifetime total, so an old loss does not re-alert forever:
 
 *Per-stream:*
@@ -313,19 +319,30 @@ This distinguishes "wrong interface / nothing here" from "the devices are presen
 - `⚠  Signal gap detected (N in last 5s, worst X.X ms) — stream interrupted`
 - `⚠  RTP payload type mismatch — encoder/SDP misconfiguration`
 - `⚠  Dante clock or subscription issue`
+- `⚠  Dante traffic routed (TTL N) — Dante audio should stay on a single L2 segment`
+- `⚠  Likely Dante Virtual Soundcard — software Dante does not apply QoS markings (DSCP Best Effort)`
 - `⚠  Stream not announced (no SAP) — audio glitch detection unavailable`
 - `⚠  Stream type unknown — SDP required to classify as video/audio/ancillary`
 - `💀 No signal for 12s`
 
 *Clock / PTP:*
 - `⚠  No PTPv2 clock — AES67 streams may lose sync` (or `AES67 and ST2110`)
-- `⚠  No PTPv1 or PTPv2 clock — Dante streams may lose sync`
+- `⚠  No PTPv1 or PTPv2 clock — Dante streams may lose sync` (Dante devices use PTPv1 by default; devices in AES67 or RTP mode switch to PTPv2 and may disable PTPv1 — both versions are checked)
 - `⚠  No L2 gPTP clock — AVB streams may lose sync`
+- `⚠  Multiple PTP Sync senders in domain N` — two or more devices sending Sync in the same PTP domain; common causes: (1) IGMP snooping misconfiguration isolating network segments so each elects its own master; (2) mixing console clock source mismatch ("Enable Sync to External" set incorrectly); (3) a device with external word clock input conflicting with a separate Preferred Leader — Audinate warns this causes one device to lose sync and be muted unless both share the same external reference
 - `⚠  Large PTP correction field — transparent clock or path issue`
 - `⚠  PTP path-delay variance > 10µs — unstable link (EEE, half-duplex, or cable)`
 - `⚠  PTP path delay > 1ms — too many hops between this node and grandmaster`
 - `    path delay: 14.2µs – 15.1µs  (spread 0.9µs)  ~3 hops` — rough hop count (5µs per switch) shown inline on the path delay line
 - `ℹ  3 hops: Dante latency should be ≥ 0.5ms` — Dante-only advisory when hop count suggests the configured latency may be too low (Audinate minimums: 3–4 hops → 0.5ms, 5–9 hops → 2ms, ≥10 hops → 5ms)
+
+*Dante device health:*
+- `⚠  Unverified (mDNS only, no ConMon): IP "Name" — may be a management NIC or non-Dante device` — device appeared via mDNS but showed no ConMon activity and no audio stream for 15s; likely a non-Dante NIC on the same network segment
+- `❌ Dante redundancy bridged: "Name" seen from N IPs` — a device in Dante Redundancy mode has its primary and secondary networks physically connected; this causes a network loop and PTP failure. The secondary port must be kept on a separate physical network from the primary
+- `⚠  Only N of M Dante devices syncing to clock` — fewer devices are sending PTPv1 Delay_Req than are known on the network; some devices may not be locked to the grandmaster
+- `❌ "Device" (169.254.x.x) has no DHCP address — subscriptions will fail` (primary network link-local; secondary network uses `172.31.*.*` instead) — note: on dedicated AV networks without a DHCP server, all Dante devices using APIPA (169.254.x.x) is intentional and fully functional; this alert only fires when some devices have routable addresses and others do not (mixed-subnet condition)
+- `⚠  DHCP may be down — all Dante devices have link-local addresses` — on a dedicated Dante-only network without a DHCP server this is expected; the alert is advisory
+- `⚠  Dante devices on multiple subnets — mDNS and PTP cannot cross subnet boundaries without Dante Domain Manager (DDM) or Dante Director`
 
 *Network infrastructure:*
 - `⚠  Stream count spike: N streams (avg last 3 windows: M) — possible runaway multicast flood`
