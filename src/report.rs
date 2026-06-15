@@ -80,48 +80,82 @@ fn print_discovery(
     dante_sources: &std::collections::HashSet<std::net::Ipv4Addr>,
     dante_names:   &HashMap<std::net::Ipv4Addr, String>,
     dante_conmon:  &HashMap<std::net::Ipv4Addr, ConmonDevice>,
+    dante_unverified_windows: &HashMap<std::net::Ipv4Addr, u32>,
     ndi_sources:   &std::collections::HashSet<std::net::Ipv4Addr>,
     ndi_names:     &HashMap<std::net::Ipv4Addr, String>,
     dante_active: usize,
     ndi_active: usize,
     logger: &mut Logger,
 ) {
-    let dante_count = dante_sources.len();
-    let ndi_count   = ndi_sources.len();
-    if dante_count == 0 && ndi_count == 0 { return; }
+    const UNVERIFIED_THRESHOLD: u32 = 3;
+
+    // Split dante_sources into verified (ConMon or active stream) and flagged
+    // (mDNS-only for ≥ UNVERIFIED_THRESHOLD consecutive windows).
+    let flagged: std::collections::HashSet<std::net::Ipv4Addr> = dante_sources
+        .iter()
+        .filter(|ip| dante_unverified_windows.get(ip).copied().unwrap_or(0) >= UNVERIFIED_THRESHOLD)
+        .copied()
+        .collect();
+    let verified_count = dante_sources.len() - flagged.len();
+
+    let ndi_count = ndi_sources.len();
+    if verified_count == 0 && flagged.is_empty() && ndi_count == 0 { return; }
 
     logger.log("\nDiscovered:");
     println!("\n{}", ansi("36", "📇 Discovered:"));
 
-    if dante_count > 0 {
-        // Merge mDNS discovery count with ConMon liveness into one line.
-        // Suffix: "all live" when ConMon covers every discovered device,
-        // "N live" when only some have active ConMon traffic, nothing when
-        // ConMon is absent (e.g. before the first metering frame arrives).
-        let live_count = dante_conmon.len();
-        let live_suffix = if live_count == 0 {
-            String::new()
-        } else if live_count == dante_count {
-            "  · all live".to_string()
-        } else {
-            format!("  · {} live", live_count)
-        };
-        let base = discovered_line("Dante", dante_count, dante_names.values().map(|s| s.as_str()).collect());
-        let line = format!("{}{}", base, live_suffix);
-        logger.log(&line);
-        println!("{}", line);
+    if verified_count > 0 || !flagged.is_empty() {
+        if verified_count > 0 {
+            // Merge mDNS discovery count with ConMon liveness into one line.
+            // Suffix: "all live" when ConMon covers every verified device,
+            // "N live" when only some have active ConMon traffic, nothing when
+            // ConMon is absent (e.g. before the first metering frame arrives).
+            let live_count = dante_conmon.len();
+            let live_suffix = if live_count == 0 {
+                String::new()
+            } else if live_count == verified_count {
+                "  · all live".to_string()
+            } else {
+                format!("  · {} live", live_count)
+            };
+            let verified_names: Vec<&str> = dante_sources
+                .iter()
+                .filter(|ip| !flagged.contains(ip))
+                .filter_map(|ip| dante_names.get(ip).map(|s| s.as_str()))
+                .collect();
+            let base = discovered_line("Dante", verified_count, verified_names);
+            let line = format!("{}{}", base, live_suffix);
+            logger.log(&line);
+            println!("{}", line);
 
-        // List IPs for devices not yet name-resolved.
-        let mut unnamed: Vec<String> = dante_sources
-            .iter()
-            .filter(|ip| !dante_names.contains_key(ip))
-            .map(|ip| ip.to_string())
-            .collect();
-        if !unnamed.is_empty() {
-            unnamed.sort_unstable();
-            let unnamed_line = format!("   ({} unnamed: {})", unnamed.len(), unnamed.join(", "));
-            logger.log(&unnamed_line);
-            println!("{}", unnamed_line);
+            // List IPs for verified devices not yet name-resolved.
+            let mut unnamed: Vec<String> = dante_sources
+                .iter()
+                .filter(|ip| !flagged.contains(ip) && !dante_names.contains_key(ip))
+                .map(|ip| ip.to_string())
+                .collect();
+            if !unnamed.is_empty() {
+                unnamed.sort_unstable();
+                let unnamed_line = format!("   ({} unnamed: {})", unnamed.len(), unnamed.join(", "));
+                logger.log(&unnamed_line);
+                println!("{}", unnamed_line);
+            }
+        }
+
+        // Flagged devices: mDNS-only for ≥ threshold windows — likely a
+        // management NIC or non-Dante device responding to Dante mDNS queries.
+        if !flagged.is_empty() {
+            let mut flagged_strs: Vec<String> = flagged.iter().map(|ip| {
+                if let Some(name) = dante_names.get(ip) {
+                    format!("{} \"{}\"", ip, name)
+                } else {
+                    ip.to_string()
+                }
+            }).collect();
+            flagged_strs.sort_unstable();
+            let flag_line = format!("   ⚠  Unverified (mDNS only, no ConMon): {} — may be a management NIC or non-Dante device", flagged_strs.join(", "));
+            logger.log(&flag_line);
+            println!("{}", ansi("33", &flag_line));
         }
     }
     if ndi_count > 0 {
@@ -134,7 +168,7 @@ fn print_discovery(
     // Two causes: (1) unicast flows between other devices need a SPAN port;
     // (2) on IGMP-snooping switches, even multicast flows are pruned until we
     // join the group — AVStreamLens joins automatically from SAP and IGMPv3 reports.
-    if (dante_count > 0 && dante_active == 0) || (ndi_count > 0 && ndi_active == 0) {
+    if (verified_count > 0 && dante_active == 0) || (ndi_count > 0 && ndi_active == 0) {
         let alert = "   ⚠  Devices announced but no active flows\
             \n      Multicast (Dante audio, AES67): joining stream groups automatically via IGMP\
             \n      Unicast (Dante subscriptions, NDI): requires a SPAN/mirror port";
@@ -219,6 +253,7 @@ pub fn print_report(
     dante_sources: &std::collections::HashSet<std::net::Ipv4Addr>,
     dante_names: &HashMap<std::net::Ipv4Addr, String>,
     dante_conmon: &HashMap<std::net::Ipv4Addr, ConmonDevice>,
+    dante_unverified_windows: &HashMap<std::net::Ipv4Addr, u32>,
     ndi_sources: &std::collections::HashSet<std::net::Ipv4Addr>,
     ndi_names: &HashMap<std::net::Ipv4Addr, String>,
     avdecc_entities: &HashMap<[u8; 8], AvdeccEntity>,
@@ -636,7 +671,7 @@ pub fn print_report(
     // (non-SPAN) switch port where the actual unicast audio/video never arrives.
     let dante_active = streams.values().filter(|s| s.protocol == "Dante").count();
     let ndi_active   = streams.values().filter(|s| s.protocol == "NDI").count();
-    print_discovery(dante_sources, dante_names, dante_conmon, ndi_sources, ndi_names, dante_active, ndi_active, logger);
+    print_discovery(dante_sources, dante_names, dante_conmon, dante_unverified_windows, ndi_sources, ndi_names, dante_active, ndi_active, logger);
     print_avdecc_entities(avdecc_entities, logger);
 
     // ── PTP / Clock Sources ─────────────────────────────────────────────────

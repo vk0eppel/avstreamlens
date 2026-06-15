@@ -155,6 +155,11 @@ pub struct CaptureState {
     // IPv4 addresses of the capture interface itself — excluded from device
     // discovery so the tool doesn't report itself as a Dante/NDI device.
     pub local_ips: HashSet<Ipv4Addr>,
+    // Consecutive windows each dante_sources IP has been mDNS-only (no ConMon,
+    // no active stream). Reset to 0 when the device is verified; incremented
+    // each window it remains unverified. Used to flag management NICs and other
+    // non-Dante devices that respond to Dante mDNS queries.
+    pub dante_unverified_windows: HashMap<Ipv4Addr, u32>,
 }
 
 impl Default for CaptureState {
@@ -194,6 +199,7 @@ impl CaptureState {
             ptpv1_followers:     HashMap::new(),
             stream_count_history: Vec::new(),
             local_ips:           HashSet::new(),
+            dante_unverified_windows: HashMap::new(),
         }
     }
 
@@ -243,6 +249,19 @@ impl CaptureState {
         // Drop ConMon devices that stopped announcing (metering is ~33 Hz, so
         // a minute of silence means the device left the network).
         self.dante_conmon.retain(|_, d| d.last_seen.elapsed().as_secs() < CONMON_PRUNE_SECS);
+        // Update mDNS-only verification counters. A device is "verified" when it
+        // has ConMon activity or an active stream; otherwise increment its window
+        // count. After 3 consecutive unverified windows the report flags it.
+        for ip in &self.dante_sources {
+            let has_stream = self.streams.values().any(|s| s.src_ip == Some(*ip));
+            let has_conmon = self.dante_conmon.contains_key(ip);
+            if has_stream || has_conmon {
+                self.dante_unverified_windows.remove(ip);
+            } else {
+                *self.dante_unverified_windows.entry(*ip).or_insert(0) += 1;
+            }
+        }
+        self.dante_unverified_windows.retain(|ip, _| self.dante_sources.contains(ip));
         // PTPv1 followers: Delay_Req rate is ~1/s; prune after 15s to survive
         // inter-cycle gaps without false-positive census drops.
         self.ptpv1_followers.retain(|_, t| t.elapsed().as_secs() < 15);

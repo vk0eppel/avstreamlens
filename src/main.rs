@@ -446,6 +446,7 @@ fn do_report(
         logger, &state.network_health, state.bytes_this_window,
         &state.avtp_streams, &state.msrp_state, &state.mvrp_vlans, &state.eee_ports,
         &state.dante_sources, &state.dante_names, &state.dante_conmon,
+        &state.dante_unverified_windows,
         &state.ndi_sources, &state.ndi_names,
         &state.avdecc_entities,
         state.pause_frames_this_window, state.pfc_frames_this_window,
