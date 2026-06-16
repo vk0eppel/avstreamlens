@@ -1054,13 +1054,8 @@ impl CaptureState {
                     name, ip,
                 )));
             }
-        } else if link_local.len() >= 2 && routable.is_empty() {
-            // All link-local — DHCP may be down network-wide.
-            alerts.push(Alert::warn(format!(
-                "⚠ All {} Dante devices on link-local (169.254.x.x / 172.31.x.x) — DHCP may be down network-wide",
-                link_local.len(),
-            )));
         }
+        // All-link-local is a valid Dante deployment (DHCP intentionally absent); no alert.
 
         // Subnet split: routable IPs in more than one /24.
         if routable.len() >= 2 {
@@ -1098,16 +1093,43 @@ impl CaptureState {
             return vec![];
         }
 
-        // syncing + 1 (for the GM) < total means at least one follower is missing.
-        if syncing + 1 < total {
-            let missing = total - syncing - 1;
-            return vec![Alert::warn(format!(
-                "⚠ Only {} of {} Dante devices syncing to clock — {} may not be locked",
-                syncing, total, missing,
-            ))];
+        // Grandmaster IP from the active PTPv1 domain — it never sends Delay_Req.
+        let gm_ip: Option<Ipv4Addr> = self.ptp_domains.iter()
+            .filter(|((_, v), _)| *v == crate::protocols::PTP_VERSION_V1)
+            .filter_map(|(_, stats)| stats.grandmaster_src_ip)
+            .next();
+
+        // Devices that are neither followers nor the known grandmaster.
+        let mut candidates: Vec<Ipv4Addr> = self.dante_sources.iter()
+            .filter(|ip| !self.ptpv1_followers.contains_key(ip))
+            .copied()
+            .collect();
+        candidates.sort();
+
+        // When the GM IP is not yet observed, assume exactly one non-follower slot
+        // belongs to the GM (count-based fallback, consistent with old behaviour).
+        let missing: Vec<Ipv4Addr> = match gm_ip {
+            Some(gm) => candidates.into_iter().filter(|ip| *ip != gm).collect(),
+            None     => if candidates.len() <= 1 { vec![] } else { candidates },
+        };
+
+        if missing.is_empty() {
+            return vec![];
         }
 
-        vec![]
+        let labels: Vec<String> = missing.iter().map(|ip| {
+            match self.dante_names.get(ip) {
+                Some(name) => format!("\"{}\" ({})", name, ip),
+                None       => ip.to_string(),
+            }
+        }).collect();
+
+        vec![Alert::warn(format!(
+            "⚠ {} Dante device{} not syncing to clock: {}",
+            missing.len(),
+            if missing.len() == 1 { "" } else { "s" },
+            labels.join(", "),
+        ))]
     }
 
     pub fn aggregate_ndi_bitrate(&mut self) {
@@ -1595,14 +1617,12 @@ mod tests {
     }
 
     #[test]
-    fn ip_config_all_link_local_warns() {
+    fn ip_config_all_link_local_no_alert() {
+        // All-link-local is a valid Dante deployment; no alert should fire.
         let mut state = CaptureState::new();
         state.dante_sources.insert(Ipv4Addr::new(169, 254, 1, 1));
         state.dante_sources.insert(Ipv4Addr::new(169, 254, 1, 2));
-        let alerts = state.check_dante_ip_config();
-        assert_eq!(alerts.len(), 1);
-        assert!(matches!(alerts[0].level, AlertLevel::Warn));
-        assert!(alerts[0].message.contains("169.254.x.x"));
+        assert!(state.check_dante_ip_config().is_empty());
     }
 
     #[test]
@@ -1650,13 +1670,12 @@ mod tests {
     }
 
     #[test]
-    fn ip_config_172_31_treated_as_link_local() {
+    fn ip_config_172_31_all_link_local_no_alert() {
+        // All 172.31.x.x (Dante link-local fallback) — valid deployment, no alert.
         let mut state = CaptureState::new();
         state.dante_sources.insert(Ipv4Addr::new(172, 31, 0, 1));
         state.dante_sources.insert(Ipv4Addr::new(172, 31, 0, 2));
-        let alerts = state.check_dante_ip_config();
-        assert_eq!(alerts.len(), 1);
-        assert!(matches!(alerts[0].level, AlertLevel::Warn));
+        assert!(state.check_dante_ip_config().is_empty());
     }
 
     #[test]
@@ -1894,15 +1913,40 @@ mod tests {
     fn follower_census_alerts_when_device_not_syncing() {
         let mut state = CaptureState::new();
         make_ptpv1_domain(&mut state);
-        // 4 devices: 1 GM + 2 followers + 1 not syncing.
+        // 4 devices: GM (.1) + 2 followers (.2, .3) + 1 not syncing (.4).
         for i in 1..=4 { state.dante_sources.insert(Ipv4Addr::new(192, 168, 1, i)); }
+        // Set the grandmaster IP on the domain so the GM is excluded from missing.
+        state.ptp_domains.values_mut()
+            .find(|s| s.version == crate::protocols::PTP_VERSION_V1)
+            .unwrap()
+            .grandmaster_src_ip = Some(Ipv4Addr::new(192, 168, 1, 1));
         state.ptpv1_followers.insert(Ipv4Addr::new(192, 168, 1, 2), Instant::now());
         state.ptpv1_followers.insert(Ipv4Addr::new(192, 168, 1, 3), Instant::now());
         let alerts = state.check_dante_follower_census();
         assert_eq!(alerts.len(), 1);
         assert!(matches!(alerts[0].level, AlertLevel::Warn));
-        assert!(alerts[0].message.contains("2 of 4"));
-        assert!(alerts[0].message.contains("1 may not be locked"));
+        assert!(alerts[0].message.contains("192.168.1.4"));
+        assert!(alerts[0].message.contains("1 Dante device"));
+    }
+
+    #[test]
+    fn follower_census_alert_includes_device_name() {
+        let mut state = CaptureState::new();
+        make_ptpv1_domain(&mut state);
+        let gm = Ipv4Addr::new(192, 168, 1, 1);
+        let missing = Ipv4Addr::new(192, 168, 1, 4);
+        for i in 1..=4 { state.dante_sources.insert(Ipv4Addr::new(192, 168, 1, i)); }
+        state.ptp_domains.values_mut()
+            .find(|s| s.version == crate::protocols::PTP_VERSION_V1)
+            .unwrap()
+            .grandmaster_src_ip = Some(gm);
+        state.dante_names.insert(missing, "StageBox".to_string());
+        state.ptpv1_followers.insert(Ipv4Addr::new(192, 168, 1, 2), Instant::now());
+        state.ptpv1_followers.insert(Ipv4Addr::new(192, 168, 1, 3), Instant::now());
+        let alerts = state.check_dante_follower_census();
+        assert_eq!(alerts.len(), 1);
+        assert!(alerts[0].message.contains("\"StageBox\""));
+        assert!(alerts[0].message.contains("192.168.1.4"));
     }
 
     // ── Dante ATP (non-RTP) audio ────────────────────────────────────────────

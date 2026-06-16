@@ -237,13 +237,15 @@ fn run_loop<T: Activated>(
     let mut last_report_pcap = 0i64;   // pcap seconds; initialised on first packet
     let mut pcap_ts_init     = false;
     let run_start            = Instant::now();
+    // Suppresses the no-active-flows diagnostic after its first appearance.
+    let mut no_flows_diagnostic_shown = false;
 
     loop {
         // ── Live: report at TOP so it fires even when next_packet() times out ─
         if !is_offline && last_report.elapsed() > Duration::from_secs(5) {
             let pcap_stats = cap.stats().ok().map(|s| (s.received, s.dropped, s.if_dropped));
             emit_periodic_alerts(state, is_offline, logger);
-            do_report(state, expanded_protocols, pcap_stats, quiet, logger);
+            do_report(state, expanded_protocols, pcap_stats, quiet, &mut no_flows_diagnostic_shown, logger);
             last_report = Instant::now();
 
             if let Some(secs) = live.as_ref().and_then(|l| l.duration_secs)
@@ -260,7 +262,7 @@ fn run_loop<T: Activated>(
             Err(pcap::Error::NoMorePackets)  => {
                 // EOF — print whatever accumulated in the last partial window.
                 emit_periodic_alerts(state, is_offline, logger);
-                do_report(state, expanded_protocols, None, quiet, logger);
+                do_report(state, expanded_protocols, None, quiet, &mut no_flows_diagnostic_shown, logger);
                 let healthy = state.network_health.network_score >= 100.0;
                 std::process::exit(if healthy { 0 } else { 1 });
             }
@@ -403,7 +405,7 @@ fn run_loop<T: Activated>(
                 pcap_ts_init = true;
             } else if pkt_ts - last_report_pcap >= 5 {
                 emit_periodic_alerts(state, is_offline, logger);
-                do_report(state, expanded_protocols, None, quiet, logger);
+                do_report(state, expanded_protocols, None, quiet, &mut no_flows_diagnostic_shown, logger);
                 last_report_pcap = pkt_ts;
             }
         }
@@ -411,13 +413,11 @@ fn run_loop<T: Activated>(
 }
 
 /// Periodic check helpers called before every report cycle.
+/// The four Discovered/Clock Sources diagnostics are computed in do_report and
+/// rendered inline in print_report instead of emitted here as free-standing output.
 fn emit_periodic_alerts(state: &mut CaptureState, is_offline: bool, logger: &mut crate::report::Logger) {
     capture::emit(&state.check_ptp_timeouts(),        logger);
-    capture::emit(&state.check_ptp_sync_conflict(),   logger);
     capture::emit(&state.check_stream_count_anomaly(), logger);
-    capture::emit(&state.check_dante_conmon_bridge(), logger);
-    capture::emit(&state.check_dante_ip_config(),          logger);
-    capture::emit(&state.check_dante_follower_census(),    logger);
     capture::emit(&state.check_igmp_query_interval(),      logger);
     capture::emit(&state.check_igmp_multiple_queriers(),   logger);
     capture::emit(&state.check_igmp_version_mismatch(),    logger);
@@ -434,8 +434,15 @@ fn do_report(
     expanded_protocols: &[protocols::ProtocolChoice],
     pcap_stats: Option<(u32, u32, u32)>,
     quiet: bool,
+    no_flows_diagnostic_shown: &mut bool,
     logger: &mut crate::report::Logger,
 ) {
+    // Compute the four section-level diagnostics before borrowing state fields.
+    let ip_config_alerts     = state.check_dante_ip_config();
+    let conmon_bridge_alerts = state.check_dante_conmon_bridge();
+    let follower_census_alerts = state.check_dante_follower_census();
+    let ptp_sync_alerts      = state.check_ptp_sync_conflict();
+
     state.network_health.calculate_score(
         &state.streams, &state.tcp_streams, &state.ptp_domains,
         &state.msrp_state, &state.eee_ports,
@@ -450,7 +457,11 @@ fn do_report(
         &state.ndi_sources, &state.ndi_names,
         &state.avdecc_entities,
         state.pause_frames_this_window, state.pfc_frames_this_window,
-        pcap_stats, state.packets_dispatched, quiet,
+        pcap_stats, state.packets_dispatched,
+        &ip_config_alerts, &conmon_bridge_alerts,
+        &follower_census_alerts, &ptp_sync_alerts,
+        no_flows_diagnostic_shown,
+        quiet,
     );
     state.reset_window();
 }

@@ -20,7 +20,7 @@ use std::time::Duration;
 use crate::stats::{AvdeccEntity, ConmonDevice, StreamStats, TcpStreamStats, PtpStats, NetworkHealth, StreamQuality, AvtpStreamStats};
 use crate::parser::{fmt_eui64, media_type_summary, sr_class_str};
 use crate::protocols::{STREAM_TIMEOUT_SECS, MsrpDeclaration, MsrpDeclType, PTP_VERSION_V1, avtp_subtype_name, msrp_failure_reason};
-use crate::capture::{MissingClock, MissingClockKind};
+use crate::capture::{Alert, emit as emit_alerts, MissingClock, MissingClockKind};
 
 /// Logger for writing timestamped messages to both file and console.
 #[derive(Debug)]
@@ -55,26 +55,10 @@ pub fn create_logger(prefix: &str) -> std::io::Result<Logger> {
     Logger::new(prefix)
 }
 
-/// Render a single discovery line: `   Dante (5):  "A", "B", … `.
-/// `total` is the authoritative device count; `names` may be shorter (some
-/// sources announce before their instance name is resolved).
-fn discovered_line(label: &str, total: usize, mut names: Vec<&str>) -> String {
-    names.sort_unstable();
-    names.dedup();
-    if names.is_empty() {
-        return format!("   {} ({}):  (names not yet resolved)", label, total);
-    }
-    const SHOWN: usize = 6;
-    let mut listed = names.iter().take(SHOWN).map(|n| format!("\"{}\"", n))
-        .collect::<Vec<_>>().join(", ");
-    if names.len() > SHOWN { listed.push_str(", …"); }
-    format!("   {} ({}):  {}", label, total, listed)
-}
-
 /// Print the `📇 Discovered` section: devices learned from multicast mDNS and
-/// Dante ConMon, plus a no-SPAN diagnostic when devices are announced but no
-/// flows of that type are active (the usual fingerprint of unicast flows on a
-/// non-mirrored port).
+/// Dante ConMon, plus periodic diagnostics for the Discovered section.
+/// One line per device; unverified devices shown inline with ⚠ prefix.
+/// The no-active-flows diagnostic appears at most once per session (flag lives at call site).
 #[allow(clippy::too_many_arguments)]
 fn print_discovery(
     dante_sources: &std::collections::HashSet<std::net::Ipv4Addr>,
@@ -85,12 +69,13 @@ fn print_discovery(
     ndi_names:     &HashMap<std::net::Ipv4Addr, String>,
     dante_active: usize,
     ndi_active: usize,
+    ip_config_alerts: &[Alert],
+    conmon_bridge_alerts: &[Alert],
+    no_flows_diagnostic_shown: &mut bool,
     logger: &mut Logger,
 ) {
     const UNVERIFIED_THRESHOLD: u32 = 3;
 
-    // Split dante_sources into verified (ConMon or active stream) and flagged
-    // (mDNS-only for ≥ UNVERIFIED_THRESHOLD consecutive windows).
     let flagged: std::collections::HashSet<std::net::Ipv4Addr> = dante_sources
         .iter()
         .filter(|ip| dante_unverified_windows.get(ip).copied().unwrap_or(0) >= UNVERIFIED_THRESHOLD)
@@ -105,75 +90,77 @@ fn print_discovery(
     println!("\n{}", ansi("36", "📇 Discovered:"));
 
     if verified_count > 0 || !flagged.is_empty() {
-        if verified_count > 0 {
-            // Merge mDNS discovery count with ConMon liveness into one line.
-            // Suffix: "all live" when ConMon covers every verified device,
-            // "N live" when only some have active ConMon traffic, nothing when
-            // ConMon is absent (e.g. before the first metering frame arrives).
-            let live_count = dante_conmon.len();
-            let live_suffix = if live_count == 0 {
-                String::new()
-            } else if live_count == verified_count {
-                "  · all live".to_string()
+        let live_count = dante_conmon.len();
+        let live_suffix = if live_count == 0 {
+            String::new()
+        } else if live_count == verified_count {
+            "  · all live".to_string()
+        } else {
+            format!("  · {} live", live_count)
+        };
+        let subheader = format!("  Dante ({}){}", verified_count, live_suffix);
+        logger.log(&subheader);
+        println!("{}", subheader);
+
+        // Verified devices sorted by IP — named first, then pending
+        let mut verified: Vec<std::net::Ipv4Addr> = dante_sources.iter()
+            .filter(|ip| !flagged.contains(ip))
+            .copied()
+            .collect();
+        verified.sort();
+        for ip in &verified {
+            let line = if let Some(name) = dante_names.get(ip) {
+                format!("  ▸ \"{}\"   {}", name, ip)
             } else {
-                format!("  · {} live", live_count)
+                format!("  ▸ {}   (name pending)", ip)
             };
-            let verified_names: Vec<&str> = dante_sources
-                .iter()
-                .filter(|ip| !flagged.contains(ip))
-                .filter_map(|ip| dante_names.get(ip).map(|s| s.as_str()))
-                .collect();
-            let base = discovered_line("Dante", verified_count, verified_names);
-            let line = format!("{}{}", base, live_suffix);
             logger.log(&line);
             println!("{}", line);
-
-            // List IPs for verified devices not yet name-resolved.
-            let mut unnamed: Vec<String> = dante_sources
-                .iter()
-                .filter(|ip| !flagged.contains(ip) && !dante_names.contains_key(ip))
-                .map(|ip| ip.to_string())
-                .collect();
-            if !unnamed.is_empty() {
-                unnamed.sort_unstable();
-                let unnamed_line = format!("   ({} unnamed: {})", unnamed.len(), unnamed.join(", "));
-                logger.log(&unnamed_line);
-                println!("{}", unnamed_line);
-            }
         }
 
-        // Flagged devices: mDNS-only for ≥ threshold windows — likely a
-        // management NIC or non-Dante device responding to Dante mDNS queries.
-        if !flagged.is_empty() {
-            let mut flagged_strs: Vec<String> = flagged.iter().map(|ip| {
-                if let Some(name) = dante_names.get(ip) {
-                    format!("{} \"{}\"", ip, name)
-                } else {
-                    ip.to_string()
-                }
-            }).collect();
-            flagged_strs.sort_unstable();
-            let flag_line = format!("   ⚠  Unverified (mDNS only, no ConMon): {} — may be a management NIC or non-Dante device", flagged_strs.join(", "));
-            logger.log(&flag_line);
-            println!("{}", ansi("33", &flag_line));
+        // Unverified devices inline (mDNS-only ≥ threshold windows)
+        let mut flagged_sorted: Vec<std::net::Ipv4Addr> = flagged.iter().copied().collect();
+        flagged_sorted.sort();
+        for ip in &flagged_sorted {
+            let line = if let Some(name) = dante_names.get(ip) {
+                format!("  ⚠  \"{}\"   {}   (mDNS only, no ConMon)", name, ip)
+            } else {
+                format!("  ⚠  {}   (mDNS only, no ConMon)", ip)
+            };
+            logger.log(&line);
+            println!("{}", ansi("33", &line));
         }
     }
+
     if ndi_count > 0 {
-        let line = discovered_line("NDI  ", ndi_count, ndi_names.values().map(|s| s.as_str()).collect());
-        logger.log(&line);
-        println!("{}", line);
+        let subheader = format!("  NDI ({})", ndi_count);
+        logger.log(&subheader);
+        println!("{}", subheader);
+
+        let mut ndi_sorted: Vec<std::net::Ipv4Addr> = ndi_sources.iter().copied().collect();
+        ndi_sorted.sort();
+        for ip in &ndi_sorted {
+            let line = if let Some(name) = ndi_names.get(ip) {
+                format!("  ▸ \"{}\"   {}", name, ip)
+            } else {
+                format!("  ▸ {}   (name pending)", ip)
+            };
+            logger.log(&line);
+            println!("{}", line);
+        }
     }
 
-    // No-SPAN / snooping diagnostic: devices announced via mDNS but no active flows.
-    // Two causes: (1) unicast flows between other devices need a SPAN port;
-    // (2) on IGMP-snooping switches, even multicast flows are pruned until we
-    // join the group — AVStreamLens joins automatically from SAP and IGMPv3 reports.
-    if (verified_count > 0 && dante_active == 0) || (ndi_count > 0 && ndi_active == 0) {
-        let alert = "   ⚠  Devices announced but no active flows\
-            \n      Multicast (Dante audio, AES67): joining stream groups automatically via IGMP\
-            \n      Unicast (Dante subscriptions, NDI): requires a SPAN/mirror port";
+    // Periodic diagnostics: IP config and redundancy bridge
+    emit_alerts(ip_config_alerts, logger);
+    emit_alerts(conmon_bridge_alerts, logger);
+
+    // No-active-flows diagnostic — shown at most once per session
+    let no_flows = (verified_count > 0 && dante_active == 0) || (ndi_count > 0 && ndi_active == 0);
+    if no_flows && !*no_flows_diagnostic_shown {
+        let alert = "  ⚠  Devices announced but no active flows — mirror port may be needed";
         logger.log(alert);
         println!("{}", ansi("33", alert));
+        *no_flows_diagnostic_shown = true;
     }
 }
 
@@ -233,10 +220,13 @@ fn print_avdecc_entities(
 /// Print one 5-second report cycle to stdout and the log file.
 ///
 /// Sections printed in order:
-/// - Bandwidth + stream count overview + status line
-/// - `📡 Streams:` — AES67, Dante, ST2110, NDI, AVB entries with per-stream alerts
-/// - `🕐 Clock Sources:` — PTP domains (omitted when none observed)
-/// - `🔬 Network Health — X%:` — QoS, IGMP querier, EEE, pcap capture stats
+/// 1. 🔬 Network Health — X% | stream counts | timestamp
+/// 2. ✓ / ⚠ status line
+/// 3. `📇 Discovered` — mDNS/ConMon devices, per-device layout
+/// 4. `📡 Discovered (AVDECC)` — ADP-discovered entities
+/// 5. `🕐 Clock Sources` — PTP domains + follower census + sync conflict
+/// 6. `📡 Streams` — AES67, Dante, ST2110, NDI, AVB entries with per-stream alerts
+/// 7. `🔬 Network Health` detail — QoS, IGMP, EEE, PAUSE/PFC, pcap stats, bandwidth
 #[allow(clippy::too_many_arguments)]
 pub fn print_report(
     streams: &HashMap<String, StreamStats>,
@@ -261,13 +251,18 @@ pub fn print_report(
     pfc_frames: u64,
     pcap_stats: Option<(u32, u32, u32)>,
     packets_dispatched: u64,
+    ip_config_alerts: &[Alert],
+    conmon_bridge_alerts: &[Alert],
+    follower_census_alerts: &[Alert],
+    ptp_sync_alerts: &[Alert],
+    no_flows_diagnostic_shown: &mut bool,
     quiet: bool,
 ) {
     let now = Local::now();
-    let timestamp = now.format("%Y-%m-%d %H:%M:%S").to_string();
-    let header_line = format!("{} | AVStreamLens report", timestamp);
-
-    logger.log(&header_line);
+    let timestamp = now.format("%H:%M:%S").to_string();
+    let full_timestamp = now.format("%Y-%m-%d %H:%M:%S").to_string();
+    let log_header = format!("{} | AVStreamLens report", full_timestamp);
+    logger.log(&log_header);
 
     let mbps = bytes_this_window as f64 * 8.0 / 5_000_000.0;
 
@@ -286,10 +281,6 @@ pub fn print_report(
         })
         .collect();
 
-    // AVB is counted from avtp_streams (per stream-id) so the overview count equals
-    // the number of rendered AVB lines and matches the gPTP clock-requirement gate.
-    // Counting streams["AVB …"] (per-subtype) instead let sv=0 control frames show
-    // "AVB: 1" with an empty Streams list.
     if !avtp_streams.is_empty() {
         proto_parts.push(format!("AVB: {}", avtp_streams.len()));
     }
@@ -305,16 +296,7 @@ pub fn print_report(
         proto_parts.join("  |  ")
     };
 
-    let net_summary = format!(
-        "\n📊 Bandwidth: {:.1} Mbps (last 5s)  |  {}",
-        mbps, streams_str
-    );
-    logger.log(&net_summary);
-
     // ── Top-level status ────────────────────────────────────────────────────
-    // Stream-issue count uses per-window deltas where applicable so the status
-    // line accurately reflects current conditions instead of accumulating
-    // every problem ever seen in this run.
     let stream_issues = streams.values().filter(|s| {
         s.lost_this_window > 0
             || s.jitter_ms() > 20.0
@@ -325,9 +307,6 @@ pub fn print_report(
     let mut parts = Vec::new();
     if stream_issues > 0 { parts.push(format!("{} stream issue(s)", stream_issues)); }
     if !missing_ptp.is_empty() {
-        // Status-line summary: list affected protocol names. The detailed
-        // "no <clock-type> clock — <protocols> may lose sync" alert is printed
-        // separately below.
         let affected: Vec<&str> = missing_ptp.iter()
             .flat_map(|mc| mc.affected.iter().copied())
             .collect();
@@ -343,25 +322,32 @@ pub fn print_report(
     logger.log(&status_line);
 
     // ── Quiet-mode early exit ───────────────────────────────────────────────
-    // When --quiet is set and the cycle is fully healthy (no stream issues,
-    // no missing clocks, no pcap drops), suppress all stdout output.
-    // The log file always receives the full report regardless of this flag.
     let pcap_drops_ok = pcap_stats.is_none_or(|(_, d, id)| d == 0 && id == 0);
-    // '✓' = all streams healthy, '–' = no streams but no issues either — both are healthy.
     let is_healthy = (status_line.starts_with('✓') || status_line.starts_with('–')) && pcap_drops_ok;
     if quiet && is_healthy {
         logger.log("");
         return;
     }
 
-    // From here on, output goes to both stdout and the log file.
+    // ── 1. Report header block + Health Score ──────────────────────────────
+    let score = format!("{:.0}%", health.network_score);
     let rule = "─".repeat(66);
+    logger.log(&format!("\n{}", rule));
+    logger.log(&format!("  AVStreamLens  ·  {}", full_timestamp));
+    logger.log(&rule);
     println!("\n{}", ansi("36", &rule));
-    println!("{}", ansi("36", &format!("  AVStreamLens  ·  {}", timestamp)));
+    println!("{}", ansi("36", &format!("  AVStreamLens  ·  {}", full_timestamp)));
     println!("{}", ansi("36", &rule));
 
-    println!("{}", net_summary);
+    let header = if proto_parts.is_empty() {
+        format!("\n🔬 Network Health — {}  |  {}", score, timestamp)
+    } else {
+        format!("\n🔬 Network Health — {}  |  {}  |  {}", score, streams_str, timestamp)
+    };
+    logger.log(&format!("Network Health — {}  |  {}  |  {}", score, streams_str, full_timestamp));
+    println!("{}", ansi("36", &header));
 
+    // ── 2. Status line ──────────────────────────────────────────────────────
     if status_line.starts_with('✓') {
         println!("{}", ansi("32", &status_line));
     } else if status_line.starts_with('⚠') {
@@ -370,7 +356,162 @@ pub fn print_report(
         println!("{}", status_line);
     }
 
-    // ── Streams (all protocols unified) ────────────────────────────────────
+    // ── 3. Discovered (mDNS/ConMon) ────────────────────────────────────────
+    let dante_active = streams.values().filter(|s| s.protocol == "Dante").count();
+    let ndi_active   = streams.values().filter(|s| s.protocol == "NDI").count();
+    print_discovery(
+        dante_sources, dante_names, dante_conmon, dante_unverified_windows,
+        ndi_sources, ndi_names, dante_active, ndi_active,
+        ip_config_alerts, conmon_bridge_alerts, no_flows_diagnostic_shown, logger,
+    );
+
+    // ── 4. Discovered (AVDECC) ──────────────────────────────────────────────
+    print_avdecc_entities(avdecc_entities, logger);
+
+    // ── 5. Clock Sources ────────────────────────────────────────────────────
+    let has_clock_content = !ptp_domains.is_empty()
+        || !missing_ptp.is_empty()
+        || !follower_census_alerts.is_empty()
+        || !ptp_sync_alerts.is_empty();
+
+    if has_clock_content {
+        logger.log("\nClock Sources:");
+        println!("\n{}", ansi("36", "🕐 Clock Sources:"));
+
+        let multi_domain = ptp_domains.len() > 1;
+
+        for ((domain, version), stats) in ptp_domains.iter() {
+            let gm_icon = if stats.clock_valid { "✓" } else if stats.last_grandmaster.is_some() { "⚠" } else { "❌" };
+
+            let proto_label = stats.protocol_kind.as_deref().unwrap_or("PTP");
+            let domain_suffix = if multi_domain || *domain > 0 {
+                format!("  (domain {})", domain)
+            } else {
+                String::new()
+            };
+
+            let clock_line = match (&stats.last_grandmaster, stats.clock_valid) {
+                (Some(gm), true) => {
+                    let gm_ip = stats.grandmaster_src_ip.or(stats.last_src_ip);
+                    let ip_str = gm_ip.map(|ip| format!("  ({})", ip)).unwrap_or_default();
+                    let name = gm_ip.and_then(|ip| dante_names.get(&ip));
+                    let id_part = match (name, stats.version) {
+                        (Some(n), _)           => format!("  grandmaster \"{}\"", n),
+                        (None, PTP_VERSION_V1) => "  grandmaster".to_string(),
+                        (None, _)              => format!("  grandmaster {}", gm),
+                    };
+                    format!("  {}  {}{}  —{}{}", gm_icon, proto_label, domain_suffix, id_part, ip_str)
+                }
+                (Some(_), false) => {
+                    format!("  {}  {}{}  —  clock lost", gm_icon, proto_label, domain_suffix)
+                }
+                (None, _) => {
+                    match &stats.last_clock_id {
+                        Some(id) if stats.seen_sync =>
+                            format!("  ○  {}{}  —  clock source: {}  (Sync seen, no Announce — no grandmaster elected)", proto_label, domain_suffix, id),
+                        Some(id) =>
+                            format!("  ○  {}{}  —  clock source: {}  (peer-delay requests only — no Sync/grandmaster; link partner may not be gPTP-capable)", proto_label, domain_suffix, id),
+                        None =>
+                            format!("  {}  {}{}  —  no clock detected", gm_icon, proto_label, domain_suffix),
+                    }
+                }
+            };
+            logger.log(&clock_line);
+            println!("{}", clock_line);
+
+            if stats.protocol_kind.as_deref() == Some("AVB")
+                && stats.last_grandmaster.is_none()
+                && !stats.seen_sync
+                && stats.last_clock_id.is_some()
+            {
+                let hint = "    ℹ  gPTP is link-local — the grandmaster is only visible on a time-aware (AVB-enabled) port";
+                logger.log(hint);
+                println!("{}", hint);
+            }
+
+            if let Some(ref q) = stats.last_quality {
+                let quality_line = format!("    clock quality: {}", q);
+                logger.log(&quality_line);
+                println!("{}", quality_line);
+            }
+
+            if let Some(offset_ns) = stats.last_offset_ns
+                && offset_ns != 0
+            {
+                let offset_line = if offset_ns.unsigned_abs() >= 1_000 {
+                    format!("    correction: {:.1} µs", offset_ns as f64 / 1_000.0)
+                } else {
+                    format!("    correction: {} ns", offset_ns)
+                };
+                logger.log(&offset_line);
+                println!("{}", offset_line);
+                if offset_ns.unsigned_abs() > 1_000 {
+                    let alert = "    ⚠  Large PTP correction field — transparent clock or path issue";
+                    logger.log(alert);
+                    println!("{}", ansi("33", alert));
+                }
+            }
+
+            if let (Some(min), Some(max)) = (stats.min_path_delay_ns, stats.max_path_delay_ns) {
+                let spread_ns = max - min;
+                let fmt = |ns: i64| if ns.unsigned_abs() >= 1_000 {
+                    format!("{:.1}µs", ns as f64 / 1_000.0)
+                } else {
+                    format!("{}ns", ns)
+                };
+                let hops = (min / 5_000).max(0) as u32;
+                let hops_str = if hops > 0 { format!("  ~{} hop{}", hops, if hops == 1 { "" } else { "s" }) } else { String::new() };
+                let line = if min == max {
+                    format!("    path delay: {}{}", fmt(max), hops_str)
+                } else {
+                    format!("    path delay: {} – {}  (spread {}){}", fmt(min), fmt(max), fmt(spread_ns), hops_str)
+                };
+                logger.log(&line);
+                println!("{}", line);
+                if spread_ns > 10_000 {
+                    let alert = "    ⚠  PTP path-delay variance > 10µs — unstable link (EEE, half-duplex, or cable)";
+                    logger.log(alert);
+                    println!("{}", ansi("33", alert));
+                }
+                if max > 1_000_000 {
+                    let alert = "    ⚠  PTP path delay > 1ms — too many hops between this node and grandmaster";
+                    logger.log(alert);
+                    println!("{}", ansi("33", alert));
+                }
+                if *version == PTP_VERSION_V1 && hops >= 3 {
+                    let min_latency = if hops >= 10 { "5ms" } else if hops >= 5 { "2ms" } else { "0.5ms" };
+                    let advisory = format!("    ℹ  {} hops: Dante latency should be ≥ {}", hops, min_latency);
+                    logger.log(&advisory);
+                    println!("{}", advisory);
+                }
+            }
+
+            if stats.protocol_clock_lost {
+                let alert = "    ⚠  Clock lost — grandmaster disappeared";
+                logger.log(alert);
+                println!("{}", ansi("33", alert));
+            }
+
+            if stats.protocol_changes_count > 0 {
+                let alert = format!("    ⚠  Clock source changed {} time(s)", stats.protocol_changes_count);
+                logger.log(&alert);
+                println!("{}", ansi("33", &alert));
+            }
+        }
+
+        // Missing clock alerts
+        for mc in missing_ptp {
+            let alert = format_missing_clock(mc);
+            logger.log(&alert);
+            println!("{}", ansi("31", &alert));
+        }
+
+        // Follower census and sync conflict belong inside Clock Sources
+        emit_alerts(follower_census_alerts, logger);
+        emit_alerts(ptp_sync_alerts, logger);
+    }
+
+    // ── 6. Streams (all protocols unified) ─────────────────────────────────
     logger.log("\nStreams:");
     println!("\n{}", ansi("36", "📡 Streams:"));
 
@@ -391,11 +532,8 @@ pub fn print_report(
     for key in keys {
         let s = &streams[key];
 
-        // AVB aggregate entries are superseded by per-AVTP-stream rendering below
         if s.protocol == "AVB" || s.protocol.starts_with("AVB ") { continue; }
 
-        // Protocol label: prefix ST2110 subtypes clearly; tag AES67 streams whose
-        // source IP is a known Dante device (AES67-mode Dante).
         let proto_label = if s.protocol.starts_with("2110-") {
             format!("ST{}", s.protocol)
         } else if s.protocol == "AES67"
@@ -423,8 +561,6 @@ pub fn print_report(
             None                       => String::new(),
         };
 
-        // Dante: show [unicast] or [multicast] so the engineer knows immediately
-        // whether the stream requires IGMP/multicast switch configuration.
         let multicast_tag = if s.protocol == "Dante" {
             if s.is_multicast { "  [multicast]" } else { "  [unicast]" }
         } else { "" };
@@ -433,7 +569,6 @@ pub fn print_report(
         logger.log(&stream_line);
         println!("{}", stream_line);
 
-        // NDI: show TCP connection quality instead of RTP loss/jitter (NDI uses TCP, not RTP)
         if s.protocol == "NDI" {
             let tcp = s.dst_ip.and_then(|ip| {
                 tcp_streams.values().find(|t| t.src_ip == ip || t.dst_ip == ip)
@@ -453,9 +588,6 @@ pub fn print_report(
             logger.log(&metrics);
             println!("{}", metrics);
         } else if s.protocol == "Dante" && !s.rtp_seen {
-            // ATP framing (official Dante ports 4321 / 14336–15359) is not RTP —
-            // showing "loss: 0.0% | jitter: 0.00 ms" would present unmeasured
-            // values as healthy. Presence and bitrate are real; say what isn't.
             let metrics = format!(
                 "    {} pkts  |  {:.1} Mbps  (ATP framing — loss/jitter unavailable)",
                 s.packets, s.bitrate_bps as f64 / 1_000_000.0
@@ -471,8 +603,6 @@ pub fn print_report(
             println!("{}", metrics);
         }
 
-        // Per-window deltas — these alerts only fire when fresh activity
-        // occurred in the last 5s, so a single old loss does not re-alert forever.
         if s.ts_discontinuities_this_window > 0 {
             let alert = format!(
                 "    ⚠  Audio glitch risk — timing discontinuity detected ({} in last 5s)",
@@ -491,8 +621,6 @@ pub fn print_report(
             println!("{}", ansi("33", &alert));
         }
 
-        // Reorder rate — distinct from loss. >1% suggests per-packet ECMP/LAG
-        // load-balancing, which breaks ordered AV streams even without drops.
         if s.reorders_this_window > 0 {
             let total = (s.packets + s.lost_packets).max(1);
             let pct = 100.0 * s.reorders_this_window as f64 / total as f64;
@@ -516,9 +644,6 @@ pub fn print_report(
             println!("{}", ansi("33", &alert));
         }
 
-        // Routing check: Dante must stay on L2; a TTL < 64 means a router decremented
-        // it (Linux/macOS sources start at 64; any router hop → ≤ 63). Windows sources
-        // start at 128 so a routed Windows device would show 127 — not caught here.
         if s.protocol == "Dante" && s.min_ttl.is_some_and(|t| t < 64) {
             let alert = format!(
                 "    ⚠  Dante traffic routed (TTL {}) — Dante is L2-only; a router is in the path",
@@ -540,8 +665,6 @@ pub fn print_report(
             println!("{}", ansi("33", alert));
         }
 
-        // 0.1% loss ≈ ~3 dropped packets per 5s window at 1ms ptime — below that is
-        // usually capture jitter, not a real subscription/clock fault.
         if s.protocol == "Dante" && (s.loss_pct() > 0.1 || s.jitter_ms() > 15.0) {
             let alert = "    ⚠  Dante clock or subscription issue";
             logger.log(alert);
@@ -554,17 +677,12 @@ pub fn print_report(
             println!("{}", ansi("33", &alert));
         }
 
-        // Gap 2: payload type mismatch
         if s.pt_mismatches > 0 {
             let alert = format!("    ⚠  RTP payload type mismatch ({} packet(s)) — encoder/SDP misconfiguration", s.pt_mismatches);
             logger.log(&alert);
             println!("{}", ansi("33", &alert));
         }
 
-        // Gap 3: stream not yet announced via SAP
-        // Only applies to RTP-based protocols that carry SDP (AES67, ST2110, Dante).
-        // AVB and NDI never publish SDP — skip the warning. Dante ATP flows
-        // (rtp_seen == false) are not RTP and never have SAP either.
         let expects_sdp = (s.protocol == "AES67"
             || s.protocol == "Dante"
             || s.protocol.starts_with("2110-"))
@@ -575,16 +693,12 @@ pub fn print_report(
             println!("{}", ansi("33", alert));
         }
 
-        // ST2110 unclassified stream type
         if s.protocol == "2110-??" {
             let alert = "    ⚠  Stream type unknown — SDP required to classify as video/audio/ancillary";
             logger.log(alert);
             println!("{}", ansi("33", alert));
         }
 
-        // Gap 4: signal gap events (IAT > 50ms).
-        // Require at least 2 events per 5s window — a single spike is typically
-        // a pcap scheduling artifact on the capture host, not a real interruption.
         if s.gap_events >= 2 {
             let alert = format!(
                 "    ⚠  Signal gap detected ({} in last 5s, worst {:.1} ms) — stream interrupted",
@@ -603,7 +717,7 @@ pub fn print_report(
         }
     }
 
-    // ── AVB per-stream entries (AVTP stream IDs with MSRP/VLAN inline) ────────
+    // AVB per-stream entries (AVTP stream IDs with MSRP/VLAN inline)
     if !avtp_streams.is_empty() {
         let mut sorted: Vec<&AvtpStreamStats> = avtp_streams.values().collect();
         sorted.sort_by_key(|s| s.stream_id);
@@ -621,7 +735,6 @@ pub fn print_report(
             logger.log(&metrics);
             println!("{}", metrics);
 
-            // MSRP reservation state for this stream
             if let Some(talker) = msrp_state.get(&avtp.stream_id) {
                 match talker.decl_type {
                     MsrpDeclType::TalkerAdvertise => {
@@ -666,177 +779,14 @@ pub fn print_report(
         }
     }
 
-    // ── Discovered devices (mDNS) ────────────────────────────────────────────
-    // mDNS is multicast, so device announcements are visible even on a plain
-    // (non-SPAN) switch port where the actual unicast audio/video never arrives.
-    let dante_active = streams.values().filter(|s| s.protocol == "Dante").count();
-    let ndi_active   = streams.values().filter(|s| s.protocol == "NDI").count();
-    print_discovery(dante_sources, dante_names, dante_conmon, dante_unverified_windows, ndi_sources, ndi_names, dante_active, ndi_active, logger);
-    print_avdecc_entities(avdecc_entities, logger);
+    // ── 7. Network Health detail ────────────────────────────────────────────
+    logger.log("\nNetwork Health detail:");
+    println!("\n{}", ansi("36", "📊 Network Health detail:"));
 
-    // ── PTP / Clock Sources ─────────────────────────────────────────────────
-    if !ptp_domains.is_empty() {
-        logger.log("\nClock Sources:");
-        println!("\n{}", ansi("36", "🕐 Clock Sources:"));
-
-        let multi_domain = ptp_domains.len() > 1;
-
-        for ((domain, version), stats) in ptp_domains.iter() {
-            let gm_icon = if stats.clock_valid { "✓" } else if stats.last_grandmaster.is_some() { "⚠" } else { "❌" };
-
-            // Primary label: protocol association (Dante, AES67/ST2110, AVB, …)
-            let proto_label = stats.protocol_kind.as_deref().unwrap_or("PTP");
-            // Show domain number only when multiple domains exist (to distinguish them)
-            let domain_suffix = if multi_domain || *domain > 0 {
-                format!("  (domain {})", domain)
-            } else {
-                String::new()
-            };
-
-            let clock_line = match (&stats.last_grandmaster, stats.clock_valid) {
-                (Some(gm), true) => {
-                    // Use the grandmaster's own IP (not the last sender in the domain).
-                    let gm_ip = stats.grandmaster_src_ip.or(stats.last_src_ip);
-                    let ip_str = gm_ip.map(|ip| format!("  ({})", ip)).unwrap_or_default();
-                    // Identify the grandmaster the way an operator thinks about it:
-                    //  1. a discovered Dante device name (from mDNS) if we have one;
-                    //  2. else for PTPv1 (Dante) drop the gmClockUuid — it is a firmware
-                    //     constant (00:00:00:01:00:1d), identical on every device, so the
-                    //     IP is the only real discriminator;
-                    //  3. else (PTPv2 / gPTP) keep the EUI-64 — it really identifies the GM.
-                    let name = gm_ip.and_then(|ip| dante_names.get(&ip));
-                    let id_part = match (name, stats.version) {
-                        (Some(n), _)           => format!("  grandmaster \"{}\"", n),
-                        (None, PTP_VERSION_V1) => "  grandmaster".to_string(),
-                        (None, _)              => format!("  grandmaster {}", gm),
-                    };
-                    format!("  {}  {}{}  —{}{}", gm_icon, proto_label, domain_suffix, id_part, ip_str)
-                }
-                (Some(_), false) => {
-                    format!("  {}  {}{}  —  clock lost", gm_icon, proto_label, domain_suffix)
-                }
-                (None, _) => {
-                    // No Announce/grandmaster. Distinguish a clock that is at least
-                    // emitting Sync (no GM elected yet) from a node that only sends
-                    // P_Delay_Req link-measurement traffic — the latter, with no
-                    // Pdelay_Resp, signals the link partner isn't gPTP-capable.
-                    match &stats.last_clock_id {
-                        Some(id) if stats.seen_sync =>
-                            format!("  ○  {}{}  —  clock source: {}  (Sync seen, no Announce — no grandmaster elected)", proto_label, domain_suffix, id),
-                        Some(id) =>
-                            format!("  ○  {}{}  —  clock source: {}  (peer-delay requests only — no Sync/grandmaster; link partner may not be gPTP-capable)", proto_label, domain_suffix, id),
-                        None =>
-                            format!("  {}  {}{}  —  no clock detected", gm_icon, proto_label, domain_suffix),
-                    }
-                }
-            };
-            logger.log(&clock_line);
-            println!("{}", clock_line);
-
-            // gPTP is link-local (dest MAC 01:80:C2:00:00:0E) and never forwarded by
-            // bridges — so the grandmaster's Announce is only visible on a time-aware
-            // (AVB-enabled) port. When all we see on this port is P_Delay_Req from an
-            // AVB node (no Sync, no grandmaster), tell the operator where to look
-            // instead of leaving them to wonder why the configured GM is absent.
-            if stats.protocol_kind.as_deref() == Some("AVB")
-                && stats.last_grandmaster.is_none()
-                && !stats.seen_sync
-                && stats.last_clock_id.is_some()
-            {
-                let hint = "    ℹ  gPTP is link-local — the grandmaster is only visible on a time-aware (AVB-enabled) port";
-                logger.log(hint);
-                println!("{}", hint);
-            }
-
-            if let Some(ref q) = stats.last_quality {
-                let quality_line = format!("    clock quality: {}", q);
-                logger.log(&quality_line);
-                println!("{}", quality_line);
-            }
-
-            if let Some(offset_ns) = stats.last_offset_ns
-                && offset_ns != 0
-            {
-                let offset_line = if offset_ns.unsigned_abs() >= 1_000 {
-                    format!("    correction: {:.1} µs", offset_ns as f64 / 1_000.0)
-                } else {
-                    format!("    correction: {} ns", offset_ns)
-                };
-                logger.log(&offset_line);
-                println!("{}", offset_line);
-                if offset_ns.unsigned_abs() > 1_000 {
-                    let alert = "    ⚠  Large PTP correction field — transparent clock or path issue";
-                    logger.log(alert);
-                    println!("{}", ansi("33", alert));
-                }
-            }
-
-            // Path-delay tracking: report min..max spread and alert on instability
-            // (>10µs spread = unstable link; >1ms absolute = too many hops).
-            if let (Some(min), Some(max)) = (stats.min_path_delay_ns, stats.max_path_delay_ns) {
-                let spread_ns = max - min;
-                let fmt = |ns: i64| if ns.unsigned_abs() >= 1_000 {
-                    format!("{:.1}µs", ns as f64 / 1_000.0)
-                } else {
-                    format!("{}ns", ns)
-                };
-                // Rough hop estimate: ~5µs per gigabit switch.
-                let hops = (min / 5_000).max(0) as u32;
-                let hops_str = if hops > 0 { format!("  ~{} hop{}", hops, if hops == 1 { "" } else { "s" }) } else { String::new() };
-                let line = if min == max {
-                    format!("    path delay: {}{}", fmt(max), hops_str)
-                } else {
-                    format!("    path delay: {} – {}  (spread {}){}", fmt(min), fmt(max), fmt(spread_ns), hops_str)
-                };
-                logger.log(&line);
-                println!("{}", line);
-                if spread_ns > 10_000 {
-                    let alert = "    ⚠  PTP path-delay variance > 10µs — unstable link (EEE, half-duplex, or cable)";
-                    logger.log(alert);
-                    println!("{}", ansi("33", alert));
-                }
-                if max > 1_000_000 {
-                    let alert = "    ⚠  PTP path delay > 1ms — too many hops between this node and grandmaster";
-                    logger.log(alert);
-                    println!("{}", ansi("33", alert));
-                }
-                // Dante-specific latency advisory: Audinate's recommended minimums by hop count.
-                if *version == PTP_VERSION_V1 && hops >= 3 {
-                    let min_latency = if hops >= 10 { "5ms" } else if hops >= 5 { "2ms" } else { "0.5ms" };
-                    let advisory = format!("    ℹ  {} hops: Dante latency should be ≥ {}", hops, min_latency);
-                    logger.log(&advisory);
-                    println!("{}", advisory);
-                }
-            }
-
-            if stats.protocol_clock_lost {
-                let alert = "    ⚠  Clock lost — grandmaster disappeared";
-                logger.log(alert);
-                println!("{}", ansi("33", alert));
-            }
-
-            if stats.protocol_changes_count > 0 {
-                let alert = format!("    ⚠  Clock source changed {} time(s)", stats.protocol_changes_count);
-                logger.log(&alert);
-                println!("{}", ansi("33", &alert));
-            }
-        }
-    }
-
-    // ── Clock source required but absent ───────────────────────────────────
-    // One alert per missing-clock family so the user immediately knows which
-    // clock type (PTPv2 / PTPv1-or-v2 / L2 gPTP) is needed and which protocol
-    // family is at risk because of it.
-    for mc in missing_ptp {
-        let alert = format_missing_clock(mc);
-        logger.log(&alert);
-        println!("{}", ansi("31", &alert));
-    }
-
-    // ── Network health ──────────────────────────────────────────────────────
-    let score = format!("{:.0}%", health.network_score);
-    logger.log(&format!("\nNetwork Health — {}:", score));
-    println!("\n{}", ansi("36", &format!("🔬 Network Health — {}:", score)));
+    // Bandwidth
+    let bw_line = format!("   Bandwidth: {:.1} Mbps (last 5s)", mbps);
+    logger.log(&bw_line);
+    println!("{}", bw_line);
 
     let dscp_bad = streams.values().filter(|s| s.dscp_violations > 0).count();
     let qos_str = if streams.values().all(|s| s.protocol == "NDI" || s.protocol == "AVB" || s.protocol.starts_with("AVB ")) {
@@ -852,7 +802,6 @@ pub fn print_report(
         Some(t) => {
             let secs = t.elapsed().as_secs();
             if secs > health.querier_silent_after_secs() {
-                // Querier is silent — suppress the stale (interval) from previous queries.
                 format!("IGMP: ⚠ querier silent {}s", secs)
             } else {
                 let interval_str = health.igmp_query_interval_secs
@@ -883,9 +832,6 @@ pub fn print_report(
         println!("{}", ansi("33", &alert));
     }
 
-    // Link-layer flow control (PAUSE / PFC). Most NICs strip these in hardware
-    // and pcap never sees them; when they DO reach userspace, even one frame is
-    // a strong signal of upstream congestion causing tx-side freezes.
     if pause_frames > 0 {
         let alert = format!(
             "   ⚠  PAUSE frames: {} in last 5s — upstream link congestion causing tx-side freezes",
@@ -917,10 +863,6 @@ pub fn print_report(
         }
     }
 
-    // ── pcap capture stats ──────────────────────────────────────────────────
-    // Kernel drops mean the ring buffer overflowed — packets were received by
-    // the NIC but discarded before pcap handed them to us. Even a small drop
-    // count corrupts loss and jitter measurements for all streams.
     if let Some((received, dropped, if_dropped)) = pcap_stats {
         let stats_line = format!(
             "   📦 {:} pkts received  |  {} kernel drop(s)  |  {} interface drop(s)  |  {} parsed",
@@ -928,7 +870,6 @@ pub fn print_report(
         );
         logger.log(&stats_line);
         if dropped > 0 || if_dropped > 0 {
-            // Red: drops actively corrupt loss/jitter numbers — engineer must act.
             println!("{}", ansi("31", &stats_line));
             let warn = "   ❌ Capture drops detected — loss/jitter figures may be understated. \
                         Reduce load or increase pcap buffer size.";
@@ -947,8 +888,6 @@ pub fn print_report(
 }
 
 /// Render a `MissingClock` as the user-facing red alert line.
-/// Names the clock type plainly and joins the affected protocols with commas
-/// (and "and" before the last item).
 fn format_missing_clock(mc: &MissingClock) -> String {
     let clock = match mc.kind {
         MissingClockKind::Ptpv2 => "PTPv2",
