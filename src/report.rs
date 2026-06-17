@@ -19,7 +19,7 @@ use std::time::Duration;
 
 use crate::stats::{AvdeccEntity, ConmonDevice, StreamStats, TcpStreamStats, PtpStats, NetworkHealth, StreamQuality, AvtpStreamStats};
 use crate::parser::{fmt_eui64, media_type_summary, sr_class_str};
-use crate::protocols::{STREAM_TIMEOUT_SECS, MsrpDeclaration, MsrpDeclType, PTP_VERSION_V1, avtp_subtype_name, msrp_failure_reason};
+use crate::protocols::{STREAM_TIMEOUT_SECS, MsrpDeclaration, MsrpDeclType, PTP_VERSION_V1, TransmitterConfidence, TransmitterVerdict, avtp_subtype_name, msrp_failure_reason};
 use crate::capture::{Alert, emit as emit_alerts, MissingClock, MissingClockKind};
 
 /// Logger for writing timestamped messages to both file and console.
@@ -76,6 +76,21 @@ fn tx_flow_suffix(streams: &HashMap<String, StreamStats>, device_ip: std::net::I
         0 => String::new(),
         n => format!("  ({} tx flows)", n),
     }
+}
+
+/// Inline Transmitter Class tag for a Dante stream line, e.g. `  ·  DVS (confirmed)`.
+/// A confirmed verdict (control-plane fingerprint) reads differently from an
+/// inferred one; a DSCP-only hint reads weakest. Multi-signal inferred verdicts
+/// surface the supporting signal count. Empty when there is no verdict.
+fn transmitter_tag(verdict: Option<TransmitterVerdict>) -> String {
+    let Some(v) = verdict else { return String::new() };
+    let conf = match v.confidence {
+        TransmitterConfidence::Confirmed => "confirmed".to_string(),
+        TransmitterConfidence::Inferred if v.signals > 1 => format!("likely, {} signals", v.signals),
+        TransmitterConfidence::Inferred => "likely".to_string(),
+        TransmitterConfidence::Hint => "possible — no QoS marking".to_string(),
+    };
+    format!("  ·  {} ({})", v.class.label(), conf)
 }
 
 /// Print the `📇 Discovered` section: devices learned from multicast mDNS and
@@ -574,7 +589,8 @@ pub fn print_report(
             if s.is_multicast { "  [multicast]" } else { "  [unicast]" }
         } else { "" };
 
-        let stream_line = format!("  ▸ {}{}{}{}{}", proto_label, multicast_tag, name_str, codec_str, addr_str);
+        let tx_tag = transmitter_tag(s.transmitter);
+        let stream_line = format!("  ▸ {}{}{}{}{}{}", proto_label, multicast_tag, name_str, codec_str, addr_str, tx_tag);
         logger.log(&stream_line);
         println!("{}", stream_line);
 

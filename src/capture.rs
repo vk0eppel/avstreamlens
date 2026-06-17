@@ -20,8 +20,8 @@ use pnet_packet::Packet;
 use crate::parser::{is_aes67_multicast, is_st2110_multicast, parse_rtp};
 use crate::protocols::{
     AvProtocol, AvdeccAdp, DanteKind, FlowControlKind, IgmpType, MsrpDeclType, MsrpDeclaration,
-    NdiKind, ProtocolChoice, PtpInfo, SdpSession, St2110Type, DEFAULT_CLOCK_HZ, PTP_VERSION_V2,
-    STREAM_TIMEOUT_SECS, avtp_subtype_name, msrp_failure_reason,
+    NdiKind, ProtocolChoice, PtpInfo, SdpSession, St2110Type, TransmitterClass, DEFAULT_CLOCK_HZ,
+    PTP_VERSION_V2, STREAM_TIMEOUT_SECS, avtp_subtype_name, classify_transmitter, msrp_failure_reason,
 };
 use crate::report::Logger;
 use crate::stats::{
@@ -160,6 +160,11 @@ pub struct CaptureState {
     // each window it remains unverified. Used to flag management NICs and other
     // non-Dante devices that respond to Dante mDNS queries.
     pub dante_unverified_windows: HashMap<Ipv4Addr, u32>,
+    // Transmitter Class learned from a source's control-plane traffic (ConMon →
+    // Hardware; DVS/Via/FPGA ports → that class). DVS/Via override Hardware;
+    // Hardware never overwrites a more specific class. Session-lifetime (a stable
+    // device property), not pruned.
+    pub dante_transmitter_class: HashMap<Ipv4Addr, TransmitterClass>,
 }
 
 impl Default for CaptureState {
@@ -200,6 +205,7 @@ impl CaptureState {
             stream_count_history: Vec::new(),
             local_ips:           HashSet::new(),
             dante_unverified_windows: HashMap::new(),
+            dante_transmitter_class: HashMap::new(),
         }
     }
 
@@ -563,10 +569,22 @@ impl CaptureState {
                 // ConMon proves a live Dante device even before (or without) mDNS —
                 // count it as a discovered source so the device list includes it.
                 self.dante_sources.insert(src);
+                // The "Audinate" ConMon signature is a positive Hardware tell.
+                self.record_tx_class(src, TransmitterClass::Hardware);
+                vec![]
+            }
+            DanteKind::ControlPlane { class } => {
+                // Product-specific control-plane traffic positively identifies the
+                // source's Transmitter Class. Proves a Dante device, like ConMon.
+                if !self.local_ips.contains(&src) {
+                    self.dante_sources.insert(src);
+                    self.record_tx_class(src, class);
+                }
                 vec![]
             }
             DanteKind::AudioStream => {
                 let is_mc = crate::parser::is_multicast(dst);
+                let cp_class = self.dante_transmitter_class.get(&src).copied();
                 // Key on src AND dst: one device can transmit several flows from
                 // the same source port to different destinations (e.g. multiple
                 // multicast groups) — keying on src:port alone merged them,
@@ -597,8 +615,25 @@ impl CaptureState {
                         None => stats.update_non_rtp(udp.payload().len(), now),
                     }
                 }
+                // Transmitter Class verdict — recomputed each packet so an early
+                // inference upgrades to a confirmed verdict as signals accumulate.
+                let signals = crate::protocols::TransmitterSignals {
+                    control_plane: cp_class,
+                    ..Default::default()
+                };
+                stats.transmitter = classify_transmitter(&signals);
                 vec![]
             }
+        }
+    }
+
+    /// Record a Transmitter Class learned from a source's control-plane traffic.
+    /// DVS/Via are more specific than Hardware, so they overwrite; a Hardware
+    /// signal never downgrades an existing DVS/Via verdict.
+    fn record_tx_class(&mut self, src: Ipv4Addr, class: TransmitterClass) {
+        match class {
+            TransmitterClass::Hardware => { self.dante_transmitter_class.entry(src).or_insert(class); }
+            _ => { self.dante_transmitter_class.insert(src, class); }
         }
     }
 
@@ -1461,6 +1496,47 @@ mod tests {
         state.handle_dante(DanteKind::AudioStream, src, Ipv4Addr::new(239,255,10,2), 4321, &[], Instant::now());
         let dante_streams = state.streams.keys().filter(|k| k.starts_with("Dante ")).count();
         assert_eq!(dante_streams, 2, "flows to different destinations must not merge");
+    }
+
+    #[test]
+    fn control_plane_dvs_sets_confirmed_verdict_on_audio_flow() {
+        use crate::protocols::{TransmitterClass, TransmitterConfidence};
+        let mut state = CaptureState::new();
+        let src = Ipv4Addr::new(192, 168, 1, 80);
+        // DVS control-plane traffic observed → source recorded as DVS.
+        state.handle_dante(
+            DanteKind::ControlPlane { class: TransmitterClass::Dvs },
+            src, Ipv4Addr::new(192,168,1,81), 38700, &[], Instant::now(),
+        );
+        assert_eq!(state.dante_transmitter_class.get(&src), Some(&TransmitterClass::Dvs));
+        assert!(state.dante_sources.contains(&src));
+        // An audio flow from that source now carries a confirmed DVS verdict.
+        state.handle_dante(DanteKind::AudioStream, src, Ipv4Addr::new(239,255,1,1), 4321, &[], Instant::now());
+        let v = state.streams.values()
+            .find(|s| s.src_ip == Some(src)).unwrap()
+            .transmitter.unwrap();
+        assert_eq!(v.class, TransmitterClass::Dvs);
+        assert_eq!(v.confidence, TransmitterConfidence::Confirmed);
+    }
+
+    #[test]
+    fn conmon_records_hardware_and_dvs_overrides_it() {
+        use crate::protocols::TransmitterClass;
+        let mut state = CaptureState::new();
+        let src = Ipv4Addr::new(192, 168, 1, 82);
+        // ConMon Audinate signature → Hardware.
+        state.handle_dante(
+            DanteKind::ConMon { device_mac: [0,1,2,3,4,5], channels: None },
+            src, Ipv4Addr::new(224,0,0,232), 8705, &[], Instant::now(),
+        );
+        assert_eq!(state.dante_transmitter_class.get(&src), Some(&TransmitterClass::Hardware));
+        // A later DVS control-plane signal is more specific and overrides Hardware.
+        state.handle_dante(
+            DanteKind::ControlPlane { class: TransmitterClass::Dvs },
+            src, Ipv4Addr::new(192,168,1,83), 38800, &[], Instant::now(),
+        );
+        assert_eq!(state.dante_transmitter_class.get(&src), Some(&TransmitterClass::Dvs),
+            "DVS must override a prior Hardware verdict");
     }
 
     #[test]

@@ -303,6 +303,18 @@ pub fn detect_protocol(eth: &EthernetPacket) -> Option<AvProtocol> {
         return Some(AvProtocol::Dante { kind: DanteKind::Control, src: src_ip, dst: dst_ip, dst_port });
     }
 
+    // ── Dante control-plane fingerprint (DVS / Via / FPGA-hardware ports) ─
+    // Product-specific control/monitoring port families positively identify the
+    // source's Transmitter Class (DVS vs Via vs Hardware) without needing a
+    // mirror port for its audio flow. Hardware ConMon (8700–8708) and control
+    // (8800) are already handled above.
+    if let Some(class) = crate::protocols::dante_control_plane_class(src_port, dst_port) {
+        return Some(AvProtocol::Dante {
+            kind: DanteKind::ControlPlane { class },
+            src: src_ip, dst: dst_ip, dst_port,
+        });
+    }
+
     // ── PTP over UDP (ports 319/320) ─────────────────────
     // Must come before the RTP gate: PTP payloads don't have RTP version bits set.
     let is_ptp_port = dst_port == crate::protocols::PTP_EVENT_PORT
@@ -652,6 +664,44 @@ mod tests {
         let eth = EthernetPacket::new(&frame).unwrap();
         assert!(matches!(detect_protocol(&eth),
             Some(AvProtocol::Dante { kind: DanteKind::Control, .. })));
+    }
+
+    // ── Dante control-plane fingerprint (DVS / Via / FPGA ports) ────────────
+
+    #[test]
+    fn dvs_control_port_classified_as_control_plane_dvs() {
+        use crate::protocols::TransmitterClass;
+        let frame = eth_ip_udp(
+            Ipv4Addr::new(192, 168, 1, 70), Ipv4Addr::new(192, 168, 1, 71),
+            50000, 38700, &[0u8; 16],
+        );
+        let eth = EthernetPacket::new(&frame).unwrap();
+        assert!(matches!(detect_protocol(&eth),
+            Some(AvProtocol::Dante { kind: DanteKind::ControlPlane { class: TransmitterClass::Dvs }, .. })));
+    }
+
+    #[test]
+    fn via_control_port_classified_as_control_plane_via() {
+        use crate::protocols::TransmitterClass;
+        let frame = eth_ip_udp(
+            Ipv4Addr::new(192, 168, 1, 72), Ipv4Addr::new(192, 168, 1, 73),
+            28700, 50000, &[0u8; 16],
+        );
+        let eth = EthernetPacket::new(&frame).unwrap();
+        assert!(matches!(detect_protocol(&eth),
+            Some(AvProtocol::Dante { kind: DanteKind::ControlPlane { class: TransmitterClass::Via }, .. })));
+    }
+
+    #[test]
+    fn fpga_keepalive_port_classified_as_control_plane_hardware() {
+        use crate::protocols::TransmitterClass;
+        let frame = eth_ip_udp(
+            Ipv4Addr::new(192, 168, 1, 74), Ipv4Addr::new(192, 168, 1, 75),
+            61500, 50000, &[0u8; 16],
+        );
+        let eth = EthernetPacket::new(&frame).unwrap();
+        assert!(matches!(detect_protocol(&eth),
+            Some(AvProtocol::Dante { kind: DanteKind::ControlPlane { class: TransmitterClass::Hardware }, .. })));
     }
 
     // ── Dante ATP audio (official ports, non-RTP framing) ───────────────────

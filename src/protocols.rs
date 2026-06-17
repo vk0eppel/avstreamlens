@@ -289,6 +289,141 @@ pub enum DanteKind {
     /// multicast that snooping switches always flood: a continuous (~33 Hz
     /// metering) liveness signal visible from any port, no SPAN needed.
     ConMon { device_mac: [u8; 6], channels: Option<u8> },
+    /// Product-specific control-plane traffic that positively identifies the
+    /// source's Transmitter Class by its port family (DVS / Via / Hardware-FPGA).
+    /// See `dante_control_plane_class`.
+    ControlPlane { class: TransmitterClass },
+}
+
+// ── Transmitter Class (CONTEXT.md) ──
+
+/// Which kind of Dante implementation is sourcing a Dante Audio Flow. "Software
+/// Dante" is not one class — DVS and Via are distinct products.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransmitterClass {
+    Hardware, // FPGA / embedded endpoint
+    Dvs,      // Dante Virtual Soundcard (software)
+    Via,      // Dante Via (a different software product)
+}
+
+impl TransmitterClass {
+    /// User-facing label, using Audinate's product vocabulary.
+    pub fn label(self) -> &'static str {
+        match self {
+            TransmitterClass::Hardware => "Hardware",
+            TransmitterClass::Dvs => "DVS",
+            TransmitterClass::Via => "Via",
+        }
+    }
+}
+
+/// How strongly a Transmitter Class verdict is supported.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransmitterConfidence {
+    Confirmed, // positive control-plane port fingerprint
+    Inferred,  // from timing and/or TTL, no control plane
+    Hint,      // weakest — absent QoS marking (DSCP 0) only
+}
+
+/// A Transmitter Class verdict plus how confident it is and how many independent
+/// signals support it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TransmitterVerdict {
+    pub class: TransmitterClass,
+    pub confidence: TransmitterConfidence,
+    pub signals: u8,
+}
+
+/// Independent signals about a Dante flow's source, fed to `classify_transmitter`.
+/// Fields are populated as evidence arrives within a Session; an empty struct
+/// yields no verdict.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TransmitterSignals {
+    /// Positive control-plane port fingerprint, if the source's control traffic was seen.
+    pub control_plane: Option<TransmitterClass>,
+    /// Packet-timing regularity: Some(true) = metronomic (hardware), Some(false) = noisy (software).
+    pub metronomic: Option<bool>,
+    /// Source host TTL (e.g. 128 → Windows host → software).
+    pub ttl: Option<u8>,
+    /// Audio flow arrived with no DSCP marking (DSCP 0).
+    pub dscp_zero: bool,
+}
+
+/// Classify a UDP flow as Dante control-plane traffic by its product-specific
+/// port family (Audinate's published port list), returning the Transmitter Class
+/// that family positively identifies. None if neither port belongs to a known
+/// family. Hardware ConMon (8700–8708) and control (8800) are handled by the
+/// existing ConMon/Control detection, not here.
+pub fn dante_control_plane_class(src_port: u16, dst_port: u16) -> Option<TransmitterClass> {
+    let either = |f: &dyn Fn(u16) -> bool| f(src_port) || f(dst_port);
+    // DVS control & monitoring: external 38700–38708 / 38800, internal 38900 / 8899.
+    let is_dvs = |p: u16| (38700..=38708).contains(&p) || p == 38800 || p == 38900 || p == 8899;
+    // Via: control & monitoring 28700–28708 / 28800 / 28900, control 4777,
+    // audio control 24440/24441/24444/24455, audio 34336–34600.
+    let is_via = |p: u16| (28700..=28708).contains(&p) || p == 28800 || p == 28900 || p == 4777
+        || matches!(p, 24440 | 24441 | 24444 | 24455) || (34336..=34600).contains(&p);
+    // Hardware/FPGA tells: metering 8751 (FPGA-based devices), FPGA flow keepalive 61440–61951.
+    let is_hw = |p: u16| p == 8751 || (61440..=61951).contains(&p);
+    if either(&is_dvs) { Some(TransmitterClass::Dvs) }
+    else if either(&is_via) { Some(TransmitterClass::Via) }
+    else if either(&is_hw) { Some(TransmitterClass::Hardware) }
+    else { None }
+}
+
+/// Decide the Transmitter Class from independent signals. Pure — no IO, no state.
+///
+/// Precedence (CONTEXT.md): the control-plane fingerprint is near-authoritative
+/// and wins when present. Timing regularity is the confound-proof fallback and
+/// **overrides** the DSCP signal — a metronomic source is Hardware even at DSCP 0.
+/// TTL corroborates. DSCP 0 alone is only a weak hint and never a sole basis for
+/// a confident DVS verdict. Inferred software defaults to DVS — distinguishing
+/// DVS from Via requires the control plane. Returns None when nothing points
+/// anywhere.
+pub fn classify_transmitter(s: &TransmitterSignals) -> Option<TransmitterVerdict> {
+    use TransmitterClass::*;
+    use TransmitterConfidence::*;
+
+    // 1. Control plane — positive identification, plus any corroborating signals.
+    if let Some(class) = s.control_plane {
+        let mut signals = 1u8;
+        match class {
+            Hardware => {
+                if s.metronomic == Some(true) { signals += 1; }
+            }
+            Dvs | Via => {
+                if s.metronomic == Some(false) { signals += 1; }
+                if s.ttl == Some(128) { signals += 1; }
+                if s.dscp_zero { signals += 1; }
+            }
+        }
+        return Some(TransmitterVerdict { class, confidence: Confirmed, signals });
+    }
+
+    // 2. Timing regularity — confound-proof; overrides DSCP.
+    if let Some(metronomic) = s.metronomic {
+        return Some(if metronomic {
+            TransmitterVerdict { class: Hardware, confidence: Inferred, signals: 1 }
+        } else {
+            let mut signals = 1u8;
+            if s.ttl == Some(128) { signals += 1; }
+            if s.dscp_zero { signals += 1; }
+            TransmitterVerdict { class: Dvs, confidence: Inferred, signals }
+        });
+    }
+
+    // 3. TTL alone — Windows host → software.
+    if s.ttl == Some(128) {
+        let mut signals = 1u8;
+        if s.dscp_zero { signals += 1; }
+        return Some(TransmitterVerdict { class: Dvs, confidence: Inferred, signals });
+    }
+
+    // 4. DSCP 0 alone — weakest hint, never confident.
+    if s.dscp_zero {
+        return Some(TransmitterVerdict { class: Dvs, confidence: Hint, signals: 1 });
+    }
+
+    None
 }
 #[derive(Debug, Clone, PartialEq)]
 pub enum NdiKind {
@@ -338,4 +473,71 @@ pub struct SdpMedia {
     pub ptime_ms:      f64,
     pub ts_refclk:     String,
     pub mediaclk:      String,
+}
+
+#[cfg(test)]
+mod transmitter_tests {
+    use super::*;
+
+    // ── dante_control_plane_class ─────────────────────────────────────────────
+    #[test]
+    fn dvs_control_ports_classify_dvs() {
+        assert_eq!(dante_control_plane_class(38700, 50000), Some(TransmitterClass::Dvs));
+        assert_eq!(dante_control_plane_class(50000, 38708), Some(TransmitterClass::Dvs));
+        assert_eq!(dante_control_plane_class(38800, 1), Some(TransmitterClass::Dvs));
+        assert_eq!(dante_control_plane_class(8899, 1), Some(TransmitterClass::Dvs));
+    }
+
+    #[test]
+    fn via_control_ports_classify_via() {
+        assert_eq!(dante_control_plane_class(28700, 50000), Some(TransmitterClass::Via));
+        assert_eq!(dante_control_plane_class(4777, 1), Some(TransmitterClass::Via));
+        assert_eq!(dante_control_plane_class(34336, 1), Some(TransmitterClass::Via));
+        assert_eq!(dante_control_plane_class(24444, 1), Some(TransmitterClass::Via));
+    }
+
+    #[test]
+    fn fpga_ports_classify_hardware() {
+        assert_eq!(dante_control_plane_class(8751, 1), Some(TransmitterClass::Hardware));
+        assert_eq!(dante_control_plane_class(1, 61440), Some(TransmitterClass::Hardware));
+    }
+
+    #[test]
+    fn unrelated_ports_classify_nothing() {
+        assert_eq!(dante_control_plane_class(5004, 5004), None);
+        assert_eq!(dante_control_plane_class(8700, 8800), None); // hardware ConMon/control handled elsewhere
+    }
+
+    // ── classify_transmitter: control-plane (Confirmed) ───────────────────────
+    #[test]
+    fn control_plane_dvs_is_confirmed() {
+        let v = classify_transmitter(&TransmitterSignals {
+            control_plane: Some(TransmitterClass::Dvs), ..Default::default()
+        }).unwrap();
+        assert_eq!(v.class, TransmitterClass::Dvs);
+        assert_eq!(v.confidence, TransmitterConfidence::Confirmed);
+    }
+
+    #[test]
+    fn control_plane_via_is_confirmed() {
+        let v = classify_transmitter(&TransmitterSignals {
+            control_plane: Some(TransmitterClass::Via), ..Default::default()
+        }).unwrap();
+        assert_eq!(v.class, TransmitterClass::Via);
+        assert_eq!(v.confidence, TransmitterConfidence::Confirmed);
+    }
+
+    #[test]
+    fn control_plane_hardware_is_confirmed() {
+        let v = classify_transmitter(&TransmitterSignals {
+            control_plane: Some(TransmitterClass::Hardware), ..Default::default()
+        }).unwrap();
+        assert_eq!(v.class, TransmitterClass::Hardware);
+        assert_eq!(v.confidence, TransmitterConfidence::Confirmed);
+    }
+
+    #[test]
+    fn no_signals_no_verdict() {
+        assert!(classify_transmitter(&TransmitterSignals::default()).is_none());
+    }
 }

@@ -75,6 +75,10 @@ pub struct StreamStats {
     // Scratch buffer for clock-rate inference from RTP timestamp deltas.
     // Cleared once clock_hz_confirmed is set; empty thereafter.
     pub ts_delta_samples:               Vec<i64>,
+    // Transmitter Class verdict (Dante audio only) — Hardware / DVS / Via with a
+    // confidence level, recomputed as signals accumulate. None for non-Dante and
+    // until any signal is observed.
+    pub transmitter:                    Option<crate::protocols::TransmitterVerdict>,
 }
 
 impl StreamStats {
@@ -119,6 +123,7 @@ impl StreamStats {
             rtp_seen:                       false,
             min_ttl:                        None,
             ts_delta_samples:               Vec::new(),
+            transmitter:                    None,
         }
     }
     // Constructor with enhanced info — useful when SDP is available at stream start
