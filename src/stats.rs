@@ -645,6 +645,115 @@ impl NetworkHealth {
 
         self.network_score = score.max(0.0);
     }
+
+    /// Build the Health Summary: one bullet per factor deducting from the Health
+    /// Score this Window. Mirrors `calculate_score` exactly — every score penalty
+    /// produces a bullet and every bullet corresponds to a penalty (the CONTEXT.md
+    /// "Health Summary" biconditional). Pure: no IO, no rendering.
+    ///
+    /// Stream-level issues are collapsed by category across all affected streams
+    /// (`⚠ N stream(s) with <issue>`); infrastructure issues each get their own
+    /// bullet. Pcap kernel/interface drops are deliberately excluded — they are a
+    /// tool limitation, not a network fault, and live in Network Status only.
+    /// Factors that carry no score penalty (PAUSE/PFC frames, AES67/ST2110 PCP
+    /// advisories) likewise produce no bullet.
+    pub fn build_health_summary(
+        &self,
+        streams: &HashMap<String, StreamStats>,
+        tcp_streams: &HashMap<String, TcpStreamStats>,
+        ptp_domains: &HashMap<(u8, u8), PtpStats>,
+        msrp_state: &HashMap<[u8; 8], crate::protocols::MsrpDeclaration>,
+        eee_ports: &HashMap<(String, String), (u16, u16)>,
+    ) -> Vec<String> {
+        let mut out = Vec::new();
+
+        // ── Stream-level issues, collapsed by category ───────────────────────
+        let n = |pred: &dyn Fn(&StreamStats) -> bool| streams.values().filter(|s| pred(s)).count();
+
+        let loss = n(&|s| s.loss_pct() > 0.0);
+        if loss > 0 { out.push(format!("⚠  {} stream(s) with packet loss", loss)); }
+
+        let jitter = n(&|s| s.jitter_ms() > 10.0);
+        if jitter > 0 { out.push(format!("⚠  {} stream(s) with high jitter", jitter)); }
+
+        let tsd = n(&|s| s.ts_discontinuities_this_window > 0);
+        if tsd > 0 { out.push(format!("⚠  {} stream(s) with timestamp discontinuities", tsd)); }
+
+        let ssrc = n(&|s| s.ssrc_changes > 0);
+        if ssrc > 0 { out.push(format!("⚠  {} stream(s) with SSRC changes", ssrc)); }
+
+        let dead = n(&|s| s.last_packet_time.is_some_and(|t| {
+            t.elapsed() > Duration::from_secs(crate::protocols::STREAM_TIMEOUT_SECS)
+        }));
+        if dead > 0 { out.push(format!("⚠  {} dead stream(s) (silent)", dead)); }
+
+        let gaps = n(&|s| s.gap_events >= 2);
+        if gaps > 0 { out.push(format!("⚠  {} stream(s) with signal gaps", gaps)); }
+
+        let dscp = n(&|s| s.dscp_violations > 0);
+        if dscp > 0 { out.push(format!("⚠  {} stream(s) with incorrect DSCP", dscp)); }
+
+        // ── TCP quality ──────────────────────────────────────────────────────
+        let tcp_bad = tcp_streams.values()
+            .filter(|t| t.stream_quality != StreamQuality::Healthy)
+            .count();
+        if tcp_bad > 0 { out.push(format!("⚠  {} TCP stream(s) with degraded quality", tcp_bad)); }
+
+        if self.tcp_retransmissions > 0 {
+            out.push(format!("⚠  TCP retransmissions ({})", self.tcp_retransmissions));
+        }
+
+        // ── Congestion (ECN) ─────────────────────────────────────────────────
+        if self.ecn_congestion_marks > 0 {
+            out.push(format!("⚠  {} ECN congestion mark(s)", self.ecn_congestion_marks));
+        }
+
+        // ── IGMP querier — only penalised when multicast is active ────────────
+        let has_active_multicast = streams.values().any(|s| s.is_multicast && s.packets > 0);
+        if has_active_multicast {
+            let silent_after = self.querier_silent_after_secs();
+            let absent = match self.last_igmp_query {
+                None => true,
+                Some(t) => t.elapsed().as_secs() > silent_after,
+            };
+            if absent { out.push("⚠  IGMP querier absent — multicast may flood".to_string()); }
+        }
+        if self.multiple_queriers_this_window {
+            out.push("⚠  Multiple IGMP queriers on segment".to_string());
+        }
+
+        // ── PTP clock health (per domain, deterministic order) ───────────────
+        let mut ptp_keys: Vec<&(u8, u8)> = ptp_domains.keys().collect();
+        ptp_keys.sort();
+        for key in ptp_keys {
+            let ptp = &ptp_domains[key];
+            if !ptp.clock_valid {
+                if ptp.protocol_clock_lost {
+                    out.push(format!("⚠  Clock Source lost (PTP domain {})", key.0));
+                } else if ptp.packets > 0 {
+                    out.push(format!("⚠  PTP traffic but no grandmaster (domain {})", key.0));
+                }
+            }
+            if ptp.grandmaster_changes > 0 {
+                out.push(format!("⚠  Grandmaster changed (PTP domain {})", key.0));
+            }
+        }
+
+        // ── MSRP / AVB bandwidth reservations ────────────────────────────────
+        let msrp_failed = msrp_state.values()
+            .filter(|d| matches!(d.decl_type, crate::protocols::MsrpDeclType::TalkerFailed))
+            .count();
+        if msrp_failed > 0 {
+            out.push(format!("⚠  {} AVB reservation failure(s)", msrp_failed));
+        }
+
+        // ── EEE ──────────────────────────────────────────────────────────────
+        if !eee_ports.is_empty() {
+            out.push(format!("⚠  EEE active on {} switch port(s)", eee_ports.len()));
+        }
+
+        out
+    }
 }
 
 // ═════════════════════──══════════════════──═════════════════════════
@@ -1078,5 +1187,141 @@ mod tests {
         s.update(0, 0,  1, 100);
         s.update(1, 48, 1, 100); // exactly on time
         assert_eq!(s.ts_discontinuities, 0);
+    }
+
+    // ── build_health_summary ─────────────────────────────────────────────────
+    fn empty_streams() -> HashMap<String, StreamStats> { HashMap::new() }
+    fn empty_tcp() -> HashMap<String, TcpStreamStats> { HashMap::new() }
+    fn empty_ptp() -> HashMap<(u8, u8), PtpStats> { HashMap::new() }
+    fn empty_msrp() -> HashMap<[u8; 8], crate::protocols::MsrpDeclaration> { HashMap::new() }
+    fn empty_eee() -> HashMap<(String, String), (u16, u16)> { HashMap::new() }
+
+    /// A stream that has received `packets` packets and `lost` losses, so
+    /// loss_pct() and liveness are controllable without driving update().
+    fn live_stream(lost: u64) -> StreamStats {
+        let mut s = aes67();
+        s.packets = 100;
+        s.lost_packets = lost;
+        s.last_packet_time = Some(Instant::now());
+        s
+    }
+
+    #[test]
+    fn summary_empty_when_all_healthy() {
+        let health = NetworkHealth::new();
+        let mut streams = empty_streams();
+        streams.insert("s1".into(), live_stream(0));
+        let out = health.build_health_summary(&streams, &empty_tcp(), &empty_ptp(), &empty_msrp(), &empty_eee());
+        assert!(out.is_empty(), "healthy state must yield no bullets, got {out:?}");
+    }
+
+    #[test]
+    fn summary_single_loss_one_bullet() {
+        let health = NetworkHealth::new();
+        let mut streams = empty_streams();
+        streams.insert("s1".into(), live_stream(5));
+        let out = health.build_health_summary(&streams, &empty_tcp(), &empty_ptp(), &empty_msrp(), &empty_eee());
+        assert_eq!(out.len(), 1);
+        assert!(out[0].contains("1 stream(s) with packet loss"), "got {out:?}");
+    }
+
+    #[test]
+    fn summary_collapses_same_issue_across_streams() {
+        let health = NetworkHealth::new();
+        let mut streams = empty_streams();
+        streams.insert("s1".into(), live_stream(5));
+        streams.insert("s2".into(), live_stream(3));
+        streams.insert("s3".into(), live_stream(1));
+        let out = health.build_health_summary(&streams, &empty_tcp(), &empty_ptp(), &empty_msrp(), &empty_eee());
+        assert_eq!(out.len(), 1, "three lossy streams collapse to one bullet, got {out:?}");
+        assert!(out[0].contains("3 stream(s) with packet loss"));
+    }
+
+    #[test]
+    fn summary_different_issues_one_bullet_each() {
+        let health = NetworkHealth::new();
+        let mut streams = empty_streams();
+
+        let mut lossy = live_stream(5);
+        lossy.dscp_violations = 2;                 // also a DSCP violation
+        streams.insert("s1".into(), lossy);
+
+        let mut jittery = live_stream(0);
+        jittery.jitter = 0.015;                    // 15 ms > 10 ms threshold
+        streams.insert("s2".into(), jittery);
+
+        let out = health.build_health_summary(&streams, &empty_tcp(), &empty_ptp(), &empty_msrp(), &empty_eee());
+        // loss, jitter, DSCP — three distinct categories, one bullet each.
+        assert_eq!(out.len(), 3, "got {out:?}");
+        assert!(out.iter().any(|b| b.contains("packet loss")));
+        assert!(out.iter().any(|b| b.contains("high jitter")));
+        assert!(out.iter().any(|b| b.contains("incorrect DSCP")));
+    }
+
+    #[test]
+    fn summary_each_infra_issue_individual_bullet() {
+        let mut health = NetworkHealth::new();
+        health.tcp_retransmissions = 4;
+        health.ecn_congestion_marks = 3;
+        health.multiple_queriers_this_window = true;
+
+        let mut ptp = empty_ptp();
+        let mut d0 = PtpStats::new(0, 1);
+        d0.clock_valid = false;
+        d0.protocol_clock_lost = true;             // clock lost
+        ptp.insert((0, 1), d0);
+
+        let mut eee = empty_eee();
+        eee.insert(("chassis".into(), "port3".into()), (10, 20));
+
+        let out = health.build_health_summary(&empty_streams(), &empty_tcp(), &ptp, &empty_msrp(), &eee);
+        assert!(out.iter().any(|b| b.contains("TCP retransmissions")), "got {out:?}");
+        assert!(out.iter().any(|b| b.contains("ECN congestion")));
+        assert!(out.iter().any(|b| b.contains("Multiple IGMP queriers")));
+        assert!(out.iter().any(|b| b.contains("Clock Source lost")));
+        assert!(out.iter().any(|b| b.contains("EEE active")));
+    }
+
+    #[test]
+    fn summary_igmp_querier_only_when_multicast_active() {
+        // last_igmp_query is None (no querier). With no multicast stream, this is
+        // not a penalty and must not produce a bullet.
+        let health = NetworkHealth::new();
+        let mut unicast = empty_streams();
+        unicast.insert("u1".into(), live_stream(0)); // is_multicast = false by default
+        let out = health.build_health_summary(&unicast, &empty_tcp(), &empty_ptp(), &empty_msrp(), &empty_eee());
+        assert!(out.is_empty(), "no multicast → no querier bullet, got {out:?}");
+
+        // Same querier state, but now an active multicast stream → querier-absent bullet.
+        let mut mc = empty_streams();
+        let mut m = live_stream(0);
+        m.is_multicast = true;
+        mc.insert("m1".into(), m);
+        let out = health.build_health_summary(&mc, &empty_tcp(), &empty_ptp(), &empty_msrp(), &empty_eee());
+        assert!(out.iter().any(|b| b.contains("IGMP querier absent")), "got {out:?}");
+    }
+
+    #[test]
+    fn summary_pcap_drops_produce_no_bullet() {
+        // pcap drops are not an input to build_health_summary at all — a fully
+        // healthy network with drops elsewhere yields an empty summary. This
+        // encodes "tool limitation, not network fault".
+        let health = NetworkHealth::new();
+        let mut streams = empty_streams();
+        streams.insert("s1".into(), live_stream(0));
+        let out = health.build_health_summary(&streams, &empty_tcp(), &empty_ptp(), &empty_msrp(), &empty_eee());
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn summary_dead_stream_bullet() {
+        let health = NetworkHealth::new();
+        let mut streams = empty_streams();
+        let mut dead = aes67();
+        dead.packets = 100;
+        dead.last_packet_time = Some(Instant::now() - Duration::from_secs(crate::protocols::STREAM_TIMEOUT_SECS + 5));
+        streams.insert("s1".into(), dead);
+        let out = health.build_health_summary(&streams, &empty_tcp(), &empty_ptp(), &empty_msrp(), &empty_eee());
+        assert!(out.iter().any(|b| b.contains("dead stream")), "got {out:?}");
     }
 }

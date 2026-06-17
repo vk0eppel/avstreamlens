@@ -261,52 +261,60 @@ Choose the protocols to monitor:
   AVStreamLens  ·  2026-05-17 14:32:00
 ──────────────────────────────────────────────────────────────────
 
-📊 Bandwidth: 12.4 Mbps (last 5s)  |  AES67: 3  |  Dante: 1
-✓  All streams healthy
+🔬 Network Health — 85%  |  AES67: 3  |  Dante: 1
+⚠  EEE active on 1 switch port(s)
+
+📇 Discovered:
+  Dante (4)  · 2 live
+  ▸ "Amp-1"   192.168.1.47
+  ▸ "Stage Box"   192.168.1.45
+  ▸ "TASCAM"   192.168.1.48
+  ▸ 192.168.1.50   (name pending)
+  ⚠  "AC44F2C8DDF9"   169.254.118.122   (mDNS only, no ConMon)
+  NDI (2)
+  ▸ "Playback PC"   192.168.1.60
+  ▸ "Studio Camera"   192.168.1.61
+
+🕐 Clock Sources:
+  ✓  PTPv2  —  grandmaster 00:1a:e5:ff:fe:78:9a:bc  (192.168.1.1)
+    clock quality: Primary reference — locked  < 100 ns
+  ✓  PTPv1  —  grandmaster "Stage Box"  (192.168.1.45)
+    clock quality: Preferred grandmaster
+  ✓  AVB  —  grandmaster 00:1a:e5:ff:fe:ab:cd:ef
 
 📡 Streams:
   ▸ AES67  "Stage Mix"  [L24/48000/2]  —  239.69.0.1:5004
     loss: 0.0%  |  jitter: 0.18 ms  |  2.3 Mbps
-  ▸ Dante  "Stage Box"  —  192.168.1.45:5010
+  ▸ Dante  [unicast]  "Stage Box"  —  192.168.1.45:5010
     loss: 0.0%  |  jitter: 0.04 ms  |  0.8 Mbps
-  ▸ NDI  "Studio Camera"  —  192.168.1.46
+  ▸ NDI  "Studio Camera"  —  192.168.1.61
     healthy  |  120.3 Mbps  |  retrans: 0
   ▸ AVB  IEC 61883  —  00:1a:e5:ff:fe:12:34:56:0001
     loss: 0.0%  |  2.3 Mbps
     ✓  Reserved  VLAN 100  prio 3  ✓  Listener Ready
 
-📇 Discovered:
-   Dante (5):  "Stage Box", "Yamaha-DM7", "TASCAM", "Amp-1", "Amp-2"  · 2 live
-   NDI   (2):  "Studio Camera", "Playback PC"
-
-🕐 Clock Sources:
-  ✓  PTPv2  —  grandmaster 00:1a:e5:ff:fe:78:9a:bc  (192.168.1.1)
-    clock quality: Primary reference — locked  < 100 ns
-  ✓  PTPv1  —  grandmaster "Stage Box"  (169.254.10.20)
-    clock quality: Preferred grandmaster
-  ✓  AVB  —  grandmaster 00:1a:e5:ff:fe:ab:cd:ef
-
-🔬 Network Health — 97%:
+📊 Network Status:
+   Bandwidth: 12.4 Mbps (last 5s)
    QoS: ✓ all streams correctly marked  |  IGMP: ✓ querier 192.168.1.1 [d0:69:9e:10:10:e4] 42s ago  (interval 125s)
    ⚠  EEE active on 1 switch port(s) — may cause audio/video glitches
       port "Gi0/1"  chassis 00:1a:2b:3c:4d:5e  Tx wake: 16µs  Rx wake: 16µs
-   📦 48 120 pkts received  |  0 kernel drop(s)  |  0 interface drop(s)
+   📦 48120 pkts received  |  0 kernel drop(s)  |  0 interface drop(s)  |  48120 parsed
 ```
 
-**Status line** — `✓ All streams healthy` or `⚠ N issue(s)` with a brief description.
+**Health Summary** — directly under the score line, a `⚠` bullet for every factor pulling the Health Score below 100%: stream issues collapsed by type (e.g. `⚠ 2 stream(s) with packet loss`) and infrastructure issues listed individually. A fully healthy (100%) report shows no summary at all. pcap capture drops are a tool limitation, not a network fault — they appear only in **Network Status** at the bottom, never as a summary bullet.
 
-**Discovered** — Dante and NDI devices announce themselves over multicast mDNS, which reaches every switch port. This section lists those devices even when their actual audio/video flows are not visible. The `· N live` suffix on the Dante line shows real-time liveness from ConMon: Dante devices transmit control & monitoring multicast at ~33 packets/s on the link-local 224.0.0.230–233 groups, which snooping switches always flood — so AVStreamLens knows which devices are alive *right now*, not just which announced via mDNS at some point (`· all live` when every discovered device is also active in ConMon). On a plain (non-SPAN) port where Dante audio or NDI is unicast between other devices, you will see the devices here but no matching stream above — in that case AVStreamLens adds:
+**Discovered** — Dante and NDI devices announce themselves over multicast mDNS, which reaches every switch port. This section lists those devices even when their actual audio/video flows are not visible. Each device appears on its own line; devices whose name has not yet been resolved show `(name pending)`. The `· N live` suffix shows real-time liveness from ConMon: Dante devices transmit control & monitoring multicast at ~33 packets/s on the link-local 224.0.0.230–233 groups, which snooping switches always flood — so AVStreamLens knows which devices are alive *right now*, not just which announced via mDNS at some point (`· all live` when every discovered device is also active in ConMon). On a plain (non-SPAN) port where Dante audio or NDI is unicast between other devices, you will see the devices here but no matching stream above — in that case AVStreamLens adds (once per session):
 
 ```
-   ⚠  Devices announced but no active flows — unicast flows need a SPAN/mirror port
+  ⚠  Devices announced but no active flows — mirror port may be needed
 ```
 
 This distinguishes "wrong interface / nothing here" from "the devices are present but their flows are unicast and need a mirror port" — see [Capture Setup](#capture-setup--choosing-the-right-switch-port).
 
-Some devices respond to Dante mDNS queries without being real Dante audio endpoints — a common example is a console's management NIC on the same network segment as its Dante interface. AVStreamLens detects these by waiting 15 seconds (3 report windows): if an mDNS-discovered IP shows no ConMon activity and no active streams, it is moved out of the main Dante list and shown as:
+Some devices respond to Dante mDNS queries without being real Dante audio endpoints — a common example is a console's management NIC on the same network segment as its Dante interface. AVStreamLens detects these by waiting 15 seconds (3 report windows): if an mDNS-discovered IP shows no ConMon activity and no active streams, it is shown inline in the device list with a `⚠` prefix:
 
 ```
-   ⚠  Unverified (mDNS only, no ConMon): 169.254.118.122 "AC44F2C8DDF9" — may be a management NIC or non-Dante device
+  ⚠  "AC44F2C8DDF9"   169.254.118.122   (mDNS only, no ConMon)
 ```
 
 **Alerts** appear inline when problems are detected. Alerts on cumulative metrics (loss, timing discontinuities) include both a per-window count and the lifetime total, so an old loss does not re-alert forever:

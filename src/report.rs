@@ -220,13 +220,13 @@ fn print_avdecc_entities(
 /// Print one 5-second report cycle to stdout and the log file.
 ///
 /// Sections printed in order:
-/// 1. 🔬 Network Health — X% | stream counts | timestamp
+/// 1. 🔬 Network Health — X% | stream counts  (timestamp is in the header rule line)
 /// 2. ✓ / ⚠ status line
 /// 3. `📇 Discovered` — mDNS/ConMon devices, per-device layout
 /// 4. `📡 Discovered (AVDECC)` — ADP-discovered entities
 /// 5. `🕐 Clock Sources` — PTP domains + follower census + sync conflict
 /// 6. `📡 Streams` — AES67, Dante, ST2110, NDI, AVB entries with per-stream alerts
-/// 7. `🔬 Network Health` detail — QoS, IGMP, EEE, PAUSE/PFC, pcap stats, bandwidth
+/// 7. `📊 Network Status` — QoS, IGMP, EEE, PAUSE/PFC, pcap stats, bandwidth
 #[allow(clippy::too_many_arguments)]
 pub fn print_report(
     streams: &HashMap<String, StreamStats>,
@@ -259,7 +259,6 @@ pub fn print_report(
     quiet: bool,
 ) {
     let now = Local::now();
-    let timestamp = now.format("%H:%M:%S").to_string();
     let full_timestamp = now.format("%Y-%m-%d %H:%M:%S").to_string();
     let log_header = format!("{} | AVStreamLens report", full_timestamp);
     logger.log(&log_header);
@@ -296,35 +295,19 @@ pub fn print_report(
         proto_parts.join("  |  ")
     };
 
-    // ── Top-level status ────────────────────────────────────────────────────
-    let stream_issues = streams.values().filter(|s| {
-        s.lost_this_window > 0
-            || s.jitter_ms() > 20.0
-            || s.ts_discontinuities_this_window > 0
-            || s.ssrc_changes > 0
-            || s.last_packet_time.is_some_and(|t| t.elapsed() > Duration::from_secs(STREAM_TIMEOUT_SECS))
-    }).count();
-    let mut parts = Vec::new();
-    if stream_issues > 0 { parts.push(format!("{} stream issue(s)", stream_issues)); }
-    if !missing_ptp.is_empty() {
-        let affected: Vec<&str> = missing_ptp.iter()
-            .flat_map(|mc| mc.affected.iter().copied())
-            .collect();
-        parts.push(format!("no clock for {}", affected.join(", ")));
-    }
-    let status_line = if !parts.is_empty() {
-        format!("⚠  {}", parts.join("  |  "))
-    } else if streams.is_empty() {
-        "–  No streams detected".to_string()
-    } else {
-        "✓  All streams healthy".to_string()
-    };
-    logger.log(&status_line);
+    // ── Health Summary ──────────────────────────────────────────────────────
+    // One bullet per factor deducting from the Health Score this Window. Mirrors
+    // the scoring table exactly (NetworkHealth::build_health_summary). Empty when
+    // the score is 100%.
+    let health_summary =
+        health.build_health_summary(streams, tcp_streams, ptp_domains, msrp_state, eee_ports);
 
     // ── Quiet-mode early exit ───────────────────────────────────────────────
+    // Healthy = no Health Summary bullets AND no pcap drops. pcap drops are not a
+    // score factor, but they still force output so the operator sees the
+    // "measurements may be understated" warning in Network Status.
     let pcap_drops_ok = pcap_stats.is_none_or(|(_, d, id)| d == 0 && id == 0);
-    let is_healthy = (status_line.starts_with('✓') || status_line.starts_with('–')) && pcap_drops_ok;
-    if quiet && is_healthy {
+    if quiet && health_summary.is_empty() && pcap_drops_ok {
         logger.log("");
         return;
     }
@@ -339,21 +322,21 @@ pub fn print_report(
     println!("{}", ansi("36", &format!("  AVStreamLens  ·  {}", full_timestamp)));
     println!("{}", ansi("36", &rule));
 
+    // Time is already in the header rule line above (full date + time) — don't repeat it here.
     let header = if proto_parts.is_empty() {
-        format!("\n🔬 Network Health — {}  |  {}", score, timestamp)
+        format!("\n🔬 Network Health — {}", score)
     } else {
-        format!("\n🔬 Network Health — {}  |  {}  |  {}", score, streams_str, timestamp)
+        format!("\n🔬 Network Health — {}  |  {}", score, streams_str)
     };
-    logger.log(&format!("Network Health — {}  |  {}  |  {}", score, streams_str, full_timestamp));
+    logger.log(&format!("Network Health — {}  |  {}", score, streams_str));
     println!("{}", ansi("36", &header));
 
-    // ── 2. Status line ──────────────────────────────────────────────────────
-    if status_line.starts_with('✓') {
-        println!("{}", ansi("32", &status_line));
-    } else if status_line.starts_with('⚠') {
-        println!("{}", ansi("33", &status_line));
-    } else {
-        println!("{}", status_line);
+    // ── 2. Health Summary ───────────────────────────────────────────────────
+    // Rendered only when the Health Score is below 100% (non-empty summary). A
+    // fully healthy report shows no status line at all — the score line says 100%.
+    for bullet in &health_summary {
+        logger.log(bullet);
+        println!("{}", ansi("33", bullet));
     }
 
     // ── 3. Discovered (mDNS/ConMon) ────────────────────────────────────────
@@ -779,9 +762,9 @@ pub fn print_report(
         }
     }
 
-    // ── 7. Network Health detail ────────────────────────────────────────────
-    logger.log("\nNetwork Health detail:");
-    println!("\n{}", ansi("36", "📊 Network Health detail:"));
+    // ── 7. Network Status ───────────────────────────────────────────────────
+    logger.log("\nNetwork Status:");
+    println!("\n{}", ansi("36", "📊 Network Status:"));
 
     // Bandwidth
     let bw_line = format!("   Bandwidth: {:.1} Mbps (last 5s)", mbps);
