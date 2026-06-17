@@ -55,6 +55,29 @@ pub fn create_logger(prefix: &str) -> std::io::Result<Logger> {
     Logger::new(prefix)
 }
 
+/// Count active Dante transmit flows sourced by `device_ip`: every entry in the
+/// stream map whose src_ip matches and whose protocol is Dante — unicast and
+/// multicast, RTP- and ATP-framed. Map pruning (silent > 20s) is the liveness
+/// filter, so streams already pruned are not counted. A passive approximation of
+/// Dante Controller's "Transmit Flows" — understated when unicast flows are not
+/// visible (no Mirror Port).
+pub fn dante_tx_flow_count(
+    streams: &HashMap<String, StreamStats>,
+    device_ip: std::net::Ipv4Addr,
+) -> usize {
+    streams.values()
+        .filter(|s| s.protocol == "Dante" && s.src_ip == Some(device_ip))
+        .count()
+}
+
+/// `  (N tx flows)` suffix for a device line, empty when the device sources none.
+fn tx_flow_suffix(streams: &HashMap<String, StreamStats>, device_ip: std::net::Ipv4Addr) -> String {
+    match dante_tx_flow_count(streams, device_ip) {
+        0 => String::new(),
+        n => format!("  ({} tx flows)", n),
+    }
+}
+
 /// Print the `📇 Discovered` section: devices learned from multicast mDNS and
 /// Dante ConMon, plus periodic diagnostics for the Discovered section.
 /// One line per device; unverified devices shown inline with ⚠ prefix.
@@ -69,6 +92,7 @@ fn print_discovery(
     ndi_names:     &HashMap<std::net::Ipv4Addr, String>,
     dante_active: usize,
     ndi_active: usize,
+    streams: &HashMap<String, StreamStats>,
     ip_config_alerts: &[Alert],
     conmon_bridge_alerts: &[Alert],
     no_flows_diagnostic_shown: &mut bool,
@@ -109,10 +133,11 @@ fn print_discovery(
             .collect();
         verified.sort();
         for ip in &verified {
+            let suffix = tx_flow_suffix(streams, *ip);
             let line = if let Some(name) = dante_names.get(ip) {
-                format!("  ▸ \"{}\"   {}", name, ip)
+                format!("  ▸ \"{}\"   {}{}", name, ip, suffix)
             } else {
-                format!("  ▸ {}   (name pending)", ip)
+                format!("  ▸ {}   (name pending){}", ip, suffix)
             };
             logger.log(&line);
             println!("{}", line);
@@ -122,10 +147,11 @@ fn print_discovery(
         let mut flagged_sorted: Vec<std::net::Ipv4Addr> = flagged.iter().copied().collect();
         flagged_sorted.sort();
         for ip in &flagged_sorted {
+            let suffix = tx_flow_suffix(streams, *ip);
             let line = if let Some(name) = dante_names.get(ip) {
-                format!("  ⚠  \"{}\"   {}   (mDNS only, no ConMon)", name, ip)
+                format!("  ⚠  \"{}\"   {}   (mDNS only, no ConMon){}", name, ip, suffix)
             } else {
-                format!("  ⚠  {}   (mDNS only, no ConMon)", ip)
+                format!("  ⚠  {}   (mDNS only, no ConMon){}", ip, suffix)
             };
             logger.log(&line);
             println!("{}", ansi("33", &line));
@@ -344,7 +370,7 @@ pub fn print_report(
     let ndi_active   = streams.values().filter(|s| s.protocol == "NDI").count();
     print_discovery(
         dante_sources, dante_names, dante_conmon, dante_unverified_windows,
-        ndi_sources, ndi_names, dante_active, ndi_active,
+        ndi_sources, ndi_names, dante_active, ndi_active, streams,
         ip_config_alerts, conmon_bridge_alerts, no_flows_diagnostic_shown, logger,
     );
 
@@ -887,4 +913,74 @@ fn format_missing_clock(mc: &MissingClock) -> String {
         }
     };
     format!("⚠  No {} clock — {} streams may lose sync", clock, protos)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::stats::StreamStats;
+    use std::net::Ipv4Addr;
+
+    fn dante_stream(src: Ipv4Addr, multicast: bool, atp: bool) -> StreamStats {
+        let mut s = StreamStats::new("Dante", 48_000.0);
+        s.src_ip = Some(src);
+        s.is_multicast = multicast;
+        s.rtp_seen = !atp; // ATP flows never set rtp_seen
+        s
+    }
+
+    #[test]
+    fn tx_flow_count_zero_when_no_streams() {
+        let streams = HashMap::new();
+        let ip = Ipv4Addr::new(192, 168, 1, 45);
+        assert_eq!(dante_tx_flow_count(&streams, ip), 0);
+        assert_eq!(tx_flow_suffix(&streams, ip), "");
+    }
+
+    #[test]
+    fn tx_flow_count_single_unicast() {
+        let ip = Ipv4Addr::new(192, 168, 1, 45);
+        let mut streams = HashMap::new();
+        streams.insert("Dante a".into(), dante_stream(ip, false, false));
+        assert_eq!(dante_tx_flow_count(&streams, ip), 1);
+        assert_eq!(tx_flow_suffix(&streams, ip), "  (1 tx flows)");
+    }
+
+    #[test]
+    fn tx_flow_count_combines_unicast_and_multicast() {
+        let ip = Ipv4Addr::new(192, 168, 1, 45);
+        let mut streams = HashMap::new();
+        streams.insert("Dante a".into(), dante_stream(ip, false, false)); // unicast
+        streams.insert("Dante b".into(), dante_stream(ip, true, false));  // multicast
+        streams.insert("Dante c".into(), dante_stream(ip, true, true));   // multicast ATP
+        assert_eq!(dante_tx_flow_count(&streams, ip), 3);
+    }
+
+    #[test]
+    fn tx_flow_count_includes_atp_framed() {
+        let ip = Ipv4Addr::new(192, 168, 1, 45);
+        let mut streams = HashMap::new();
+        streams.insert("Dante atp".into(), dante_stream(ip, true, true));
+        assert_eq!(dante_tx_flow_count(&streams, ip), 1, "ATP flow (rtp_seen=false) must count");
+    }
+
+    #[test]
+    fn tx_flow_count_ignores_other_source_ips() {
+        let ip = Ipv4Addr::new(192, 168, 1, 45);
+        let other = Ipv4Addr::new(192, 168, 1, 99);
+        let mut streams = HashMap::new();
+        streams.insert("Dante a".into(), dante_stream(ip, false, false));
+        streams.insert("Dante b".into(), dante_stream(other, false, false));
+        assert_eq!(dante_tx_flow_count(&streams, ip), 1);
+    }
+
+    #[test]
+    fn tx_flow_count_ignores_non_dante_protocols() {
+        let ip = Ipv4Addr::new(192, 168, 1, 45);
+        let mut streams = HashMap::new();
+        let mut aes = StreamStats::new("AES67", 48_000.0);
+        aes.src_ip = Some(ip);
+        streams.insert("AES67 x".into(), aes);
+        assert_eq!(dante_tx_flow_count(&streams, ip), 0, "only Dante flows count toward Dante budget");
+    }
 }
