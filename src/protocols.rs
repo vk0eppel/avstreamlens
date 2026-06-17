@@ -571,4 +571,43 @@ mod transmitter_tests {
         assert_eq!(v.class, TransmitterClass::Dvs);
         assert_eq!(v.confidence, TransmitterConfidence::Confirmed);
     }
+
+    // ── classify_transmitter: TTL corroboration + confidence ──────────────────
+    #[test]
+    fn ttl_128_alone_infers_dvs() {
+        let v = classify_transmitter(&TransmitterSignals { ttl: Some(128), ..Default::default() }).unwrap();
+        assert_eq!(v.class, TransmitterClass::Dvs);
+        assert_eq!(v.confidence, TransmitterConfidence::Inferred);
+    }
+
+    #[test]
+    fn ttl_128_does_not_override_metronomic_hardware() {
+        // A metronomic source stays Hardware even with a Windows-like TTL — timing wins.
+        let v = classify_transmitter(&TransmitterSignals {
+            metronomic: Some(true), ttl: Some(128), ..Default::default()
+        }).unwrap();
+        assert_eq!(v.class, TransmitterClass::Hardware);
+    }
+
+    #[test]
+    fn dscp_zero_alone_is_only_a_hint() {
+        let v = classify_transmitter(&TransmitterSignals { dscp_zero: true, ..Default::default() }).unwrap();
+        assert_eq!(v.class, TransmitterClass::Dvs);
+        assert_eq!(v.confidence, TransmitterConfidence::Hint);
+        assert_eq!(v.signals, 1);
+    }
+
+    #[test]
+    fn confirmed_verdict_counts_corroborating_signals() {
+        // Control-plane DVS + noisy timing + Windows TTL + no QoS marking = 4 signals.
+        let v = classify_transmitter(&TransmitterSignals {
+            control_plane: Some(TransmitterClass::Dvs),
+            metronomic: Some(false),
+            ttl: Some(128),
+            dscp_zero: true,
+        }).unwrap();
+        assert_eq!(v.class, TransmitterClass::Dvs);
+        assert_eq!(v.confidence, TransmitterConfidence::Confirmed);
+        assert_eq!(v.signals, 4);
+    }
 }

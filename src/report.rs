@@ -999,4 +999,36 @@ mod tests {
         streams.insert("AES67 x".into(), aes);
         assert_eq!(dante_tx_flow_count(&streams, ip), 0, "only Dante flows count toward Dante budget");
     }
+
+    // ── transmitter_tag (confidence verdict display) ─────────────────────────
+    use crate::protocols::TransmitterClass;
+
+    #[test]
+    fn tag_empty_without_verdict() {
+        assert_eq!(transmitter_tag(None), "");
+    }
+
+    #[test]
+    fn tag_confirmed_reads_confirmed() {
+        let v = TransmitterVerdict { class: TransmitterClass::Dvs, confidence: TransmitterConfidence::Confirmed, signals: 3 };
+        assert_eq!(transmitter_tag(Some(v)), "  ·  DVS (confirmed)");
+    }
+
+    #[test]
+    fn tag_inferred_multi_signal_shows_count() {
+        let v = TransmitterVerdict { class: TransmitterClass::Dvs, confidence: TransmitterConfidence::Inferred, signals: 2 };
+        assert_eq!(transmitter_tag(Some(v)), "  ·  DVS (likely, 2 signals)");
+    }
+
+    #[test]
+    fn tag_hint_reads_low_confidence() {
+        let v = TransmitterVerdict { class: TransmitterClass::Dvs, confidence: TransmitterConfidence::Hint, signals: 1 };
+        assert_eq!(transmitter_tag(Some(v)), "  ·  DVS (possible — no QoS marking)");
+    }
+
+    #[test]
+    fn tag_inferred_hardware_single_signal() {
+        let v = TransmitterVerdict { class: TransmitterClass::Hardware, confidence: TransmitterConfidence::Inferred, signals: 1 };
+        assert_eq!(transmitter_tag(Some(v)), "  ·  Hardware (likely)");
+    }
 }

@@ -637,8 +637,8 @@ impl CaptureState {
                 let signals = crate::protocols::TransmitterSignals {
                     control_plane: cp_class,
                     metronomic,
+                    ttl: stats.min_ttl, // TTL 128 → Windows host → software (corroborating)
                     dscp_zero: stats.observed_dscp == Some(0),
-                    ..Default::default()
                 };
                 stats.transmitter = classify_transmitter(&signals);
                 vec![]
