@@ -540,4 +540,35 @@ mod transmitter_tests {
     fn no_signals_no_verdict() {
         assert!(classify_transmitter(&TransmitterSignals::default()).is_none());
     }
+
+    // ── classify_transmitter: timing fallback + precedence ────────────────────
+    #[test]
+    fn metronomic_timing_overrides_dscp_zero_to_hardware() {
+        // A metronomic source is Hardware even with no QoS marking — timing beats DSCP.
+        let v = classify_transmitter(&TransmitterSignals {
+            metronomic: Some(true), dscp_zero: true, ..Default::default()
+        }).unwrap();
+        assert_eq!(v.class, TransmitterClass::Hardware);
+        assert_eq!(v.confidence, TransmitterConfidence::Inferred);
+    }
+
+    #[test]
+    fn noisy_timing_infers_dvs() {
+        let v = classify_transmitter(&TransmitterSignals {
+            metronomic: Some(false), ..Default::default()
+        }).unwrap();
+        assert_eq!(v.class, TransmitterClass::Dvs);
+        assert_eq!(v.confidence, TransmitterConfidence::Inferred);
+    }
+
+    #[test]
+    fn control_plane_overrides_timing_for_confirmed_verdict() {
+        // Timing alone would say Hardware; a DVS control-plane fingerprint wins and
+        // upgrades the verdict to Confirmed.
+        let v = classify_transmitter(&TransmitterSignals {
+            control_plane: Some(TransmitterClass::Dvs), metronomic: Some(true), ..Default::default()
+        }).unwrap();
+        assert_eq!(v.class, TransmitterClass::Dvs);
+        assert_eq!(v.confidence, TransmitterConfidence::Confirmed);
+    }
 }

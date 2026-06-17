@@ -617,8 +617,10 @@ impl CaptureState {
                 }
                 // Transmitter Class verdict — recomputed each packet so an early
                 // inference upgrades to a confirmed verdict as signals accumulate.
+                let metronomic = stats.timing_metronomic();
                 let signals = crate::protocols::TransmitterSignals {
                     control_plane: cp_class,
+                    metronomic,
                     ..Default::default()
                 };
                 stats.transmitter = classify_transmitter(&signals);

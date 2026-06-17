@@ -79,6 +79,10 @@ pub struct StreamStats {
     // confidence level, recomputed as signals accumulate. None for non-Dante and
     // until any signal is observed.
     pub transmitter:                    Option<crate::protocols::TransmitterVerdict>,
+    // Recent inter-arrival times (ms), bounded ring. Drives the timing-regularity
+    // signal for Transmitter Class: hardware/FPGA sources are metronomic (low
+    // variance), general-purpose-OS software (DVS/Via) is scheduler-noisy.
+    pub iat_samples:                    Vec<f64>,
 }
 
 impl StreamStats {
@@ -124,7 +128,38 @@ impl StreamStats {
             min_ttl:                        None,
             ts_delta_samples:               Vec::new(),
             transmitter:                    None,
+            iat_samples:                    Vec::new(),
         }
+    }
+
+    /// Push an inter-arrival sample (ms) into the bounded ring used for the
+    /// timing-regularity signal. Shared by RTP and ATP update paths.
+    fn push_iat(&mut self, iat_ms: f64) {
+        const MAX_IAT_SAMPLES: usize = 64;
+        if iat_ms > 0.0 {
+            self.iat_samples.push(iat_ms);
+            if self.iat_samples.len() > MAX_IAT_SAMPLES {
+                self.iat_samples.remove(0);
+            }
+        }
+    }
+
+    /// Timing-regularity signal for Transmitter Class. Returns `Some(true)` when
+    /// the source is metronomic (low coefficient of variation → hardware/FPGA),
+    /// `Some(false)` when clearly noisy (→ software), and `None` while there are
+    /// too few samples or the regularity is ambiguous. Independent of QoS marking,
+    /// so it disambiguates a re-marked hardware source from genuine software.
+    pub fn timing_metronomic(&self) -> Option<bool> {
+        const MIN_SAMPLES: usize = 16;
+        if self.iat_samples.len() < MIN_SAMPLES { return None; }
+        let n = self.iat_samples.len() as f64;
+        let mean = self.iat_samples.iter().sum::<f64>() / n;
+        if mean <= 0.0 { return None; }
+        let var = self.iat_samples.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / n;
+        let cv = var.sqrt() / mean; // coefficient of variation
+        if cv < 0.10 { Some(true) }        // metronomic — hardware
+        else if cv > 0.30 { Some(false) }  // noisy — software
+        else { None }                      // ambiguous
     }
     // Constructor with enhanced info — useful when SDP is available at stream start
     pub fn new_with_info(protocol: &str, clock_hz: f64, is_multicast: bool, dst_ip: Ipv4Addr, dst_port: u16) -> Self {
@@ -204,6 +239,12 @@ impl StreamStats {
         // ── RFC 3550 §6.4.1 Jitter + IAT burst detection ──────────
         let now = Instant::now();
 
+        // Timing-regularity sampling (Transmitter Class) — before last_arrival is
+        // overwritten below.
+        if let Some(last_time) = self.last_arrival {
+            self.push_iat(now.duration_since(last_time).as_secs_f64() * 1000.0);
+        }
+
         // IAT burst: ptime_ms > 0 means SDP confirmed the expected packet interval
         if self.ptime_ms > 0.0
             && let Some(last_time) = self.last_arrival
@@ -246,6 +287,11 @@ impl StreamStats {
     /// No sequence, timestamp, or jitter analysis — those need RTP fields.
     pub fn update_non_rtp(&mut self, udp_payload_len: usize, now: Instant) {
         self.packets += 1;
+        // Timing-regularity sampling (Transmitter Class) for ATP flows.
+        if let Some(last) = self.last_arrival {
+            self.push_iat(now.duration_since(last).as_secs_f64() * 1000.0);
+        }
+        self.last_arrival = Some(now);
         self.last_packet_time = Some(now);
         self.bytes_total += udp_payload_len as u64;
         let elapsed = self.last_bitrate_check.elapsed();
@@ -1328,5 +1374,28 @@ mod tests {
         streams.insert("s1".into(), dead);
         let out = health.build_health_summary(&streams, &empty_tcp(), &empty_ptp(), &empty_msrp(), &empty_eee());
         assert!(out.iter().any(|b| b.contains("dead stream")), "got {out:?}");
+    }
+
+    // ── timing_metronomic (Transmitter Class) ────────────────────────────────
+    #[test]
+    fn timing_metronomic_true_for_steady_intervals() {
+        let mut s = aes67();
+        s.iat_samples = vec![1.0; 32]; // perfectly steady → cv 0
+        assert_eq!(s.timing_metronomic(), Some(true));
+    }
+
+    #[test]
+    fn timing_metronomic_false_for_noisy_intervals() {
+        let mut s = aes67();
+        // alternating 0.5 / 1.5 ms → mean 1.0, cv 0.5 — scheduler-noisy software
+        s.iat_samples = (0..32).map(|i| if i % 2 == 0 { 0.5 } else { 1.5 }).collect();
+        assert_eq!(s.timing_metronomic(), Some(false));
+    }
+
+    #[test]
+    fn timing_metronomic_none_with_too_few_samples() {
+        let mut s = aes67();
+        s.iat_samples = vec![1.0; 4];
+        assert_eq!(s.timing_metronomic(), None);
     }
 }
