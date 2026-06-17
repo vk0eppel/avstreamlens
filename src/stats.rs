@@ -83,6 +83,10 @@ pub struct StreamStats {
     // signal for Transmitter Class: hardware/FPGA sources are metronomic (low
     // variance), general-purpose-OS software (DVS/Via) is scheduler-noisy.
     pub iat_samples:                    Vec<f64>,
+    // DSCP observed on the first packet — set once, never reset. Distinguishes a
+    // software source intentionally sending Best Effort (DSCP 0) from misconfigured
+    // hardware (wrong non-zero DSCP); used to gate the Dante DSCP violation.
+    pub observed_dscp:                  Option<u8>,
 }
 
 impl StreamStats {
@@ -129,6 +133,7 @@ impl StreamStats {
             ts_delta_samples:               Vec::new(),
             transmitter:                    None,
             iat_samples:                    Vec::new(),
+            observed_dscp:                  None,
         }
     }
 

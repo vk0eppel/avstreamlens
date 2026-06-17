@@ -600,8 +600,24 @@ impl CaptureState {
                 if let Some(ip) = pnet_packet::ipv4::Ipv4Packet::new(l2_payload)
                     && let Some(udp) = pnet_packet::udp::UdpPacket::new(ip.payload())
                 {
-                    // Dante audio requires DSCP EF (46)
-                    if ip.get_dscp() != 46 { stats.dscp_violations += 1; }
+                    let dscp = ip.get_dscp();
+                    if stats.observed_dscp.is_none() { stats.observed_dscp = Some(dscp); }
+                    // Dante hardware audio requires DSCP EF (46). DVS/Via intentionally
+                    // send Best Effort (DSCP 0), so DSCP 0 is NOT a violation for a
+                    // software source. The gating class is derived WITHOUT the DSCP
+                    // signal (control-plane + timing only) to avoid circularity —
+                    // otherwise DSCP 0 would suppress its own violation and a
+                    // misconfigured hardware device at DSCP 0 would go unflagged.
+                    let gating_class = classify_transmitter(&crate::protocols::TransmitterSignals {
+                        control_plane: cp_class,
+                        metronomic: stats.timing_metronomic(),
+                        ..Default::default()
+                    }).map(|v| v.class);
+                    let software = matches!(gating_class,
+                        Some(TransmitterClass::Dvs | TransmitterClass::Via));
+                    if dscp != 46 && !(dscp == 0 && software) {
+                        stats.dscp_violations += 1;
+                    }
                     if ip.get_ecn() == 3 { self.network_health.ecn_congestion_marks += 1; }
                     // TTL routing check: Dante is L2-only; track minimum TTL so the
                     // report can alert when a router decremented it (TTL < 64 from a
@@ -621,6 +637,7 @@ impl CaptureState {
                 let signals = crate::protocols::TransmitterSignals {
                     control_plane: cp_class,
                     metronomic,
+                    dscp_zero: stats.observed_dscp == Some(0),
                     ..Default::default()
                 };
                 stats.transmitter = classify_transmitter(&signals);
@@ -1539,6 +1556,49 @@ mod tests {
         );
         assert_eq!(state.dante_transmitter_class.get(&src), Some(&TransmitterClass::Dvs),
             "DVS must override a prior Hardware verdict");
+    }
+
+    #[test]
+    fn dvs_flow_at_dscp_zero_is_not_a_violation() {
+        use crate::protocols::TransmitterClass;
+        let mut state = CaptureState::new();
+        let src = Ipv4Addr::new(192, 168, 1, 90);
+        state.handle_dante(
+            DanteKind::ControlPlane { class: TransmitterClass::Dvs },
+            src, Ipv4Addr::new(192,168,1,91), 38700, &[], Instant::now(),
+        );
+        let pkt = ip_udp_rtp(0, 5004, 96, 0, 0, 1); // DSCP 0 (Best Effort)
+        state.handle_dante(DanteKind::AudioStream, src, Ipv4Addr::new(239,255,1,1), 5004, &pkt, Instant::now());
+        let s = state.streams.values().find(|s| s.src_ip == Some(src)).unwrap();
+        assert_eq!(s.dscp_violations, 0, "DVS at DSCP 0 is expected, not a violation");
+    }
+
+    #[test]
+    fn hardware_flow_at_dscp_zero_is_a_violation() {
+        let mut state = CaptureState::new();
+        let src = Ipv4Addr::new(192, 168, 1, 92);
+        // ConMon Audinate signature → Hardware.
+        state.handle_dante(
+            DanteKind::ConMon { device_mac: [0,1,2,3,4,5], channels: None },
+            src, Ipv4Addr::new(224,0,0,232), 8705, &[], Instant::now(),
+        );
+        let pkt = ip_udp_rtp(0, 5004, 96, 0, 0, 1); // DSCP 0 from hardware = misconfig
+        state.handle_dante(DanteKind::AudioStream, src, Ipv4Addr::new(239,255,1,2), 5004, &pkt, Instant::now());
+        let s = state.streams.values().find(|s| s.src_ip == Some(src)).unwrap();
+        assert_eq!(s.dscp_violations, 1, "hardware at DSCP 0 is a genuine misconfiguration");
+    }
+
+    #[test]
+    fn unclassified_flow_at_dscp_zero_still_violates() {
+        // No control-plane and no timing evidence → software cannot be confirmed,
+        // so DSCP 0 is still flagged. This is what stops DSCP 0 suppressing its own
+        // violation (the gating class is derived without the DSCP signal).
+        let mut state = CaptureState::new();
+        let src = Ipv4Addr::new(192, 168, 1, 94);
+        let pkt = ip_udp_rtp(0, 5004, 96, 0, 0, 1);
+        state.handle_dante(DanteKind::AudioStream, src, Ipv4Addr::new(239,255,1,3), 5004, &pkt, Instant::now());
+        let s = state.streams.values().find(|s| s.src_ip == Some(src)).unwrap();
+        assert_eq!(s.dscp_violations, 1);
     }
 
     #[test]
