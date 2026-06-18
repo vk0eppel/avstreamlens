@@ -14,13 +14,66 @@ fn ansi(code: &str, text: &str) -> String {
         text.to_string()
     }
 }
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::net::Ipv4Addr;
 use std::time::Duration;
 
 use crate::stats::{AvdeccEntity, ConmonDevice, StreamStats, TcpStreamStats, PtpStats, NetworkHealth, StreamQuality, AvtpStreamStats};
 use crate::parser::{fmt_eui64, media_type_summary, sr_class_str};
 use crate::protocols::{STREAM_TIMEOUT_SECS, MsrpDeclaration, MsrpDeclType, PTP_VERSION_V1, TransmitterConfidence, TransmitterVerdict, avtp_subtype_name, msrp_failure_reason};
 use crate::capture::{Alert, emit as emit_alerts, MissingClock, MissingClockKind};
+
+/// Everything one report cycle (one Window) needs to render, gathered behind a
+/// single borrow. Built by `do_report` via `from_state`-style assembly and
+/// consumed by `print_report`. All fields are borrows from the live
+/// `CaptureState` plus the locally-computed section diagnostics — zero copies,
+/// valid only for the stack frame that builds it.
+///
+/// This is also the natural unit to serialize for JSON output (see TODO): a
+/// `#[derive(Serialize)]` here would not couple the serializer to the live
+/// capture state.
+///
+/// `Copy`: every field is a shared borrow or a scalar, so the snapshot is
+/// trivially copyable — `print_report` destructures it in place.
+#[derive(Clone, Copy)]
+pub struct ReportSnapshot<'a> {
+    pub streams:        &'a HashMap<String, StreamStats>,
+    pub tcp_streams:    &'a HashMap<String, TcpStreamStats>,
+    pub ptp_domains:    &'a HashMap<(u8, u8), PtpStats>,
+    pub missing_ptp:    &'a [MissingClock],
+    pub health:         &'a NetworkHealth,
+    pub bytes_this_window: u64,
+    pub avtp_streams:   &'a HashMap<[u8; 8], AvtpStreamStats>,
+    pub msrp_state:     &'a HashMap<[u8; 8], MsrpDeclaration>,
+    pub mvrp_vlans:     &'a HashSet<u16>,
+    pub eee_ports:      &'a HashMap<(String, String), (u16, u16)>,
+    pub dante_sources:  &'a HashSet<Ipv4Addr>,
+    pub dante_names:    &'a HashMap<Ipv4Addr, String>,
+    pub dante_conmon:   &'a HashMap<Ipv4Addr, ConmonDevice>,
+    pub dante_unverified_windows: &'a HashMap<Ipv4Addr, u32>,
+    pub ndi_sources:    &'a HashSet<Ipv4Addr>,
+    pub ndi_names:      &'a HashMap<Ipv4Addr, String>,
+    pub avdecc_entities: &'a HashMap<[u8; 8], AvdeccEntity>,
+    pub pause_frames:   u64,
+    pub pfc_frames:     u64,
+    pub pcap_stats:     Option<(u32, u32, u32)>,
+    pub packets_dispatched: u64,
+    // Section-level diagnostics computed once per cycle in `do_report` and
+    // rendered inline in their target sections (Discovered / Clock Sources).
+    pub ip_config_alerts:       &'a [Alert],
+    pub conmon_bridge_alerts:   &'a [Alert],
+    pub follower_census_alerts: &'a [Alert],
+    pub ptp_sync_alerts:        &'a [Alert],
+}
+
+/// Session-lifetime report config — distinct from the per-Window `ReportSnapshot`.
+/// `quiet` is a CLI flag fixed for the Session; `no_flows_diagnostic_shown` is a
+/// latch set the first time the no-active-flows diagnostic fires so it does not
+/// repeat. Owned by `run_loop`, mutably threaded into `print_report`.
+pub struct ReportSession {
+    pub quiet: bool,
+    pub no_flows_diagnostic_shown: bool,
+}
 
 /// Logger for writing timestamped messages to both file and console.
 #[derive(Debug)]
@@ -268,37 +321,19 @@ fn print_avdecc_entities(
 /// 5. `🕐 Clock Sources` — PTP domains + follower census + sync conflict
 /// 6. `📡 Streams` — AES67, Dante, ST2110, NDI, AVB entries with per-stream alerts
 /// 7. `📊 Network Status` — QoS, IGMP, EEE, PAUSE/PFC, pcap stats, bandwidth
-#[allow(clippy::too_many_arguments)]
-pub fn print_report(
-    streams: &HashMap<String, StreamStats>,
-    tcp_streams: &HashMap<String, TcpStreamStats>,
-    ptp_domains: &HashMap<(u8, u8), PtpStats>,
-    missing_ptp: &[MissingClock],
-    logger: &mut Logger,
-    health: &NetworkHealth,
-    bytes_this_window: u64,
-    avtp_streams: &HashMap<[u8; 8], AvtpStreamStats>,
-    msrp_state: &HashMap<[u8; 8], MsrpDeclaration>,
-    mvrp_vlans: &std::collections::HashSet<u16>,
-    eee_ports: &std::collections::HashMap<(String, String), (u16, u16)>,
-    dante_sources: &std::collections::HashSet<std::net::Ipv4Addr>,
-    dante_names: &HashMap<std::net::Ipv4Addr, String>,
-    dante_conmon: &HashMap<std::net::Ipv4Addr, ConmonDevice>,
-    dante_unverified_windows: &HashMap<std::net::Ipv4Addr, u32>,
-    ndi_sources: &std::collections::HashSet<std::net::Ipv4Addr>,
-    ndi_names: &HashMap<std::net::Ipv4Addr, String>,
-    avdecc_entities: &HashMap<[u8; 8], AvdeccEntity>,
-    pause_frames: u64,
-    pfc_frames: u64,
-    pcap_stats: Option<(u32, u32, u32)>,
-    packets_dispatched: u64,
-    ip_config_alerts: &[Alert],
-    conmon_bridge_alerts: &[Alert],
-    follower_census_alerts: &[Alert],
-    ptp_sync_alerts: &[Alert],
-    no_flows_diagnostic_shown: &mut bool,
-    quiet: bool,
-) {
+pub fn print_report(snap: &ReportSnapshot, session: &mut ReportSession, logger: &mut Logger) {
+    // Destructure the snapshot into the local names the body below uses. Every
+    // field is Copy (a borrow or scalar), so this is zero-cost.
+    let ReportSnapshot {
+        streams, tcp_streams, ptp_domains, missing_ptp, health, bytes_this_window,
+        avtp_streams, msrp_state, mvrp_vlans, eee_ports, dante_sources, dante_names,
+        dante_conmon, dante_unverified_windows, ndi_sources, ndi_names, avdecc_entities,
+        pause_frames, pfc_frames, pcap_stats, packets_dispatched,
+        ip_config_alerts, conmon_bridge_alerts, follower_census_alerts, ptp_sync_alerts,
+    } = *snap;
+    let quiet = session.quiet;
+    let no_flows_diagnostic_shown = &mut session.no_flows_diagnostic_shown;
+
     let now = Local::now();
     let full_timestamp = now.format("%Y-%m-%d %H:%M:%S").to_string();
     let log_header = format!("{} | AVStreamLens report", full_timestamp);

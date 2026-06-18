@@ -88,6 +88,316 @@ impl Alert {
     pub fn error(s: impl Into<String>) -> Self { Self { level: AlertLevel::Error, message: s.into() } }
 }
 
+/// Dante-specific per-session state. Grouped so that Dante-only methods take
+/// a narrow `&mut DanteState` seam rather than all of `CaptureState`.
+pub struct DanteState {
+    /// Source IPs learned from mDNS or ConMon — tracked regardless of whether a name is known.
+    pub sources:  HashSet<Ipv4Addr>,
+    pub names:    HashMap<Ipv4Addr, String>,
+    /// Live devices observed via ConMon multicast (224.0.0.230-233:8700-8708).
+    pub conmon:   HashMap<Ipv4Addr, ConmonDevice>,
+    /// Consecutive windows each source IP has been mDNS-only (no ConMon, no active stream).
+    pub unverified_windows: HashMap<Ipv4Addr, u32>,
+    /// Transmitter Class learned from control-plane traffic. Session-lifetime, never pruned.
+    pub transmitter_class: HashMap<Ipv4Addr, TransmitterClass>,
+}
+
+impl DanteState {
+    pub fn new() -> Self {
+        Self {
+            sources:           HashSet::new(),
+            names:             HashMap::new(),
+            conmon:            HashMap::new(),
+            unverified_windows: HashMap::new(),
+            transmitter_class: HashMap::new(),
+        }
+    }
+
+    /// Prune stale ConMon entries and update the mDNS-only verification counters.
+    /// Must be called after report checks (check_conmon_bridge etc.) but before
+    /// the next capture window begins.
+    pub fn reset_window(&mut self, streams: &HashMap<String, StreamStats>) {
+        self.conmon.retain(|_, d| d.last_seen.elapsed().as_secs() < CONMON_PRUNE_SECS);
+        for ip in &self.sources {
+            let has_stream = streams.values().any(|s| s.src_ip == Some(*ip));
+            let has_conmon = self.conmon.contains_key(ip);
+            if has_stream || has_conmon {
+                self.unverified_windows.remove(ip);
+            } else {
+                *self.unverified_windows.entry(*ip).or_insert(0) += 1;
+            }
+        }
+        self.unverified_windows.retain(|ip, _| self.sources.contains(ip));
+    }
+
+    /// Record a Transmitter Class learned from control-plane traffic.
+    /// DVS/Via are more specific than Hardware and overwrite it; Hardware never
+    /// downgrades an existing DVS/Via verdict.
+    pub fn record_tx_class(&mut self, src: Ipv4Addr, class: TransmitterClass) {
+        match class {
+            TransmitterClass::Hardware => { self.transmitter_class.entry(src).or_insert(class); }
+            _ => { self.transmitter_class.insert(src, class); }
+        }
+    }
+
+    /// Detect accidental bridging of Dante primary and secondary networks.
+    /// Two distinct source IPs sharing the same ConMon MAC means both NICs of
+    /// the same device are visible — the redundancy networks are connected.
+    pub fn check_conmon_bridge(&self) -> Vec<Alert> {
+        let mut mac_to_ips: HashMap<[u8; 6], Vec<Ipv4Addr>> = HashMap::new();
+        for (src_ip, device) in &self.conmon {
+            mac_to_ips.entry(device.mac).or_default().push(*src_ip);
+        }
+        let mut alerts = Vec::new();
+        for (mac, ips) in &mac_to_ips {
+            if ips.len() < 2 { continue; }
+            let mac_str = format!("{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+                mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+            let mut ip_strs: Vec<String> = ips.iter().map(|ip| ip.to_string()).collect();
+            ip_strs.sort();
+            let name = ips.iter().find_map(|ip| self.names.get(ip))
+                .map(|n| format!("  \"{}\"", n)).unwrap_or_default();
+            alerts.push(Alert::error(format!(
+                "❌ Dante redundancy bridged: MAC {}{}  seen from {} IPs ({}) — primary and secondary networks are connected",
+                mac_str, name, ips.len(), ip_strs.join(", "),
+            )));
+        }
+        alerts
+    }
+
+    pub fn check_ip_config(&self) -> Vec<Alert> {
+        if self.sources.len() < 2 {
+            return vec![];
+        }
+        let mut alerts = Vec::new();
+        let is_link_local = |ip: &Ipv4Addr| {
+            let o = ip.octets();
+            (o[0] == 169 && o[1] == 254) || (o[0] == 172 && o[1] == 31)
+        };
+        let link_local: Vec<Ipv4Addr> = self.sources.iter().filter(|ip| is_link_local(ip)).copied().collect();
+        let routable:   Vec<Ipv4Addr> = self.sources.iter().filter(|ip| !is_link_local(ip)).copied().collect();
+        if !link_local.is_empty() && !routable.is_empty() {
+            let mut sorted = link_local.clone();
+            sorted.sort();
+            for ip in sorted {
+                let name = self.names.get(&ip)
+                    .map(|n| format!("\"{}\" ", n))
+                    .unwrap_or_default();
+                alerts.push(Alert::error(format!(
+                    "❌ Dante device {}({}) has no DHCP address — subscriptions to/from this device will fail",
+                    name, ip,
+                )));
+            }
+        }
+        if routable.len() >= 2 {
+            let mut subnets: std::collections::HashSet<[u8; 3]> = std::collections::HashSet::new();
+            for ip in &routable {
+                let o = ip.octets();
+                subnets.insert([o[0], o[1], o[2]]);
+            }
+            if subnets.len() > 1 {
+                let mut labels: Vec<String> = subnets.iter()
+                    .map(|s| format!("{}.{}.{}.0/24", s[0], s[1], s[2]))
+                    .collect();
+                labels.sort();
+                alerts.push(Alert::warn(format!(
+                    "⚠ Dante devices span {} subnets ({}) — mDNS discovery and PTP sync are multicast-only and cannot cross subnet boundaries; use Dante Domain Manager (DDM) or Dante Director for cross-subnet operation",
+                    subnets.len(), labels.join(", "),
+                )));
+            }
+        }
+        alerts
+    }
+
+    /// Alert when fewer Dante devices than expected are sending PTPv1 Delay_Req.
+    /// Takes the PTP maps directly (interim signature — will accept `&PtpState`
+    /// once that substate is extracted in the follow-on refactor).
+    pub fn check_follower_census(
+        &self,
+        ptpv1_followers: &HashMap<Ipv4Addr, Instant>,
+        ptp_domains: &HashMap<(u8, u8), PtpStats>,
+    ) -> Vec<Alert> {
+        let total   = self.sources.len();
+        let syncing = ptpv1_followers.len();
+        let has_ptpv1 = ptp_domains.keys().any(|(_, v)| *v == crate::protocols::PTP_VERSION_V1);
+        if !has_ptpv1 || total < 2 || syncing == 0 {
+            return vec![];
+        }
+        let gm_ip: Option<Ipv4Addr> = ptp_domains.iter()
+            .filter(|((_, v), _)| *v == crate::protocols::PTP_VERSION_V1)
+            .filter_map(|(_, stats)| stats.grandmaster_src_ip)
+            .next();
+        let mut candidates: Vec<Ipv4Addr> = self.sources.iter()
+            .filter(|ip| !ptpv1_followers.contains_key(ip))
+            .copied()
+            .collect();
+        candidates.sort();
+        let missing: Vec<Ipv4Addr> = match gm_ip {
+            Some(gm) => candidates.into_iter().filter(|ip| *ip != gm).collect(),
+            None     => if candidates.len() <= 1 { vec![] } else { candidates },
+        };
+        if missing.is_empty() {
+            return vec![];
+        }
+        let labels: Vec<String> = missing.iter().map(|ip| {
+            match self.names.get(ip) {
+                Some(name) => format!("\"{}\" ({})", name, ip),
+                None       => ip.to_string(),
+            }
+        }).collect();
+        vec![Alert::warn(format!(
+            "⚠ {} Dante device{} not syncing to clock: {}",
+            missing.len(),
+            if missing.len() == 1 { "" } else { "s" },
+            labels.join(", "),
+        ))]
+    }
+}
+
+impl Default for DanteState {
+    fn default() -> Self { Self::new() }
+}
+
+/// NDI-specific substate: sender IPs and names learned from `_ndi._tcp` mDNS.
+/// Both maps are session-lifetime (never pruned) — an NDI source that goes
+/// quiet keeps its name so a later TCP flow is still attributable. Grouped for
+/// symmetry with the other protocol-family substates; carries no per-window
+/// logic of its own. Bitrate aggregation lives on `CaptureState` because it
+/// reads the shared `streams`/`tcp_streams` maps, not these fields.
+pub struct NdiState {
+    pub sources: HashSet<Ipv4Addr>,
+    pub names:   HashMap<Ipv4Addr, String>,
+}
+
+impl NdiState {
+    pub fn new() -> Self {
+        Self { sources: HashSet::new(), names: HashMap::new() }
+    }
+}
+
+impl Default for NdiState {
+    fn default() -> Self { Self::new() }
+}
+
+/// IGMP-specific substate: per-window querier/report tracking plus the Join
+/// dedup map. Querier *identity* (IP, MAC, interval) lives on `NetworkHealth`
+/// because the score penalty reads it there — so the two `check_*` methods that
+/// need that identity take `&mut NetworkHealth` / `&NetworkHealth` as a param
+/// (interim signature, same shape as `DanteState::check_follower_census`).
+pub struct IgmpState {
+    /// Deduplicates IGMP Join console output — cleared on Leave so re-joins print again.
+    pub joins_seen: HashMap<(Ipv4Addr, Ipv4Addr), Instant>,
+    /// Per-window set of source IPs that sent an IGMP General Query.
+    pub querier_ips_this_window: HashSet<Ipv4Addr>,
+    /// Querier version detected from query payload length (2 or 3). Retained
+    /// across windows (last known version, not reset per window).
+    pub querier_version: Option<u8>,
+    /// Set when any IGMPv3 report (type 0x22) is seen this window.
+    pub v3_report_seen_this_window: bool,
+}
+
+impl IgmpState {
+    pub fn new() -> Self {
+        Self {
+            joins_seen: HashMap::new(),
+            querier_ips_this_window: HashSet::new(),
+            querier_version: None,
+            v3_report_seen_this_window: false,
+        }
+    }
+
+    /// Reset per-window IGMP tracking and prune the Join dedup map.
+    /// Must run AFTER `check_multiple_queriers()` (which reads
+    /// `querier_ips_this_window`) and before the next capture window begins.
+    pub fn reset_window(&mut self) {
+        self.querier_ips_this_window.clear();
+        self.v3_report_seen_this_window = false;
+        // Drop IGMP Join entries from hosts that vanished without sending a Leave.
+        self.joins_seen.retain(|_, t| t.elapsed() < Duration::from_secs(IGMP_JOIN_DEDUP_TTL_SECS));
+    }
+
+    /// Multiple IGMP queriers on the same LAN cause multicast group lists to
+    /// desync across switches, leading to lost PTP/audio traffic.
+    /// Sets `health.multiple_queriers_this_window` for the score penalty.
+    pub fn check_multiple_queriers(&self, health: &mut NetworkHealth) -> Vec<Alert> {
+        let mut sorted: Vec<String> = self.querier_ips_this_window
+            .iter().map(|ip| ip.to_string()).collect();
+        if sorted.len() < 2 {
+            return vec![];
+        }
+        health.multiple_queriers_this_window = true;
+        sorted.sort();
+        vec![Alert::error(format!(
+            "❌ Multiple IGMP queriers detected: {} — querier conflict causes multicast group desync; disable querier on all but one switch",
+            sorted.join(", "),
+        ))]
+    }
+
+    /// Advisory when an IGMPv2 querier is paired with IGMPv3 hosts.
+    /// Mac built-in Ethernet always sends IGMPv3 reports (0x22); some managed
+    /// switches only speak IGMPv2 and may silently drop those reports, starving
+    /// Mac hosts of Dante/AES67 multicast. Fires when querier version == 2 AND
+    /// v3 reports are seen.
+    pub fn check_version_mismatch(&self) -> Vec<Alert> {
+        if self.querier_version == Some(2) && self.v3_report_seen_this_window {
+            return vec![Alert::warn(
+                "⚠ IGMPv2 querier with IGMPv3 hosts — Mac built-in Ethernet sends IGMPv3 reports that an IGMPv2 querier may not process; affected Macs may lose Dante/AES67 multicast (workaround: use a USB/Thunderbolt Ethernet adapter)".to_string(),
+            )];
+        }
+        vec![]
+    }
+}
+
+impl Default for IgmpState {
+    fn default() -> Self { Self::new() }
+}
+
+/// AVB-specific substate: the four L2 maps with coupled lifecycles — AVTP
+/// per-stream stats, MSRP reservations, MVRP VLAN registrations, and
+/// ADP-discovered AVDECC entities. Grouped here because their pruning rules
+/// reference each other (MSRP pruned to surviving AVTP; MVRP cleared when AVTP
+/// is empty) — that interdependency wants to live in one `reset_window`.
+pub struct AvbState {
+    pub avtp_streams:    HashMap<[u8; 8], AvtpStreamStats>,
+    pub msrp_state:      HashMap<[u8; 8], MsrpDeclaration>,
+    pub mvrp_vlans:      HashSet<u16>,
+    /// AVDECC entities discovered via ADP (IEEE 1722.1) — keyed by entity_id EUI-64.
+    pub avdecc_entities: HashMap<[u8; 8], AvdeccEntity>,
+}
+
+impl AvbState {
+    pub fn new() -> Self {
+        Self {
+            avtp_streams:    HashMap::new(),
+            msrp_state:      HashMap::new(),
+            mvrp_vlans:      HashSet::new(),
+            avdecc_entities: HashMap::new(),
+        }
+    }
+
+    /// Prune AVTP streams that have gone silent, then keep the dependent maps in
+    /// step: MSRP reservations whose AVTP stream is gone have nothing to display;
+    /// MVRP VLAN registrations are cleared when no AVTP stream remains (MVRP is
+    /// periodic — the switch re-registers within seconds when AVB resumes); and
+    /// AVDECC entities expire once past their advertised valid_time (+10s grace).
+    pub fn reset_window(&mut self) {
+        self.avtp_streams.retain(|_, s| {
+            s.last_seen.elapsed().as_secs() < STREAM_PRUNE_SECS
+        });
+        self.msrp_state.retain(|sid, _| self.avtp_streams.contains_key(sid));
+        if self.avtp_streams.is_empty() {
+            self.mvrp_vlans.clear();
+        }
+        self.avdecc_entities.retain(|_, e| {
+            e.last_seen.elapsed().as_secs() < e.valid_time_secs.max(10) + 10
+        });
+    }
+}
+
+impl Default for AvbState {
+    fn default() -> Self { Self::new() }
+}
+
 /// All per-loop state owned by the capture loop. Handlers mutate fields here
 /// and return alerts to the dispatch layer.
 pub struct CaptureState {
@@ -97,23 +407,12 @@ pub struct CaptureState {
     // PTP stats keyed by (domain, version) — separates Dante PTPv1 from AES67/ST2110 PTPv2.
     pub ptp_domains:    HashMap<(u8, u8), PtpStats>,
     pub network_health: NetworkHealth,
-    // NDI sender IPs learned from mDNS — used for IP-based stream detection.
-    pub ndi_sources:    HashSet<Ipv4Addr>,
-    pub ndi_names:      HashMap<Ipv4Addr, String>,
-    // Dante sender IPs learned from mDNS or ConMon — tracked regardless of whether a name is known.
-    pub dante_sources:  HashSet<Ipv4Addr>,
-    pub dante_names:    HashMap<Ipv4Addr, String>,
-    // Live Dante devices observed via ConMon multicast (224.0.0.230-233:8700-8708).
-    // Link-local multicast — never IGMP-snooped, so this is a continuous liveness
-    // signal from any port even when all audio flows are unicast (no SPAN).
-    pub dante_conmon:   HashMap<Ipv4Addr, ConmonDevice>,
-    // Deduplicates IGMP Join console output — cleared on Leave so re-joins print again.
-    pub igmp_joins_seen: HashMap<(Ipv4Addr, Ipv4Addr), Instant>,
-    pub avtp_streams:    HashMap<[u8; 8], AvtpStreamStats>,
-    pub msrp_state:      HashMap<[u8; 8], MsrpDeclaration>,
-    pub mvrp_vlans:      HashSet<u16>,
-    // AVDECC entities discovered via ADP (IEEE 1722.1) — keyed by entity_id EUI-64.
-    pub avdecc_entities: HashMap<[u8; 8], AvdeccEntity>,
+    // Protocol-family substates — each groups its fields with its own
+    // reset_window/check_* methods for locality and independent testability.
+    pub dante: DanteState,
+    pub ndi:   NdiState,
+    pub igmp:  IgmpState,
+    pub avb:   AvbState,
     // EEE detection: (chassis_id, port_id) → (tx_wake_us, rx_wake_us)
     pub eee_ports:      HashMap<(String, String), (u16, u16)>,
     pub bytes_this_window: u64,
@@ -130,14 +429,6 @@ pub struct CaptureState {
     // handlers can avoid pushing the same group more than once.
     pub pending_join_groups: Vec<Ipv4Addr>,
     pub joined_multicast:    HashSet<Ipv4Addr>,
-    // Per-window set of source IPs that sent an IGMP General Query.
-    // Reset in reset_window; checked in check_igmp_multiple_queriers before reset.
-    pub igmp_querier_ips_this_window: HashSet<Ipv4Addr>,
-    // IGMP querier version detected from query payload length (2 or 3).
-    // Retained across windows (last known version, not reset per window).
-    pub igmp_querier_version: Option<u8>,
-    // Set when any IGMPv3 report (type 0x22) is seen this window.
-    pub igmp_v3_report_seen_this_window: bool,
     // Consecutive report cycles where ConMon is active but no mDNS/PTP/streams seen.
     // Resets to 0 when the condition clears.
     pub filter_unregistered_suspect_cycles: u32,
@@ -155,16 +446,6 @@ pub struct CaptureState {
     // IPv4 addresses of the capture interface itself — excluded from device
     // discovery so the tool doesn't report itself as a Dante/NDI device.
     pub local_ips: HashSet<Ipv4Addr>,
-    // Consecutive windows each dante_sources IP has been mDNS-only (no ConMon,
-    // no active stream). Reset to 0 when the device is verified; incremented
-    // each window it remains unverified. Used to flag management NICs and other
-    // non-Dante devices that respond to Dante mDNS queries.
-    pub dante_unverified_windows: HashMap<Ipv4Addr, u32>,
-    // Transmitter Class learned from a source's control-plane traffic (ConMon →
-    // Hardware; DVS/Via/FPGA ports → that class). DVS/Via override Hardware;
-    // Hardware never overwrites a more specific class. Session-lifetime (a stable
-    // device property), not pruned.
-    pub dante_transmitter_class: HashMap<Ipv4Addr, TransmitterClass>,
 }
 
 impl Default for CaptureState {
@@ -179,16 +460,10 @@ impl CaptureState {
             sdp_cache: HashMap::new(),
             ptp_domains: HashMap::new(),
             network_health: NetworkHealth::new(),
-            ndi_sources: HashSet::new(),
-            ndi_names: HashMap::new(),
-            dante_sources: HashSet::new(),
-            dante_names: HashMap::new(),
-            dante_conmon: HashMap::new(),
-            igmp_joins_seen: HashMap::new(),
-            avtp_streams:    HashMap::new(),
-            msrp_state:      HashMap::new(),
-            mvrp_vlans:      HashSet::new(),
-            avdecc_entities: HashMap::new(),
+            dante: DanteState::new(),
+            ndi:   NdiState::new(),
+            igmp:  IgmpState::new(),
+            avb:   AvbState::new(),
             eee_ports: HashMap::new(),
             bytes_this_window: 0,
             pause_frames_this_window: 0,
@@ -196,16 +471,11 @@ impl CaptureState {
             packets_dispatched: 0,
             pending_join_groups: Vec::new(),
             joined_multicast:    HashSet::new(),
-            igmp_querier_ips_this_window: HashSet::new(),
-            igmp_querier_version: None,
-            igmp_v3_report_seen_this_window: false,
             filter_unregistered_suspect_cycles: 0,
             multicast_bytes_this_window: 0,
             ptpv1_followers:     HashMap::new(),
             stream_count_history: Vec::new(),
             local_ips:           HashSet::new(),
-            dante_unverified_windows: HashMap::new(),
-            dante_transmitter_class: HashMap::new(),
         }
     }
 
@@ -235,54 +505,27 @@ impl CaptureState {
             s.last_seen.elapsed().as_secs() < STREAM_PRUNE_SECS
                 && !matches!(s.stream_quality, StreamQuality::Terminated)
         });
-        self.avtp_streams.retain(|_, s| {
-            s.last_seen.elapsed().as_secs() < STREAM_PRUNE_SECS
-        });
-        // Prune MSRP reservation state for stream IDs whose AVTP stream was
-        // just pruned — a gone stream has no active reservation to display.
-        self.msrp_state.retain(|sid, _| self.avtp_streams.contains_key(sid));
-        // Clear MVRP VLAN registrations when there are no active AVTP streams.
-        // MVRP is periodic — when AVB is active, the switch re-registers VLANs
-        // within a few seconds, so clearing here causes no lasting data loss.
-        if self.avtp_streams.is_empty() {
-            self.mvrp_vlans.clear();
-        }
+        // AVB substate: AVTP prune + dependent MSRP/MVRP/AVDECC pruning.
+        self.avb.reset_window();
         // Clear per-window PTPv1 Sync sender census. Must happen AFTER
         // check_ptp_sync_conflict() (called by main.rs before reset_window).
         for ptp in self.ptp_domains.values_mut() {
             ptp.sync_senders_this_window.clear();
         }
-        // Drop ConMon devices that stopped announcing (metering is ~33 Hz, so
-        // a minute of silence means the device left the network).
-        self.dante_conmon.retain(|_, d| d.last_seen.elapsed().as_secs() < CONMON_PRUNE_SECS);
-        // Update mDNS-only verification counters. A device is "verified" when it
-        // has ConMon activity or an active stream; otherwise increment its window
-        // count. After 3 consecutive unverified windows the report flags it.
-        for ip in &self.dante_sources {
-            let has_stream = self.streams.values().any(|s| s.src_ip == Some(*ip));
-            let has_conmon = self.dante_conmon.contains_key(ip);
-            if has_stream || has_conmon {
-                self.dante_unverified_windows.remove(ip);
-            } else {
-                *self.dante_unverified_windows.entry(*ip).or_insert(0) += 1;
-            }
-        }
-        self.dante_unverified_windows.retain(|ip, _| self.dante_sources.contains(ip));
+        // Dante substate: ConMon pruning + unverified-windows update.
+        // Must run after check_conmon_bridge / check_follower_census (they read
+        // the pre-reset data) and before the next capture window begins.
+        self.dante.reset_window(&self.streams);
         // PTPv1 followers: Delay_Req rate is ~1/s; prune after 15s to survive
         // inter-cycle gaps without false-positive census drops.
         self.ptpv1_followers.retain(|_, t| t.elapsed().as_secs() < 15);
-        // Reset per-window IGMP querier tracking. Must happen AFTER
-        // check_igmp_multiple_queriers() which reads this set.
-        self.igmp_querier_ips_this_window.clear();
+        // IGMP substate: per-window querier/report reset + Join-dedup pruning.
+        // Must run AFTER check_multiple_queriers() (which reads
+        // querier_ips_this_window). The network_health flag is reset here
+        // because it lives on NetworkHealth, not IgmpState.
+        self.igmp.reset_window();
         self.network_health.multiple_queriers_this_window = false;
-        self.igmp_v3_report_seen_this_window = false;
         self.multicast_bytes_this_window = 0;
-        // Drop IGMP Join entries from hosts that vanished without sending a Leave.
-        self.igmp_joins_seen.retain(|_, t| t.elapsed() < Duration::from_secs(IGMP_JOIN_DEDUP_TTL_SECS));
-        // Prune AVDECC entities whose ADP announcement has expired (valid_time + 10s grace).
-        self.avdecc_entities.retain(|_, e| {
-            e.last_seen.elapsed().as_secs() < e.valid_time_secs.max(10) + 10
-        });
     }
 
     // ── Handlers ────────────────────────────────────────────────────────────
@@ -340,7 +583,7 @@ impl CaptureState {
 
         // ENTITY_DEPARTING — device is leaving the network.
         if adp.message_type == 1 {
-            if self.avdecc_entities.remove(&adp.entity_id).is_some() {
+            if self.avb.avdecc_entities.remove(&adp.entity_id).is_some() {
                 return vec![Alert::info(format!(
                     "➖ AVDECC entity departed: {}", fmt_eui64(&adp.entity_id)
                 ))];
@@ -353,12 +596,12 @@ impl CaptureState {
 
         // ENTITY_AVAILABLE (0) — upsert.
         let eui = fmt_eui64(&adp.entity_id);
-        let entry = self.avdecc_entities.get(&adp.entity_id);
+        let entry = self.avb.avdecc_entities.get(&adp.entity_id);
 
         let is_new     = entry.is_none();
         let state_changed = entry.is_some_and(|e| e.available_index != adp.available_index);
 
-        self.avdecc_entities.insert(adp.entity_id, AvdeccEntity {
+        self.avb.avdecc_entities.insert(adp.entity_id, AvdeccEntity {
             entity_id:             adp.entity_id,
             entity_model_id:       adp.entity_model_id,
             entity_capabilities:   adp.entity_capabilities,
@@ -532,10 +775,10 @@ impl CaptureState {
         match kind {
             DanteKind::Discovery { device_name } => {
                 if self.local_ips.contains(&src) { return vec![]; }
-                let is_new = !self.dante_sources.contains(&src);
-                self.dante_sources.insert(src);
+                let is_new = !self.dante.sources.contains(&src);
+                self.dante.sources.insert(src);
                 if let Some(ref name) = device_name {
-                    self.dante_names.insert(src, name.clone());
+                    self.dante.names.insert(src, name.clone());
                     // Retroactive naming: a stream observed before this device's
                     // mDNS announcement was created nameless — backfill it now.
                     // Name is written once (same rule as SAP session names) so
@@ -556,8 +799,8 @@ impl CaptureState {
             DanteKind::Control => vec![],
             DanteKind::ConMon { device_mac, channels } => {
                 if self.local_ips.contains(&src) { return vec![]; }
-                let _is_new = !self.dante_conmon.contains_key(&src);
-                let entry = self.dante_conmon.entry(src).or_insert_with(|| ConmonDevice {
+                let _is_new = !self.dante.conmon.contains_key(&src);
+                let entry = self.dante.conmon.entry(src).or_insert_with(|| ConmonDevice {
                     mac: device_mac, channels: None, packets: 0, last_seen: now,
                 });
                 entry.packets += 1;
@@ -568,23 +811,23 @@ impl CaptureState {
                 if channels.is_some() { entry.channels = channels; }
                 // ConMon proves a live Dante device even before (or without) mDNS —
                 // count it as a discovered source so the device list includes it.
-                self.dante_sources.insert(src);
+                self.dante.sources.insert(src);
                 // The "Audinate" ConMon signature is a positive Hardware tell.
-                self.record_tx_class(src, TransmitterClass::Hardware);
+                self.dante.record_tx_class(src, TransmitterClass::Hardware);
                 vec![]
             }
             DanteKind::ControlPlane { class } => {
                 // Product-specific control-plane traffic positively identifies the
                 // source's Transmitter Class. Proves a Dante device, like ConMon.
                 if !self.local_ips.contains(&src) {
-                    self.dante_sources.insert(src);
-                    self.record_tx_class(src, class);
+                    self.dante.sources.insert(src);
+                    self.dante.record_tx_class(src, class);
                 }
                 vec![]
             }
             DanteKind::AudioStream => {
                 let is_mc = crate::parser::is_multicast(dst);
-                let cp_class = self.dante_transmitter_class.get(&src).copied();
+                let cp_class = self.dante.transmitter_class.get(&src).copied();
                 // Key on src AND dst: one device can transmit several flows from
                 // the same source port to different destinations (e.g. multiple
                 // multicast groups) — keying on src:port alone merged them,
@@ -594,7 +837,7 @@ impl CaptureState {
                     let mut s = StreamStats::new_with_info("Dante", DEFAULT_CLOCK_HZ, is_mc, dst, dst_port);
                     s.ptime_ms = 1.0; // Dante standard: 48 samples @ 48kHz = 1ms
                     s.src_ip = Some(src);
-                    s.sdp_name = self.dante_names.get(&src).cloned();
+                    s.sdp_name = self.dante.names.get(&src).cloned();
                     s
                 });
                 if let Some(ip) = pnet_packet::ipv4::Ipv4Packet::new(l2_payload)
@@ -646,22 +889,12 @@ impl CaptureState {
         }
     }
 
-    /// Record a Transmitter Class learned from a source's control-plane traffic.
-    /// DVS/Via are more specific than Hardware, so they overwrite; a Hardware
-    /// signal never downgrades an existing DVS/Via verdict.
-    fn record_tx_class(&mut self, src: Ipv4Addr, class: TransmitterClass) {
-        match class {
-            TransmitterClass::Hardware => { self.dante_transmitter_class.entry(src).or_insert(class); }
-            _ => { self.dante_transmitter_class.insert(src, class); }
-        }
-    }
-
     /// NDI mDNS discovery — registers the source IP and emits a discovery line.
     pub fn handle_ndi_discovery(&mut self, src: Ipv4Addr, source_name: Option<String>) -> Vec<Alert> {
         if self.local_ips.contains(&src) { return vec![]; }
-        self.ndi_sources.insert(src);
+        self.ndi.sources.insert(src);
         if let Some(ref name) = source_name {
-            self.ndi_names.insert(src, name.clone());
+            self.ndi.names.insert(src, name.clone());
         }
         let label = source_name.as_deref().unwrap_or("unknown source");
         vec![Alert::info(format!("🔍 NDI source: {}  \"{}\"", src, label))]
@@ -692,7 +925,7 @@ impl CaptureState {
             stats.last_bitrate_check = now;
         }
 
-        let entry = self.avtp_streams.entry(sid)
+        let entry = self.avb.avtp_streams.entry(sid)
             .or_insert_with(|| AvtpStreamStats::new(sid, subtype));
         entry.packets += 1;
         entry.last_seen = now;
@@ -717,7 +950,7 @@ impl CaptureState {
                     code_str
                 )));
             }
-            self.msrp_state.insert(decl.stream_id, decl);
+            self.avb.msrp_state.insert(decl.stream_id, decl);
         }
         alerts
     }
@@ -726,7 +959,7 @@ impl CaptureState {
     pub fn handle_mvrp(&mut self, vlan_ids: Vec<u16>) -> Vec<Alert> {
         let mut alerts = Vec::new();
         for vid in vlan_ids {
-            if self.mvrp_vlans.insert(vid) {
+            if self.avb.mvrp_vlans.insert(vid) {
                 alerts.push(Alert::info(format!("🔖 MVRP: VLAN {} registered", vid)));
             }
         }
@@ -751,14 +984,14 @@ impl CaptureState {
         let mut alerts = Vec::new();
         match igmp_type {
             IgmpType::Join => {
-                let first_time = !self.igmp_joins_seen.contains_key(&(src, group));
-                self.igmp_joins_seen.insert((src, group), now);
+                let first_time = !self.igmp.joins_seen.contains_key(&(src, group));
+                self.igmp.joins_seen.insert((src, group), now);
                 if first_time {
                     alerts.push(Alert::info(format!("➕ IGMP Join: {} → group {}", src, group)));
                 }
             }
             IgmpType::Leave => {
-                self.igmp_joins_seen.remove(&(src, group));
+                self.igmp.joins_seen.remove(&(src, group));
                 alerts.push(Alert::info(format!("➖ IGMP Leave: {} → group {}", src, group)));
                 if self.streams.values().any(|s| s.dst_ip == Some(group)) {
                     alerts.push(Alert::warn(format!("    ⚠  IGMP Leave on monitored group {}", group)));
@@ -772,7 +1005,7 @@ impl CaptureState {
                         self.pending_join_groups.push(group);
                     }
                 }
-                self.igmp_v3_report_seen_this_window = true;
+                self.igmp.v3_report_seen_this_window = true;
                 // No console output — infrastructure detail, not user-visible.
             }
             IgmpType::Query { version } => {
@@ -783,9 +1016,9 @@ impl CaptureState {
                 self.network_health.last_igmp_query = Some(now);
                 self.network_health.igmp_querier_ip = Some(src);
                 self.network_health.igmp_querier_mac = Some(src_mac);
-                self.igmp_querier_ips_this_window.insert(src);
+                self.igmp.querier_ips_this_window.insert(src);
                 // Track querier version for v2/v3 mismatch detection.
-                self.igmp_querier_version = Some(version);
+                self.igmp.querier_version = Some(version);
                 alerts.push(Alert::info(format!("❓ IGMP Query (v{}): {} → group {}", version, src, group)));
             }
             IgmpType::Unknown(t) => {
@@ -874,37 +1107,6 @@ impl CaptureState {
         vec![]
     }
 
-    /// Multiple IGMP queriers on the same LAN cause multicast group lists to
-    /// desync across switches, leading to lost PTP/audio traffic.
-    /// Tracked per window in `igmp_querier_ips_this_window`; sets
-    /// `network_health.multiple_queriers_this_window` for score penalty.
-    pub fn check_igmp_multiple_queriers(&mut self) -> Vec<Alert> {
-        let mut sorted: Vec<String> = self.igmp_querier_ips_this_window
-            .iter().map(|ip| ip.to_string()).collect();
-        if sorted.len() < 2 {
-            return vec![];
-        }
-        self.network_health.multiple_queriers_this_window = true;
-        sorted.sort();
-        vec![Alert::error(format!(
-            "❌ Multiple IGMP queriers detected: {} — querier conflict causes multicast group desync; disable querier on all but one switch",
-            sorted.join(", "),
-        ))]
-    }
-
-    /// Advisory when an IGMPv2 querier is paired with IGMPv3 hosts.
-    /// Mac built-in Ethernet always sends IGMPv3 reports (0x22); some managed switches
-    /// only speak IGMPv2 and may silently drop those reports, starving Mac hosts of
-    /// Dante/AES67 multicast. Fires when querier version == 2 AND v3 reports are seen.
-    pub fn check_igmp_version_mismatch(&self) -> Vec<Alert> {
-        if self.igmp_querier_version == Some(2) && self.igmp_v3_report_seen_this_window {
-            return vec![Alert::warn(
-                "⚠ IGMPv2 querier with IGMPv3 hosts — Mac built-in Ethernet sends IGMPv3 reports that an IGMPv2 querier may not process; affected Macs may lose Dante/AES67 multicast (workaround: use a USB/Thunderbolt Ethernet adapter)".to_string(),
-            )];
-        }
-        vec![]
-    }
-
     /// Alert when ConMon (link-local, always-visible) shows live Dante devices but no
     /// mDNS, PTP, or audio streams are visible — the fingerprint of a switch with
     /// "Filter Unregistered Multicast" (or "Block Unknown Multicast") enabled, which
@@ -912,10 +1114,10 @@ impl CaptureState {
     /// Fires after ≥2 consecutive cycles with this condition to avoid false positives
     /// on startup before mDNS/PTP traffic has arrived.
     pub fn check_filter_unregistered_multicast(&mut self) -> Vec<Alert> {
-        let conmon_active = !self.dante_conmon.is_empty();
-        let no_mdns       = self.dante_names.is_empty();
+        let conmon_active = !self.dante.conmon.is_empty();
+        let no_mdns       = self.dante.names.is_empty();
         let no_ptp        = self.ptp_domains.values().all(|p| p.packets == 0);
-        let no_streams    = self.streams.is_empty() && self.avtp_streams.is_empty();
+        let no_streams    = self.streams.is_empty() && self.avb.avtp_streams.is_empty();
 
         if conmon_active && no_mdns && no_ptp && no_streams {
             self.filter_unregistered_suspect_cycles += 1;
@@ -951,7 +1153,7 @@ impl CaptureState {
     /// joined those groups via IGMP. Not fired in offline mode (pcap can't join groups).
     pub fn check_igmp_snooping_blocking_ptp(&self, is_offline: bool) -> Vec<Alert> {
         if is_offline { return vec![]; }
-        let has_dante_devices = !self.dante_sources.is_empty() || !self.dante_conmon.is_empty();
+        let has_dante_devices = !self.dante.sources.is_empty() || !self.dante.conmon.is_empty();
         if !has_dante_devices { return vec![]; }
         let has_ptp = self.ptp_domains.values().any(|p| p.packets > 0);
         if has_ptp { return vec![]; }
@@ -969,7 +1171,7 @@ impl CaptureState {
     /// flooding new multicast groups. Requires a full 3-window baseline before
     /// alerting so normal startup growth doesn't trigger a false positive.
     pub fn check_stream_count_anomaly(&mut self) -> Vec<Alert> {
-        let current = self.streams.len() + self.tcp_streams.len() + self.avtp_streams.len();
+        let current = self.streams.len() + self.tcp_streams.len() + self.avb.avtp_streams.len();
 
         let mut alerts = Vec::new();
         if self.stream_count_history.len() == 3 {
@@ -1036,7 +1238,7 @@ impl CaptureState {
 
         // ── L2 gPTP (AVB) ────────────────────────────────────────────────────
         let avb_active = expanded.iter().any(|c| matches!(c, ProtocolChoice::AVB))
-            && !self.avtp_streams.is_empty();
+            && !self.avb.avtp_streams.is_empty();
         let has_gptp = self.ptp_domains.values().any(|s|
             s.clock_valid && s.protocol_kind.as_deref() == Some("AVB"));
         if avb_active && !has_gptp {
@@ -1044,146 +1246,6 @@ impl CaptureState {
         }
 
         missing
-    }
-
-    /// Re-compute NDI per-stream bitrate by summing matching TCP flows.
-    /// Called once per report cycle.
-    /// Detect accidental bridging of Dante primary and secondary networks.
-    ///
-    /// Dante redundancy requires the two networks to be fully isolated. If they
-    /// are connected (e.g. a cross-cable, a misconfigured uplink, or a device
-    /// acting as a bridge), both interfaces of the same physical device appear
-    /// on the same L2 segment. ConMon frames carry the sender MAC in the payload;
-    /// two distinct source IPs with the same MAC means two NICs of the same
-    /// device are visible simultaneously — the redundancy networks are bridged.
-    pub fn check_dante_conmon_bridge(&self) -> Vec<Alert> {
-        // Build MAC → [source IPs] map.
-        let mut mac_to_ips: HashMap<[u8; 6], Vec<Ipv4Addr>> = HashMap::new();
-        for (src_ip, device) in &self.dante_conmon {
-            mac_to_ips.entry(device.mac).or_default().push(*src_ip);
-        }
-
-        let mut alerts = Vec::new();
-        for (mac, ips) in &mac_to_ips {
-            if ips.len() < 2 { continue; }
-            let mac_str = format!("{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-                mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-            let mut ip_strs: Vec<String> = ips.iter().map(|ip| ip.to_string()).collect();
-            ip_strs.sort();
-            let name = ips.iter().find_map(|ip| self.dante_names.get(ip))
-                .map(|n| format!("  \"{}\"", n)).unwrap_or_default();
-            alerts.push(Alert::error(format!(
-                "❌ Dante redundancy bridged: MAC {}{}  seen from {} IPs ({}) — primary and secondary networks are connected",
-                mac_str, name, ips.len(), ip_strs.join(", "),
-            )));
-        }
-        alerts
-    }
-
-    pub fn check_dante_ip_config(&self) -> Vec<Alert> {
-        if self.dante_sources.len() < 2 {
-            return vec![];
-        }
-
-        let mut alerts = Vec::new();
-
-        let is_link_local = |ip: &Ipv4Addr| {
-            let o = ip.octets();
-            (o[0] == 169 && o[1] == 254) || (o[0] == 172 && o[1] == 31)
-        };
-
-        let link_local: Vec<Ipv4Addr> = self.dante_sources.iter().filter(|ip| is_link_local(ip)).copied().collect();
-        let routable:   Vec<Ipv4Addr> = self.dante_sources.iter().filter(|ip| !is_link_local(ip)).copied().collect();
-
-        if !link_local.is_empty() && !routable.is_empty() {
-            // Mixed: some devices have DHCP, others fell back to link-local.
-            let mut sorted = link_local.clone();
-            sorted.sort();
-            for ip in sorted {
-                let name = self.dante_names.get(&ip)
-                    .map(|n| format!("\"{}\" ", n))
-                    .unwrap_or_default();
-                alerts.push(Alert::error(format!(
-                    "❌ Dante device {}({}) has no DHCP address — subscriptions to/from this device will fail",
-                    name, ip,
-                )));
-            }
-        }
-        // All-link-local is a valid Dante deployment (DHCP intentionally absent); no alert.
-
-        // Subnet split: routable IPs in more than one /24.
-        if routable.len() >= 2 {
-            let mut subnets: std::collections::HashSet<[u8; 3]> = std::collections::HashSet::new();
-            for ip in &routable {
-                let o = ip.octets();
-                subnets.insert([o[0], o[1], o[2]]);
-            }
-            if subnets.len() > 1 {
-                let mut labels: Vec<String> = subnets.iter()
-                    .map(|s| format!("{}.{}.{}.0/24", s[0], s[1], s[2]))
-                    .collect();
-                labels.sort();
-                alerts.push(Alert::warn(format!(
-                    "⚠ Dante devices span {} subnets ({}) — mDNS discovery and PTP sync are multicast-only and cannot cross subnet boundaries; use Dante Domain Manager (DDM) or Dante Director for cross-subnet operation",
-                    subnets.len(), labels.join(", "),
-                )));
-            }
-        }
-
-        alerts
-    }
-
-    /// Alert when fewer Dante devices than expected are sending PTPv1 Delay_Req.
-    /// The grandmaster never sends Delay_Req, so N == M-1 is healthy.
-    /// Only fires once at least one follower has been seen (avoids false positives
-    /// at startup before the first Delay_Req arrives).
-    pub fn check_dante_follower_census(&self) -> Vec<Alert> {
-        let total = self.dante_sources.len();
-        let syncing = self.ptpv1_followers.len();
-
-        // Need a PTPv1 domain, at least 2 discovered devices, and at least one follower seen.
-        let has_ptpv1 = self.ptp_domains.keys().any(|(_, v)| *v == crate::protocols::PTP_VERSION_V1);
-        if !has_ptpv1 || total < 2 || syncing == 0 {
-            return vec![];
-        }
-
-        // Grandmaster IP from the active PTPv1 domain — it never sends Delay_Req.
-        let gm_ip: Option<Ipv4Addr> = self.ptp_domains.iter()
-            .filter(|((_, v), _)| *v == crate::protocols::PTP_VERSION_V1)
-            .filter_map(|(_, stats)| stats.grandmaster_src_ip)
-            .next();
-
-        // Devices that are neither followers nor the known grandmaster.
-        let mut candidates: Vec<Ipv4Addr> = self.dante_sources.iter()
-            .filter(|ip| !self.ptpv1_followers.contains_key(ip))
-            .copied()
-            .collect();
-        candidates.sort();
-
-        // When the GM IP is not yet observed, assume exactly one non-follower slot
-        // belongs to the GM (count-based fallback, consistent with old behaviour).
-        let missing: Vec<Ipv4Addr> = match gm_ip {
-            Some(gm) => candidates.into_iter().filter(|ip| *ip != gm).collect(),
-            None     => if candidates.len() <= 1 { vec![] } else { candidates },
-        };
-
-        if missing.is_empty() {
-            return vec![];
-        }
-
-        let labels: Vec<String> = missing.iter().map(|ip| {
-            match self.dante_names.get(ip) {
-                Some(name) => format!("\"{}\" ({})", name, ip),
-                None       => ip.to_string(),
-            }
-        }).collect();
-
-        vec![Alert::warn(format!(
-            "⚠ {} Dante device{} not syncing to clock: {}",
-            missing.len(),
-            if missing.len() == 1 { "" } else { "s" },
-            labels.join(", "),
-        ))]
     }
 
     pub fn aggregate_ndi_bitrate(&mut self) {
@@ -1476,7 +1538,7 @@ mod tests {
     fn dante_audio_stream_picks_up_name_from_mdns_cache() {
         let mut state = CaptureState::new();
         let src = Ipv4Addr::new(192, 168, 1, 50);
-        state.dante_names.insert(src, "Stage Box".to_string());
+        state.dante.names.insert(src, "Stage Box".to_string());
         // empty l2_payload — name pickup happens before IP parse
         let alerts = state.handle_dante(DanteKind::AudioStream, src, Ipv4Addr::new(192,168,1,60), 5004, &[], Instant::now());
         assert!(alerts.is_empty());
@@ -1527,8 +1589,8 @@ mod tests {
             DanteKind::ControlPlane { class: TransmitterClass::Dvs },
             src, Ipv4Addr::new(192,168,1,81), 38700, &[], Instant::now(),
         );
-        assert_eq!(state.dante_transmitter_class.get(&src), Some(&TransmitterClass::Dvs));
-        assert!(state.dante_sources.contains(&src));
+        assert_eq!(state.dante.transmitter_class.get(&src), Some(&TransmitterClass::Dvs));
+        assert!(state.dante.sources.contains(&src));
         // An audio flow from that source now carries a confirmed DVS verdict.
         state.handle_dante(DanteKind::AudioStream, src, Ipv4Addr::new(239,255,1,1), 4321, &[], Instant::now());
         let v = state.streams.values()
@@ -1548,13 +1610,13 @@ mod tests {
             DanteKind::ConMon { device_mac: [0,1,2,3,4,5], channels: None },
             src, Ipv4Addr::new(224,0,0,232), 8705, &[], Instant::now(),
         );
-        assert_eq!(state.dante_transmitter_class.get(&src), Some(&TransmitterClass::Hardware));
+        assert_eq!(state.dante.transmitter_class.get(&src), Some(&TransmitterClass::Hardware));
         // A later DVS control-plane signal is more specific and overrides Hardware.
         state.handle_dante(
             DanteKind::ControlPlane { class: TransmitterClass::Dvs },
             src, Ipv4Addr::new(192,168,1,83), 38800, &[], Instant::now(),
         );
-        assert_eq!(state.dante_transmitter_class.get(&src), Some(&TransmitterClass::Dvs),
+        assert_eq!(state.dante.transmitter_class.get(&src), Some(&TransmitterClass::Dvs),
             "DVS must override a prior Hardware verdict");
     }
 
@@ -1612,8 +1674,8 @@ mod tests {
         assert_eq!(alerts.len(), 1);
         assert_eq!(alerts[0].level, AlertLevel::Info);
         assert!(alerts[0].message.contains("Stage Box"));
-        assert!(state.dante_sources.contains(&src));
-        assert_eq!(state.dante_names.get(&src).map(|s| s.as_str()), Some("Stage Box"));
+        assert!(state.dante.sources.contains(&src));
+        assert_eq!(state.dante.names.get(&src).map(|s| s.as_str()), Some("Stage Box"));
     }
 
     #[test]
@@ -1628,8 +1690,8 @@ mod tests {
         );
         assert_eq!(alerts.len(), 1);
         assert!(alerts[0].message.contains("unknown device"));
-        assert!(state.dante_sources.contains(&src));
-        assert!(!state.dante_names.contains_key(&src), "dante_names should stay empty for unknown device");
+        assert!(state.dante.sources.contains(&src));
+        assert!(!state.dante.names.contains_key(&src), "dante_names should stay empty for unknown device");
     }
 
     #[test]
@@ -1647,7 +1709,7 @@ mod tests {
         );
         assert_eq!(first.len(), 1, "first discovery should emit alert");
         assert_eq!(second.len(), 0, "duplicate discovery should emit no alert");
-        assert_eq!(state.dante_sources.len(), 1);
+        assert_eq!(state.dante.sources.len(), 1);
     }
 
     // ── Dante ConMon ─────────────────────────────────────────────────────────
@@ -1667,11 +1729,11 @@ mod tests {
         );
         assert_eq!(first.len(), 0, "ConMon sightings are silent — liveness shown in periodic report");
         assert_eq!(second.len(), 0, "repeat sightings are silent");
-        let dev = state.dante_conmon.get(&src).expect("device tracked");
+        let dev = state.dante.conmon.get(&src).expect("device tracked");
         assert_eq!(dev.mac, mac);
         assert_eq!(dev.channels, Some(32));
         assert_eq!(dev.packets, 2);
-        assert!(state.dante_sources.contains(&src),
+        assert!(state.dante.sources.contains(&src),
             "ConMon device counts as a discovered Dante source");
     }
 
@@ -1686,7 +1748,7 @@ mod tests {
             src, Ipv4Addr::new(224, 0, 0, 232), 8705, &[], Instant::now());
         state.handle_dante(DanteKind::ConMon { device_mac: mac, channels: None },
             src, Ipv4Addr::new(224, 0, 0, 233), 8708, &[], Instant::now());
-        assert_eq!(state.dante_conmon[&src].channels, Some(32));
+        assert_eq!(state.dante.conmon[&src].channels, Some(32));
     }
 
     // ── Dante ConMon redundancy bridge detection ─────────────────────────────
@@ -1697,7 +1759,7 @@ mod tests {
         let mac = [0x00, 0x1d, 0xc1, 0x19, 0x86, 0x2a];
         state.handle_dante(DanteKind::ConMon { device_mac: mac, channels: None },
             Ipv4Addr::new(169, 254, 81, 11), Ipv4Addr::new(224, 0, 0, 232), 8705, &[], Instant::now());
-        assert!(state.check_dante_conmon_bridge().is_empty());
+        assert!(state.dante.check_conmon_bridge().is_empty());
     }
 
     #[test]
@@ -1709,7 +1771,7 @@ mod tests {
             Ipv4Addr::new(169, 254, 81, 11), Ipv4Addr::new(224, 0, 0, 232), 8705, &[], Instant::now());
         state.handle_dante(DanteKind::ConMon { device_mac: mac, channels: None },
             Ipv4Addr::new(192, 168, 1, 11), Ipv4Addr::new(224, 0, 0, 232), 8705, &[], Instant::now());
-        let alerts = state.check_dante_conmon_bridge();
+        let alerts = state.dante.check_conmon_bridge();
         assert_eq!(alerts.len(), 1);
         assert!(matches!(alerts[0].level, AlertLevel::Error));
         assert!(alerts[0].message.contains("00:1d:c1:19:86:2a"));
@@ -1723,12 +1785,12 @@ mod tests {
         let mac = [0x00, 0x1d, 0xc1, 0x19, 0x86, 0x2a];
         let ip1 = Ipv4Addr::new(169, 254, 81, 11);
         let ip2 = Ipv4Addr::new(192, 168, 1, 11);
-        state.dante_names.insert(ip1, "Rio3224-D2".to_string());
+        state.dante.names.insert(ip1, "Rio3224-D2".to_string());
         state.handle_dante(DanteKind::ConMon { device_mac: mac, channels: None },
             ip1, Ipv4Addr::new(224, 0, 0, 232), 8705, &[], Instant::now());
         state.handle_dante(DanteKind::ConMon { device_mac: mac, channels: None },
             ip2, Ipv4Addr::new(224, 0, 0, 232), 8705, &[], Instant::now());
-        let alerts = state.check_dante_conmon_bridge();
+        let alerts = state.dante.check_conmon_bridge();
         assert_eq!(alerts.len(), 1);
         assert!(alerts[0].message.contains("\"Rio3224-D2\""));
     }
@@ -1742,7 +1804,7 @@ mod tests {
             Ipv4Addr::new(169, 254, 81, 11), Ipv4Addr::new(224, 0, 0, 232), 8705, &[], Instant::now());
         state.handle_dante(DanteKind::ConMon { device_mac: mac_b, channels: None },
             Ipv4Addr::new(169, 254, 149, 65), Ipv4Addr::new(224, 0, 0, 232), 8705, &[], Instant::now());
-        assert!(state.check_dante_conmon_bridge().is_empty());
+        assert!(state.dante.check_conmon_bridge().is_empty());
     }
 
     // ── Dante IP misconfiguration detection ──────────────────────────────────
@@ -1750,26 +1812,26 @@ mod tests {
     #[test]
     fn ip_config_no_alert_with_fewer_than_two_devices() {
         let mut state = CaptureState::new();
-        state.dante_sources.insert(Ipv4Addr::new(169, 254, 1, 1));
-        assert!(state.check_dante_ip_config().is_empty());
+        state.dante.sources.insert(Ipv4Addr::new(169, 254, 1, 1));
+        assert!(state.dante.check_ip_config().is_empty());
     }
 
     #[test]
     fn ip_config_all_link_local_no_alert() {
         // All-link-local is a valid Dante deployment; no alert should fire.
         let mut state = CaptureState::new();
-        state.dante_sources.insert(Ipv4Addr::new(169, 254, 1, 1));
-        state.dante_sources.insert(Ipv4Addr::new(169, 254, 1, 2));
-        assert!(state.check_dante_ip_config().is_empty());
+        state.dante.sources.insert(Ipv4Addr::new(169, 254, 1, 1));
+        state.dante.sources.insert(Ipv4Addr::new(169, 254, 1, 2));
+        assert!(state.dante.check_ip_config().is_empty());
     }
 
     #[test]
     fn ip_config_mixed_link_local_and_routable_errors_per_device() {
         let mut state = CaptureState::new();
         let ll = Ipv4Addr::new(169, 254, 1, 5);
-        state.dante_sources.insert(ll);
-        state.dante_sources.insert(Ipv4Addr::new(192, 168, 1, 10));
-        let alerts = state.check_dante_ip_config();
+        state.dante.sources.insert(ll);
+        state.dante.sources.insert(Ipv4Addr::new(192, 168, 1, 10));
+        let alerts = state.dante.check_ip_config();
         assert_eq!(alerts.len(), 1);
         assert!(matches!(alerts[0].level, AlertLevel::Error));
         assert!(alerts[0].message.contains("169.254.1.5"));
@@ -1779,27 +1841,27 @@ mod tests {
     fn ip_config_mixed_includes_device_name() {
         let mut state = CaptureState::new();
         let ll = Ipv4Addr::new(169, 254, 1, 5);
-        state.dante_sources.insert(ll);
-        state.dante_names.insert(ll, "StageBox".to_string());
-        state.dante_sources.insert(Ipv4Addr::new(192, 168, 1, 10));
-        let alerts = state.check_dante_ip_config();
+        state.dante.sources.insert(ll);
+        state.dante.names.insert(ll, "StageBox".to_string());
+        state.dante.sources.insert(Ipv4Addr::new(192, 168, 1, 10));
+        let alerts = state.dante.check_ip_config();
         assert!(alerts[0].message.contains("\"StageBox\""));
     }
 
     #[test]
     fn ip_config_same_subnet_no_alert() {
         let mut state = CaptureState::new();
-        state.dante_sources.insert(Ipv4Addr::new(192, 168, 1, 10));
-        state.dante_sources.insert(Ipv4Addr::new(192, 168, 1, 20));
-        assert!(state.check_dante_ip_config().is_empty());
+        state.dante.sources.insert(Ipv4Addr::new(192, 168, 1, 10));
+        state.dante.sources.insert(Ipv4Addr::new(192, 168, 1, 20));
+        assert!(state.dante.check_ip_config().is_empty());
     }
 
     #[test]
     fn ip_config_subnet_split_warns() {
         let mut state = CaptureState::new();
-        state.dante_sources.insert(Ipv4Addr::new(192, 168, 1, 10));
-        state.dante_sources.insert(Ipv4Addr::new(10, 0, 0, 5));
-        let alerts = state.check_dante_ip_config();
+        state.dante.sources.insert(Ipv4Addr::new(192, 168, 1, 10));
+        state.dante.sources.insert(Ipv4Addr::new(10, 0, 0, 5));
+        let alerts = state.dante.check_ip_config();
         assert_eq!(alerts.len(), 1);
         assert!(matches!(alerts[0].level, AlertLevel::Warn));
         assert!(alerts[0].message.contains("2 subnets"));
@@ -1811,18 +1873,18 @@ mod tests {
     fn ip_config_172_31_all_link_local_no_alert() {
         // All 172.31.x.x (Dante link-local fallback) — valid deployment, no alert.
         let mut state = CaptureState::new();
-        state.dante_sources.insert(Ipv4Addr::new(172, 31, 0, 1));
-        state.dante_sources.insert(Ipv4Addr::new(172, 31, 0, 2));
-        assert!(state.check_dante_ip_config().is_empty());
+        state.dante.sources.insert(Ipv4Addr::new(172, 31, 0, 1));
+        state.dante.sources.insert(Ipv4Addr::new(172, 31, 0, 2));
+        assert!(state.dante.check_ip_config().is_empty());
     }
 
     #[test]
     fn ip_config_172_31_mixed_with_routable_errors() {
         let mut state = CaptureState::new();
         let ll = Ipv4Addr::new(172, 31, 0, 5);
-        state.dante_sources.insert(ll);
-        state.dante_sources.insert(Ipv4Addr::new(192, 168, 1, 10));
-        let alerts = state.check_dante_ip_config();
+        state.dante.sources.insert(ll);
+        state.dante.sources.insert(Ipv4Addr::new(192, 168, 1, 10));
+        let alerts = state.dante.check_ip_config();
         assert_eq!(alerts.len(), 1);
         assert!(matches!(alerts[0].level, AlertLevel::Error));
         assert!(alerts[0].message.contains("172.31.0.5"));
@@ -1831,9 +1893,9 @@ mod tests {
     #[test]
     fn ip_config_subnet_split_warns_ddm() {
         let mut state = CaptureState::new();
-        state.dante_sources.insert(Ipv4Addr::new(192, 168, 1, 10));
-        state.dante_sources.insert(Ipv4Addr::new(10, 0, 0, 5));
-        let alerts = state.check_dante_ip_config();
+        state.dante.sources.insert(Ipv4Addr::new(192, 168, 1, 10));
+        state.dante.sources.insert(Ipv4Addr::new(10, 0, 0, 5));
+        let alerts = state.dante.check_ip_config();
         assert!(alerts[0].message.contains("Domain Manager"));
     }
 
@@ -1859,9 +1921,9 @@ mod tests {
     #[test]
     fn igmp_multiple_queriers_fires_error_and_sets_flag() {
         let mut state = CaptureState::new();
-        state.igmp_querier_ips_this_window.insert(Ipv4Addr::new(10, 0, 0, 1));
-        state.igmp_querier_ips_this_window.insert(Ipv4Addr::new(10, 0, 0, 2));
-        let alerts = state.check_igmp_multiple_queriers();
+        state.igmp.querier_ips_this_window.insert(Ipv4Addr::new(10, 0, 0, 1));
+        state.igmp.querier_ips_this_window.insert(Ipv4Addr::new(10, 0, 0, 2));
+        let alerts = state.igmp.check_multiple_queriers(&mut state.network_health);
         assert_eq!(alerts.len(), 1);
         assert!(matches!(alerts[0].level, AlertLevel::Error));
         assert!(alerts[0].message.contains("10.0.0.1"));
@@ -1872,21 +1934,21 @@ mod tests {
     #[test]
     fn igmp_single_querier_no_alert() {
         let mut state = CaptureState::new();
-        state.igmp_querier_ips_this_window.insert(Ipv4Addr::new(10, 0, 0, 1));
-        assert!(state.check_igmp_multiple_queriers().is_empty());
+        state.igmp.querier_ips_this_window.insert(Ipv4Addr::new(10, 0, 0, 1));
+        assert!(state.igmp.check_multiple_queriers(&mut state.network_health).is_empty());
         assert!(!state.network_health.multiple_queriers_this_window);
     }
 
     #[test]
     fn igmp_multiple_querier_flag_clears_on_reset_window() {
         let mut state = CaptureState::new();
-        state.igmp_querier_ips_this_window.insert(Ipv4Addr::new(10, 0, 0, 1));
-        state.igmp_querier_ips_this_window.insert(Ipv4Addr::new(10, 0, 0, 2));
-        state.check_igmp_multiple_queriers();
+        state.igmp.querier_ips_this_window.insert(Ipv4Addr::new(10, 0, 0, 1));
+        state.igmp.querier_ips_this_window.insert(Ipv4Addr::new(10, 0, 0, 2));
+        state.igmp.check_multiple_queriers(&mut state.network_health);
         assert!(state.network_health.multiple_queriers_this_window);
         state.reset_window();
         assert!(!state.network_health.multiple_queriers_this_window);
-        assert!(state.igmp_querier_ips_this_window.is_empty());
+        assert!(state.igmp.querier_ips_this_window.is_empty());
     }
 
     // ── IGMPv2/v3 mismatch, filter-unregistered-multicast, snooping-blocking-ptp ──
@@ -1894,9 +1956,9 @@ mod tests {
     #[test]
     fn igmp_version_mismatch_fires_warn_when_v2_querier_and_v3_report() {
         let mut state = CaptureState::new();
-        state.igmp_querier_version = Some(2);
-        state.igmp_v3_report_seen_this_window = true;
-        let alerts = state.check_igmp_version_mismatch();
+        state.igmp.querier_version = Some(2);
+        state.igmp.v3_report_seen_this_window = true;
+        let alerts = state.igmp.check_version_mismatch();
         assert_eq!(alerts.len(), 1);
         assert!(matches!(alerts[0].level, AlertLevel::Warn));
         assert!(alerts[0].message.contains("IGMPv2"));
@@ -1905,23 +1967,68 @@ mod tests {
     #[test]
     fn igmp_version_mismatch_silent_when_v3_querier() {
         let mut state = CaptureState::new();
-        state.igmp_querier_version = Some(3);
-        state.igmp_v3_report_seen_this_window = true;
-        assert!(state.check_igmp_version_mismatch().is_empty());
+        state.igmp.querier_version = Some(3);
+        state.igmp.v3_report_seen_this_window = true;
+        assert!(state.igmp.check_version_mismatch().is_empty());
     }
 
     #[test]
     fn igmp_version_mismatch_silent_without_v3_reports() {
         let mut state = CaptureState::new();
-        state.igmp_querier_version = Some(2);
-        assert!(state.check_igmp_version_mismatch().is_empty());
+        state.igmp.querier_version = Some(2);
+        assert!(state.igmp.check_version_mismatch().is_empty());
+    }
+
+    // ── Protocol-family substate isolation tests ─────────────────────────────
+    // These exercise the substate through its own interface — no surrounding
+    // CaptureState needed — which is the point of grouping the fields.
+
+    #[test]
+    fn igmp_state_reset_clears_window_fields_but_keeps_version() {
+        let mut igmp = IgmpState::new();
+        igmp.querier_ips_this_window.insert(Ipv4Addr::new(10, 0, 0, 1));
+        igmp.v3_report_seen_this_window = true;
+        igmp.querier_version = Some(3); // retained across windows
+        igmp.reset_window();
+        assert!(igmp.querier_ips_this_window.is_empty());
+        assert!(!igmp.v3_report_seen_this_window);
+        assert_eq!(igmp.querier_version, Some(3));
+    }
+
+    #[test]
+    fn avb_state_reset_clears_mvrp_when_no_avtp_streams() {
+        let mut avb = AvbState::new();
+        avb.mvrp_vlans.insert(2);
+        // No AVTP streams present — MVRP registrations are cleared on reset.
+        avb.reset_window();
+        assert!(avb.mvrp_vlans.is_empty());
+    }
+
+    #[test]
+    fn avb_state_reset_prunes_msrp_to_surviving_avtp() {
+        let mut avb = AvbState::new();
+        let sid = [1, 2, 3, 4, 5, 6, 7, 8];
+        // An MSRP reservation whose AVTP stream is absent has nothing to display.
+        avb.msrp_state.insert(sid, MsrpDeclaration {
+            decl_type:           MsrpDeclType::TalkerAdvertise,
+            stream_id:           sid,
+            dest_mac:            None,
+            vlan_id:             None,
+            max_frame_size:      None,
+            max_interval_frames: None,
+            priority:            None,
+            failure_code:        None,
+            listener_state:      None,
+        });
+        avb.reset_window();
+        assert!(avb.msrp_state.is_empty());
     }
 
     #[test]
     fn filter_unregistered_multicast_fires_after_two_cycles() {
         let mut state = CaptureState::new();
         // Populate ConMon to simulate device presence.
-        state.dante_conmon.insert(Ipv4Addr::new(192, 168, 1, 1), ConmonDevice {
+        state.dante.conmon.insert(Ipv4Addr::new(192, 168, 1, 1), ConmonDevice {
             mac: [0, 0, 0, 0, 0, 0],
             channels: None,
             packets: 0,
@@ -1940,7 +2047,7 @@ mod tests {
     #[test]
     fn filter_unregistered_multicast_clears_when_streams_appear() {
         let mut state = CaptureState::new();
-        state.dante_conmon.insert(Ipv4Addr::new(192, 168, 1, 1), ConmonDevice {
+        state.dante.conmon.insert(Ipv4Addr::new(192, 168, 1, 1), ConmonDevice {
             mac: [0, 0, 0, 0, 0, 0],
             channels: None,
             packets: 0,
@@ -1957,7 +2064,7 @@ mod tests {
     #[test]
     fn igmp_snooping_blocking_ptp_fires_when_dante_found_but_no_ptp_no_querier() {
         let mut state = CaptureState::new();
-        state.dante_sources.insert(Ipv4Addr::new(192, 168, 1, 10));
+        state.dante.sources.insert(Ipv4Addr::new(192, 168, 1, 10));
         let alerts = state.check_igmp_snooping_blocking_ptp(false);
         assert_eq!(alerts.len(), 1);
         assert!(matches!(alerts[0].level, AlertLevel::Warn));
@@ -1966,14 +2073,14 @@ mod tests {
     #[test]
     fn igmp_snooping_blocking_ptp_silent_in_offline_mode() {
         let mut state = CaptureState::new();
-        state.dante_sources.insert(Ipv4Addr::new(192, 168, 1, 10));
+        state.dante.sources.insert(Ipv4Addr::new(192, 168, 1, 10));
         assert!(state.check_igmp_snooping_blocking_ptp(true).is_empty());
     }
 
     #[test]
     fn igmp_snooping_blocking_ptp_silent_when_querier_present() {
         let mut state = CaptureState::new();
-        state.dante_sources.insert(Ipv4Addr::new(192, 168, 1, 10));
+        state.dante.sources.insert(Ipv4Addr::new(192, 168, 1, 10));
         state.network_health.last_igmp_query = Some(std::time::Instant::now());
         assert!(state.check_igmp_snooping_blocking_ptp(false).is_empty());
     }
@@ -2018,20 +2125,20 @@ mod tests {
     #[test]
     fn follower_census_no_alert_without_ptpv1_domain() {
         let mut state = CaptureState::new();
-        state.dante_sources.insert(Ipv4Addr::new(192, 168, 1, 1));
-        state.dante_sources.insert(Ipv4Addr::new(192, 168, 1, 2));
+        state.dante.sources.insert(Ipv4Addr::new(192, 168, 1, 1));
+        state.dante.sources.insert(Ipv4Addr::new(192, 168, 1, 2));
         state.ptpv1_followers.insert(Ipv4Addr::new(192, 168, 1, 2), Instant::now());
-        assert!(state.check_dante_follower_census().is_empty());
+        assert!(state.dante.check_follower_census(&state.ptpv1_followers, &state.ptp_domains).is_empty());
     }
 
     #[test]
     fn follower_census_no_alert_when_no_followers_seen_yet() {
         let mut state = CaptureState::new();
         make_ptpv1_domain(&mut state);
-        state.dante_sources.insert(Ipv4Addr::new(192, 168, 1, 1));
-        state.dante_sources.insert(Ipv4Addr::new(192, 168, 1, 2));
+        state.dante.sources.insert(Ipv4Addr::new(192, 168, 1, 1));
+        state.dante.sources.insert(Ipv4Addr::new(192, 168, 1, 2));
         // No Delay_Req seen yet — startup grace, no alert.
-        assert!(state.check_dante_follower_census().is_empty());
+        assert!(state.dante.check_follower_census(&state.ptpv1_followers, &state.ptp_domains).is_empty());
     }
 
     #[test]
@@ -2039,12 +2146,12 @@ mod tests {
         let mut state = CaptureState::new();
         make_ptpv1_domain(&mut state);
         // 3 devices: 1 GM + 2 followers — healthy.
-        state.dante_sources.insert(Ipv4Addr::new(192, 168, 1, 1));
-        state.dante_sources.insert(Ipv4Addr::new(192, 168, 1, 2));
-        state.dante_sources.insert(Ipv4Addr::new(192, 168, 1, 3));
+        state.dante.sources.insert(Ipv4Addr::new(192, 168, 1, 1));
+        state.dante.sources.insert(Ipv4Addr::new(192, 168, 1, 2));
+        state.dante.sources.insert(Ipv4Addr::new(192, 168, 1, 3));
         state.ptpv1_followers.insert(Ipv4Addr::new(192, 168, 1, 2), Instant::now());
         state.ptpv1_followers.insert(Ipv4Addr::new(192, 168, 1, 3), Instant::now());
-        assert!(state.check_dante_follower_census().is_empty());
+        assert!(state.dante.check_follower_census(&state.ptpv1_followers, &state.ptp_domains).is_empty());
     }
 
     #[test]
@@ -2052,7 +2159,7 @@ mod tests {
         let mut state = CaptureState::new();
         make_ptpv1_domain(&mut state);
         // 4 devices: GM (.1) + 2 followers (.2, .3) + 1 not syncing (.4).
-        for i in 1..=4 { state.dante_sources.insert(Ipv4Addr::new(192, 168, 1, i)); }
+        for i in 1..=4 { state.dante.sources.insert(Ipv4Addr::new(192, 168, 1, i)); }
         // Set the grandmaster IP on the domain so the GM is excluded from missing.
         state.ptp_domains.values_mut()
             .find(|s| s.version == crate::protocols::PTP_VERSION_V1)
@@ -2060,7 +2167,7 @@ mod tests {
             .grandmaster_src_ip = Some(Ipv4Addr::new(192, 168, 1, 1));
         state.ptpv1_followers.insert(Ipv4Addr::new(192, 168, 1, 2), Instant::now());
         state.ptpv1_followers.insert(Ipv4Addr::new(192, 168, 1, 3), Instant::now());
-        let alerts = state.check_dante_follower_census();
+        let alerts = state.dante.check_follower_census(&state.ptpv1_followers, &state.ptp_domains);
         assert_eq!(alerts.len(), 1);
         assert!(matches!(alerts[0].level, AlertLevel::Warn));
         assert!(alerts[0].message.contains("192.168.1.4"));
@@ -2073,15 +2180,15 @@ mod tests {
         make_ptpv1_domain(&mut state);
         let gm = Ipv4Addr::new(192, 168, 1, 1);
         let missing = Ipv4Addr::new(192, 168, 1, 4);
-        for i in 1..=4 { state.dante_sources.insert(Ipv4Addr::new(192, 168, 1, i)); }
+        for i in 1..=4 { state.dante.sources.insert(Ipv4Addr::new(192, 168, 1, i)); }
         state.ptp_domains.values_mut()
             .find(|s| s.version == crate::protocols::PTP_VERSION_V1)
             .unwrap()
             .grandmaster_src_ip = Some(gm);
-        state.dante_names.insert(missing, "StageBox".to_string());
+        state.dante.names.insert(missing, "StageBox".to_string());
         state.ptpv1_followers.insert(Ipv4Addr::new(192, 168, 1, 2), Instant::now());
         state.ptpv1_followers.insert(Ipv4Addr::new(192, 168, 1, 3), Instant::now());
-        let alerts = state.check_dante_follower_census();
+        let alerts = state.dante.check_follower_census(&state.ptpv1_followers, &state.ptp_domains);
         assert_eq!(alerts.len(), 1);
         assert!(alerts[0].message.contains("\"StageBox\""));
         assert!(alerts[0].message.contains("192.168.1.4"));
@@ -2132,8 +2239,8 @@ mod tests {
         let src = Ipv4Addr::new(192, 168, 1, 60);
         let alerts = state.handle_ndi_discovery(src, Some("Studio Cam".to_string()));
         assert_eq!(alerts.len(), 1);
-        assert!(state.ndi_sources.contains(&src));
-        assert_eq!(state.ndi_names.get(&src).map(|s| s.as_str()), Some("Studio Cam"));
+        assert!(state.ndi.sources.contains(&src));
+        assert_eq!(state.ndi.names.get(&src).map(|s| s.as_str()), Some("Studio Cam"));
     }
 
     // ── IGMP ─────────────────────────────────────────────────────────────────
@@ -2279,7 +2386,7 @@ mod tests {
     fn ptp_ok_for_ndi_only_no_clock_required() {
         // NDI is TCP — no PTP at all.
         let mut state = CaptureState::new();
-        state.ndi_sources.insert(Ipv4Addr::new(192,168,1,60));
+        state.ndi.sources.insert(Ipv4Addr::new(192,168,1,60));
         assert!(state.missing_ptp_clocks(&[ProtocolChoice::NDI]).is_empty());
     }
 
@@ -2354,7 +2461,7 @@ mod tests {
         // overview count, the Streams list, and the gPTP gate all agree.
         let mut state = CaptureState::new();
         state.handle_avb(0x7e, None, 100, None, Instant::now()); // 0x7e = MAAP
-        assert!(state.avtp_streams.is_empty());
+        assert!(state.avb.avtp_streams.is_empty());
         assert!(!state.streams.keys().any(|k| k.starts_with("AVB")));
     }
 
@@ -2362,7 +2469,7 @@ mod tests {
     fn avb_media_frame_with_stream_id_creates_stream() {
         let mut state = CaptureState::new();
         state.handle_avb(0x00, Some([1, 2, 3, 4, 5, 6, 7, 8]), 100, Some(0), Instant::now());
-        assert_eq!(state.avtp_streams.len(), 1);
+        assert_eq!(state.avb.avtp_streams.len(), 1);
         assert!(state.streams.keys().any(|k| k.starts_with("AVB")));
     }
 
@@ -2590,7 +2697,7 @@ mod tests {
         assert_eq!(alerts.len(), 1);
         assert_eq!(alerts[0].level, AlertLevel::Warn);
         assert!(alerts[0].message.contains("insufficient bandwidth"));
-        assert!(state.msrp_state.contains_key(&[0xAA,0xBB,0xCC,0xDD,0xEE,0xFF,0x00,0x01]));
+        assert!(state.avb.msrp_state.contains_key(&[0xAA,0xBB,0xCC,0xDD,0xEE,0xFF,0x00,0x01]));
     }
 
     // ── PTPv1 sync-sender / multiple-master tests ────────────────────────────

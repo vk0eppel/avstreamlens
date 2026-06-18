@@ -568,6 +568,29 @@ pub struct NetworkHealth {
     pub multiple_queriers_this_window: bool,
 }
 
+/// A single factor deducting from the Health Score this Window.
+/// `PerStream` represents a stream-level issue (aggregated across all affected streams);
+/// `Infrastructure` represents a network or protocol infrastructure issue.
+pub enum ScorePenalty {
+    PerStream    { total_deduction: f64, bullet: String },
+    Infrastructure { deduction: f64,    bullet: String },
+}
+
+impl ScorePenalty {
+    pub fn deduction(&self) -> f64 {
+        match self {
+            ScorePenalty::PerStream    { total_deduction, .. } => *total_deduction,
+            ScorePenalty::Infrastructure { deduction, .. }     => *deduction,
+        }
+    }
+    pub fn into_bullet(self) -> String {
+        match self {
+            ScorePenalty::PerStream    { bullet, .. } => bullet,
+            ScorePenalty::Infrastructure { bullet, .. } => bullet,
+        }
+    }
+}
+
 impl NetworkHealth {
     pub fn new() -> Self {
         Self {
@@ -596,6 +619,171 @@ impl NetworkHealth {
         self.igmp_query_interval_secs.map(|i| i * 2 + 10).unwrap_or(260)
     }
 
+    /// Collect every active penalty this Window. Both `calculate_score` and
+    /// `build_health_summary` are thin consumers of this function, so the
+    /// score and the summary are always derived from the same source of truth.
+    pub fn collect_penalties(
+        &self,
+        streams:     &HashMap<String, StreamStats>,
+        tcp_streams: &HashMap<String, TcpStreamStats>,
+        ptp_domains: &HashMap<(u8, u8), PtpStats>,
+        msrp_state:  &HashMap<[u8; 8], crate::protocols::MsrpDeclaration>,
+        eee_ports:   &HashMap<(String, String), (u16, u16)>,
+    ) -> Vec<ScorePenalty> {
+        let mut p: Vec<ScorePenalty> = Vec::new();
+
+        // ── Per-stream penalties (aggregated by category) ─────────────────────
+        let mut has_multicast       = false;
+        let mut loss_count          = 0usize; let mut loss_total          = 0.0f64;
+        let mut jitter_count        = 0usize; let mut jitter_total        = 0.0f64;
+        let mut tsd_count           = 0usize; let mut tsd_total           = 0.0f64;
+        let mut ssrc_count          = 0usize; let mut ssrc_total          = 0.0f64;
+        let mut dead_count          = 0usize;
+        let mut gap_count           = 0usize;
+
+        for s in streams.values() {
+            if s.is_multicast && s.packets > 0 { has_multicast = true; }
+
+            let loss = s.loss_pct();
+            if loss > 0.0 { loss_count += 1; loss_total += loss.min(10.0); }
+
+            let jit = s.jitter_ms();
+            if jit > 20.0 { jitter_count += 1; jitter_total += 5.0; }
+            else if jit > 10.0 { jitter_count += 1; jitter_total += 2.0; }
+
+            if s.ts_discontinuities_this_window > 0 {
+                tsd_count += 1;
+                tsd_total += 3.0 * (s.ts_discontinuities_this_window as f64).min(5.0);
+            }
+            if s.ssrc_changes > 0 {
+                ssrc_count += 1;
+                ssrc_total += 10.0 * (s.ssrc_changes as f64).min(3.0);
+            }
+            if s.last_packet_time.is_some_and(|t| t.elapsed() > Duration::from_secs(crate::protocols::STREAM_TIMEOUT_SECS)) {
+                dead_count += 1;
+            }
+            if s.gap_events >= 2 { gap_count += 1; }
+        }
+
+        macro_rules! per_stream {
+            ($count:expr, $deduction:expr, $fmt:expr) => {
+                if $count > 0 {
+                    p.push(ScorePenalty::PerStream {
+                        total_deduction: $deduction,
+                        bullet: format!($fmt, $count),
+                    });
+                }
+            };
+        }
+        per_stream!(loss_count,   loss_total,                    "⚠  {} stream(s) with packet loss");
+        per_stream!(jitter_count, jitter_total,                   "⚠  {} stream(s) with high jitter");
+        per_stream!(tsd_count,    tsd_total,                      "⚠  {} stream(s) with timestamp discontinuities");
+        per_stream!(ssrc_count,   ssrc_total,                     "⚠  {} stream(s) with SSRC changes");
+        per_stream!(dead_count,   dead_count as f64 * 30.0,       "⚠  {} dead stream(s) (silent)");
+        per_stream!(gap_count,    gap_count  as f64 * 10.0,       "⚠  {} stream(s) with signal gaps");
+
+        let dscp_bad = streams.values().filter(|s| s.dscp_violations > 0).count();
+        per_stream!(dscp_bad, (dscp_bad as f64 * 5.0).min(20.0), "⚠  {} stream(s) with incorrect DSCP");
+
+        // ── TCP quality ───────────────────────────────────────────────────────
+        let mut tcp_count = 0usize; let mut tcp_total = 0.0f64;
+        for t in tcp_streams.values() {
+            let d = match t.stream_quality {
+                StreamQuality::Healthy    => 0.0,
+                StreamQuality::Degrading  => 5.0,
+                StreamQuality::Critical   => 15.0,
+                StreamQuality::Terminated => 25.0,
+            };
+            if d > 0.0 { tcp_count += 1; tcp_total += d; }
+        }
+        per_stream!(tcp_count, tcp_total, "⚠  {} TCP stream(s) with degraded quality");
+
+        let retrans = (self.tcp_retransmissions as f64 * 0.5).min(10.0);
+        if retrans > 0.0 {
+            p.push(ScorePenalty::Infrastructure {
+                deduction: retrans,
+                bullet: format!("⚠  TCP retransmissions ({})", self.tcp_retransmissions),
+            });
+        }
+
+        // ── Congestion (ECN) ──────────────────────────────────────────────────
+        let ecn = (self.ecn_congestion_marks as f64 * 2.0).min(20.0);
+        if ecn > 0.0 {
+            p.push(ScorePenalty::Infrastructure {
+                deduction: ecn,
+                bullet: format!("⚠  {} ECN congestion mark(s)", self.ecn_congestion_marks),
+            });
+        }
+
+        // ── IGMP querier ──────────────────────────────────────────────────────
+        if has_multicast {
+            let absent = match self.last_igmp_query {
+                None    => true,
+                Some(t) => t.elapsed().as_secs() > self.querier_silent_after_secs(),
+            };
+            if absent {
+                p.push(ScorePenalty::Infrastructure {
+                    deduction: 10.0,
+                    bullet: "⚠  IGMP querier absent — multicast may flood".to_string(),
+                });
+            }
+        }
+        if self.multiple_queriers_this_window {
+            p.push(ScorePenalty::Infrastructure {
+                deduction: 15.0,
+                bullet: "⚠  Multiple IGMP queriers on segment".to_string(),
+            });
+        }
+
+        // ── PTP clock health (deterministic order) ────────────────────────────
+        let mut keys: Vec<&(u8, u8)> = ptp_domains.keys().collect();
+        keys.sort();
+        for key in keys {
+            let ptp = &ptp_domains[key];
+            if !ptp.clock_valid {
+                if ptp.protocol_clock_lost {
+                    p.push(ScorePenalty::Infrastructure {
+                        deduction: 25.0,
+                        bullet: format!("⚠  Clock Source lost (PTP domain {})", key.0),
+                    });
+                } else if ptp.packets > 0 {
+                    p.push(ScorePenalty::Infrastructure {
+                        deduction: 15.0,
+                        bullet: format!("⚠  PTP traffic but no grandmaster (domain {})", key.0),
+                    });
+                }
+            }
+            if ptp.grandmaster_changes > 0 {
+                p.push(ScorePenalty::Infrastructure {
+                    deduction: 10.0 * (ptp.grandmaster_changes as f64).min(3.0),
+                    bullet: format!("⚠  Grandmaster changed (PTP domain {})", key.0),
+                });
+            }
+        }
+
+        // ── MSRP / AVB bandwidth reservations ────────────────────────────────
+        let msrp_failed = msrp_state.values()
+            .filter(|d| matches!(d.decl_type, crate::protocols::MsrpDeclType::TalkerFailed))
+            .count();
+        if msrp_failed > 0 {
+            p.push(ScorePenalty::Infrastructure {
+                deduction: msrp_failed as f64 * 20.0,
+                bullet: format!("⚠  {} AVB reservation failure(s)", msrp_failed),
+            });
+        }
+
+        // ── EEE ───────────────────────────────────────────────────────────────
+        let eee = (eee_ports.len() as f64 * 15.0).min(30.0);
+        if eee > 0.0 {
+            p.push(ScorePenalty::Infrastructure {
+                deduction: eee,
+                bullet: format!("⚠  EEE active on {} switch port(s)", eee_ports.len()),
+            });
+        }
+
+        p
+    }
+
     pub fn calculate_score(
         &mut self,
         streams: &std::collections::HashMap<String, StreamStats>,
@@ -604,102 +792,14 @@ impl NetworkHealth {
         msrp_state: &std::collections::HashMap<[u8; 8], crate::protocols::MsrpDeclaration>,
         eee_ports: &std::collections::HashMap<(String, String), (u16, u16)>,
     ) {
-        let mut score = 100.0;
-        let mut has_active_multicast = false;
-
-        for stats in streams.values() {
-            if stats.is_multicast && stats.packets > 0 {
-                has_active_multicast = true;
-            }
-            if stats.loss_pct() > 0.0 {
-                score -= stats.loss_pct().min(10.0);
-            }
-            if stats.jitter_ms() > 20.0 {
-                score -= 5.0;
-            } else if stats.jitter_ms() > 10.0 {
-                score -= 2.0;
-            }
-            if stats.ts_discontinuities_this_window > 0 {
-                score -= 3.0 * (stats.ts_discontinuities_this_window as f64).min(5.0);
-            }
-            if stats.ssrc_changes > 0 {
-                score -= 10.0 * (stats.ssrc_changes as f64).min(3.0);
-            }
-            if stats.last_packet_time.is_some_and(|t| t.elapsed() > Duration::from_secs(crate::protocols::STREAM_TIMEOUT_SECS)) {
-                score -= 30.0;
-            }
-            if stats.gap_events >= 2 {
-                score -= 10.0;  // repeated 50ms+ gaps in the current 5s window
-            }
-        }
-
-        // ── TCP quality ───────────────────────────────────────────────────────
-        for tcp_stats in tcp_streams.values() {
-            match tcp_stats.stream_quality {
-                StreamQuality::Healthy    => {}
-                StreamQuality::Degrading  => score -= 5.0,
-                StreamQuality::Critical   => score -= 15.0,
-                StreamQuality::Terminated => score -= 25.0,
-            }
-        }
-        score -= (self.tcp_retransmissions as f64 * 0.5).min(10.0);
-
-        // ── QoS / DSCP (per-stream) ──────────────────────────────────────────
-        // Each stream validates DSCP against protocol-appropriate expected values.
-        // Any stream with violations counts as misconfigured.
-        let dscp_bad = streams.values().filter(|s| s.dscp_violations > 0).count();
-        if dscp_bad > 0 {
-            score -= (dscp_bad as f64 * 5.0).min(20.0);
-        }
-
-        // ── Congestion (ECN Congestion Experienced marks) ─────────────────────
-        // ECN=CE is set by routers when they are experiencing congestion mid-path.
-        score -= (self.ecn_congestion_marks as f64 * 2.0).min(20.0);
-
-        // ── IGMP / Snooping ───────────────────────────────────────────────────
-        // Multicast snooping requires a live IGMP Querier. If multicast streams are
-        // active but no Query has been seen within the "other querier present" window
-        // (≈ 2× the query interval, see querier_silent_after_secs), managed switches
-        // may start flooding multicast.
-        if has_active_multicast {
-            let silent_after = self.querier_silent_after_secs();
-            match self.last_igmp_query {
-                None => score -= 10.0,
-                Some(t) if t.elapsed().as_secs() > silent_after => score -= 10.0,
-                _ => {}
-            }
-        }
-        if self.multiple_queriers_this_window {
-            score -= 15.0;
-        }
-
-        // ── PTP clock health ──────────────────────────────────────────────────
-        for ptp in ptp_domains.values() {
-            if !ptp.clock_valid {
-                if ptp.protocol_clock_lost {
-                    score -= 25.0;  // grandmaster confirmed then lost
-                } else if ptp.packets > 0 {
-                    score -= 15.0;  // PTP traffic seen but no grandmaster yet
-                }
-            }
-            if ptp.grandmaster_changes > 0 {
-                score -= 10.0 * (ptp.grandmaster_changes as f64).min(3.0);
-            }
-        }
-
-        // ── MSRP / AVB bandwidth reservations ────────────────────────────────
-        for decl in msrp_state.values() {
-            if matches!(decl.decl_type, crate::protocols::MsrpDeclType::TalkerFailed) {
-                score -= 20.0;
-            }
-        }
-
-        // ── EEE (Energy Efficient Ethernet) ──────────────────────────────────
-        // EEE causes micro-bursting (packets held during sleep, released on wake-up)
-        // directly threatening jitter-sensitive AV streams.
-        score -= (eee_ports.len() as f64 * 15.0).min(30.0);
-
-        self.network_score = score.max(0.0);
+        // Score = 100 − Σ penalties. The penalty table lives once in
+        // `collect_penalties`; this is a thin consumer of it.
+        let total: f64 = self
+            .collect_penalties(streams, tcp_streams, ptp_domains, msrp_state, eee_ports)
+            .iter()
+            .map(|p| p.deduction())
+            .sum();
+        self.network_score = (100.0 - total).max(0.0);
     }
 
     /// Build the Health Summary: one bullet per factor deducting from the Health
@@ -707,6 +807,8 @@ impl NetworkHealth {
     /// produces a bullet and every bullet corresponds to a penalty (the CONTEXT.md
     /// "Health Summary" biconditional). Pure: no IO, no rendering.
     ///
+    /// The biconditional is now structural, not conventional: this is the same
+    /// `collect_penalties` table that `calculate_score` sums, mapped to its bullets.
     /// Stream-level issues are collapsed by category across all affected streams
     /// (`⚠ N stream(s) with <issue>`); infrastructure issues each get their own
     /// bullet. Pcap kernel/interface drops are deliberately excluded — they are a
@@ -721,94 +823,10 @@ impl NetworkHealth {
         msrp_state: &HashMap<[u8; 8], crate::protocols::MsrpDeclaration>,
         eee_ports: &HashMap<(String, String), (u16, u16)>,
     ) -> Vec<String> {
-        let mut out = Vec::new();
-
-        // ── Stream-level issues, collapsed by category ───────────────────────
-        let n = |pred: &dyn Fn(&StreamStats) -> bool| streams.values().filter(|s| pred(s)).count();
-
-        let loss = n(&|s| s.loss_pct() > 0.0);
-        if loss > 0 { out.push(format!("⚠  {} stream(s) with packet loss", loss)); }
-
-        let jitter = n(&|s| s.jitter_ms() > 10.0);
-        if jitter > 0 { out.push(format!("⚠  {} stream(s) with high jitter", jitter)); }
-
-        let tsd = n(&|s| s.ts_discontinuities_this_window > 0);
-        if tsd > 0 { out.push(format!("⚠  {} stream(s) with timestamp discontinuities", tsd)); }
-
-        let ssrc = n(&|s| s.ssrc_changes > 0);
-        if ssrc > 0 { out.push(format!("⚠  {} stream(s) with SSRC changes", ssrc)); }
-
-        let dead = n(&|s| s.last_packet_time.is_some_and(|t| {
-            t.elapsed() > Duration::from_secs(crate::protocols::STREAM_TIMEOUT_SECS)
-        }));
-        if dead > 0 { out.push(format!("⚠  {} dead stream(s) (silent)", dead)); }
-
-        let gaps = n(&|s| s.gap_events >= 2);
-        if gaps > 0 { out.push(format!("⚠  {} stream(s) with signal gaps", gaps)); }
-
-        let dscp = n(&|s| s.dscp_violations > 0);
-        if dscp > 0 { out.push(format!("⚠  {} stream(s) with incorrect DSCP", dscp)); }
-
-        // ── TCP quality ──────────────────────────────────────────────────────
-        let tcp_bad = tcp_streams.values()
-            .filter(|t| t.stream_quality != StreamQuality::Healthy)
-            .count();
-        if tcp_bad > 0 { out.push(format!("⚠  {} TCP stream(s) with degraded quality", tcp_bad)); }
-
-        if self.tcp_retransmissions > 0 {
-            out.push(format!("⚠  TCP retransmissions ({})", self.tcp_retransmissions));
-        }
-
-        // ── Congestion (ECN) ─────────────────────────────────────────────────
-        if self.ecn_congestion_marks > 0 {
-            out.push(format!("⚠  {} ECN congestion mark(s)", self.ecn_congestion_marks));
-        }
-
-        // ── IGMP querier — only penalised when multicast is active ────────────
-        let has_active_multicast = streams.values().any(|s| s.is_multicast && s.packets > 0);
-        if has_active_multicast {
-            let silent_after = self.querier_silent_after_secs();
-            let absent = match self.last_igmp_query {
-                None => true,
-                Some(t) => t.elapsed().as_secs() > silent_after,
-            };
-            if absent { out.push("⚠  IGMP querier absent — multicast may flood".to_string()); }
-        }
-        if self.multiple_queriers_this_window {
-            out.push("⚠  Multiple IGMP queriers on segment".to_string());
-        }
-
-        // ── PTP clock health (per domain, deterministic order) ───────────────
-        let mut ptp_keys: Vec<&(u8, u8)> = ptp_domains.keys().collect();
-        ptp_keys.sort();
-        for key in ptp_keys {
-            let ptp = &ptp_domains[key];
-            if !ptp.clock_valid {
-                if ptp.protocol_clock_lost {
-                    out.push(format!("⚠  Clock Source lost (PTP domain {})", key.0));
-                } else if ptp.packets > 0 {
-                    out.push(format!("⚠  PTP traffic but no grandmaster (domain {})", key.0));
-                }
-            }
-            if ptp.grandmaster_changes > 0 {
-                out.push(format!("⚠  Grandmaster changed (PTP domain {})", key.0));
-            }
-        }
-
-        // ── MSRP / AVB bandwidth reservations ────────────────────────────────
-        let msrp_failed = msrp_state.values()
-            .filter(|d| matches!(d.decl_type, crate::protocols::MsrpDeclType::TalkerFailed))
-            .count();
-        if msrp_failed > 0 {
-            out.push(format!("⚠  {} AVB reservation failure(s)", msrp_failed));
-        }
-
-        // ── EEE ──────────────────────────────────────────────────────────────
-        if !eee_ports.is_empty() {
-            out.push(format!("⚠  EEE active on {} switch port(s)", eee_ports.len()));
-        }
-
-        out
+        self.collect_penalties(streams, tcp_streams, ptp_domains, msrp_state, eee_ports)
+            .into_iter()
+            .map(ScorePenalty::into_bullet)
+            .collect()
     }
 }
 
@@ -1379,6 +1397,42 @@ mod tests {
         streams.insert("s1".into(), dead);
         let out = health.build_health_summary(&streams, &empty_tcp(), &empty_ptp(), &empty_msrp(), &empty_eee());
         assert!(out.iter().any(|b| b.contains("dead stream")), "got {out:?}");
+    }
+
+    /// The CONTEXT.md "Health Summary" biconditional, now structural: the score
+    /// and the summary are both derived from `collect_penalties`, so for any state
+    /// the bullet count equals the penalty count and the score equals 100 minus
+    /// the summed deductions. Exercises a mixed stream-level + infrastructure state.
+    #[test]
+    fn score_and_summary_share_one_penalty_table() {
+        let mut health = NetworkHealth::new();
+        health.tcp_retransmissions = 4;
+        health.ecn_congestion_marks = 3;
+
+        let mut streams = empty_streams();
+        streams.insert("loss".into(), live_stream(5));      // packet loss
+        let mut dscp = live_stream(0);
+        dscp.dscp_violations = 2;                            // DSCP violation
+        streams.insert("dscp".into(), dscp);
+
+        let mut eee = empty_eee();
+        eee.insert(("chassis".into(), "port3".into()), (10, 20));
+
+        let penalties = health.collect_penalties(
+            &streams, &empty_tcp(), &empty_ptp(), &empty_msrp(), &eee,
+        );
+        let summary = health.build_health_summary(
+            &streams, &empty_tcp(), &empty_ptp(), &empty_msrp(), &eee,
+        );
+        let expected: f64 = penalties.iter().map(|p| p.deduction()).sum();
+        health.calculate_score(&streams, &empty_tcp(), &empty_ptp(), &empty_msrp(), &eee);
+
+        // One bullet per penalty (biconditional), and the score is exactly the
+        // complement of the summed deductions.
+        assert_eq!(summary.len(), penalties.len(), "bullet ⇔ penalty: {summary:?}");
+        assert!(expected > 0.0, "test state must produce penalties");
+        assert!((health.network_score - (100.0 - expected)).abs() < 1e-9,
+            "score {} != 100 - {}", health.network_score, expected);
     }
 
     // ── timing_metronomic (Transmitter Class) ────────────────────────────────

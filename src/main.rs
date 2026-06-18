@@ -27,7 +27,7 @@ use std::time::{Duration, Instant};
 
 use crate::capture::{Alert, CaptureState};
 use crate::parser::{detect_protocol, parse_tcp_packet, parse_ts_refclk, is_multicast, unwrap_vlan};
-use crate::report::{create_logger, print_report};
+use crate::report::{create_logger, print_report, ReportSnapshot, ReportSession};
 use crate::stats::StreamStats;
 
 use std::collections::HashSet;
@@ -237,15 +237,16 @@ fn run_loop<T: Activated>(
     let mut last_report_pcap = 0i64;   // pcap seconds; initialised on first packet
     let mut pcap_ts_init     = false;
     let run_start            = Instant::now();
-    // Suppresses the no-active-flows diagnostic after its first appearance.
-    let mut no_flows_diagnostic_shown = false;
+    // Session-lifetime report config: `quiet` is fixed; `no_flows_diagnostic_shown`
+    // latches after the no-active-flows diagnostic first appears.
+    let mut session = ReportSession { quiet, no_flows_diagnostic_shown: false };
 
     loop {
         // ── Live: report at TOP so it fires even when next_packet() times out ─
         if !is_offline && last_report.elapsed() > Duration::from_secs(5) {
             let pcap_stats = cap.stats().ok().map(|s| (s.received, s.dropped, s.if_dropped));
             emit_periodic_alerts(state, is_offline, logger);
-            do_report(state, expanded_protocols, pcap_stats, quiet, &mut no_flows_diagnostic_shown, logger);
+            do_report(state, expanded_protocols, pcap_stats, &mut session, logger);
             last_report = Instant::now();
 
             if let Some(secs) = live.as_ref().and_then(|l| l.duration_secs)
@@ -262,7 +263,7 @@ fn run_loop<T: Activated>(
             Err(pcap::Error::NoMorePackets)  => {
                 // EOF — print whatever accumulated in the last partial window.
                 emit_periodic_alerts(state, is_offline, logger);
-                do_report(state, expanded_protocols, None, quiet, &mut no_flows_diagnostic_shown, logger);
+                do_report(state, expanded_protocols, None, &mut session, logger);
                 let healthy = state.network_health.network_score >= 100.0;
                 std::process::exit(if healthy { 0 } else { 1 });
             }
@@ -322,16 +323,16 @@ fn run_loop<T: Activated>(
         // ── NDI stream via known source IP ───────────────────────────────────
         if live.as_ref().is_some_and(|l| l.ndi_selected)
             && let Some(ref ip) = outer_ip
-            && !state.ndi_sources.is_empty()
+            && !state.ndi.sources.is_empty()
             && ip.get_next_level_protocol() == pnet_packet::ip::IpNextHeaderProtocols::Tcp
         {
             let s = ip.get_source();
             let d = ip.get_destination();
-            let sender = if state.ndi_sources.contains(&s) { Some(s) }
-                        else if state.ndi_sources.contains(&d) { Some(d) }
+            let sender = if state.ndi.sources.contains(&s) { Some(s) }
+                        else if state.ndi.sources.contains(&d) { Some(d) }
                         else { None };
             if let Some(sender_ip) = sender {
-                let names = &state.ndi_names;
+                let names = &state.ndi.names;
                 let stats = state.streams.entry(format!("NDI {}", sender_ip))
                     .or_insert_with(|| {
                         let mut s = StreamStats::new_with_info("NDI", 0.0, false, sender_ip, 0);
@@ -352,7 +353,7 @@ fn run_loop<T: Activated>(
         {
             let ndi_range = protocols::NDI_PORT_MIN..=protocols::NDI_PORT_MAX;
             let is_ndi = ndi_range.contains(&src_port) || ndi_range.contains(&dst_port)
-                      || state.ndi_sources.contains(&src_ip) || state.ndi_sources.contains(&dst_ip);
+                      || state.ndi.sources.contains(&src_ip) || state.ndi.sources.contains(&dst_ip);
             if is_ndi {
                 let key = format!("TCP {}:{} → {}:{}", src_ip, src_port, dst_ip, dst_port);
                 let tcp_stat = state.tcp_streams.entry(key).or_insert_with(|| crate::stats::TcpStreamStats::new(src_ip, dst_ip));
@@ -405,7 +406,7 @@ fn run_loop<T: Activated>(
                 pcap_ts_init = true;
             } else if pkt_ts - last_report_pcap >= 5 {
                 emit_periodic_alerts(state, is_offline, logger);
-                do_report(state, expanded_protocols, None, quiet, &mut no_flows_diagnostic_shown, logger);
+                do_report(state, expanded_protocols, None, &mut session, logger);
                 last_report_pcap = pkt_ts;
             }
         }
@@ -419,8 +420,8 @@ fn emit_periodic_alerts(state: &mut CaptureState, is_offline: bool, logger: &mut
     capture::emit(&state.check_ptp_timeouts(),        logger);
     capture::emit(&state.check_stream_count_anomaly(), logger);
     capture::emit(&state.check_igmp_query_interval(),      logger);
-    capture::emit(&state.check_igmp_multiple_queriers(),   logger);
-    capture::emit(&state.check_igmp_version_mismatch(),    logger);
+    capture::emit(&state.igmp.check_multiple_queriers(&mut state.network_health), logger);
+    capture::emit(&state.igmp.check_version_mismatch(),    logger);
     capture::emit(&state.check_filter_unregistered_multicast(), logger);
     capture::emit(&state.check_high_multicast_bandwidth(), logger);
     capture::emit(&state.check_igmp_snooping_blocking_ptp(is_offline), logger);
@@ -433,36 +434,53 @@ fn do_report(
     state: &mut CaptureState,
     expanded_protocols: &[protocols::ProtocolChoice],
     pcap_stats: Option<(u32, u32, u32)>,
-    quiet: bool,
-    no_flows_diagnostic_shown: &mut bool,
+    session: &mut ReportSession,
     logger: &mut crate::report::Logger,
 ) {
     // Compute the four section-level diagnostics before borrowing state fields.
-    let ip_config_alerts     = state.check_dante_ip_config();
-    let conmon_bridge_alerts = state.check_dante_conmon_bridge();
-    let follower_census_alerts = state.check_dante_follower_census();
+    let ip_config_alerts     = state.dante.check_ip_config();
+    let conmon_bridge_alerts = state.dante.check_conmon_bridge();
+    let follower_census_alerts = state.dante.check_follower_census(&state.ptpv1_followers, &state.ptp_domains);
     let ptp_sync_alerts      = state.check_ptp_sync_conflict();
 
     state.network_health.calculate_score(
         &state.streams, &state.tcp_streams, &state.ptp_domains,
-        &state.msrp_state, &state.eee_ports,
+        &state.avb.msrp_state, &state.eee_ports,
     );
     let missing_ptp = state.missing_ptp_clocks(expanded_protocols);
-    print_report(
-        &state.streams, &state.tcp_streams, &state.ptp_domains, &missing_ptp,
-        logger, &state.network_health, state.bytes_this_window,
-        &state.avtp_streams, &state.msrp_state, &state.mvrp_vlans, &state.eee_ports,
-        &state.dante_sources, &state.dante_names, &state.dante_conmon,
-        &state.dante_unverified_windows,
-        &state.ndi_sources, &state.ndi_names,
-        &state.avdecc_entities,
-        state.pause_frames_this_window, state.pfc_frames_this_window,
-        pcap_stats, state.packets_dispatched,
-        &ip_config_alerts, &conmon_bridge_alerts,
-        &follower_census_alerts, &ptp_sync_alerts,
-        no_flows_diagnostic_shown,
-        quiet,
-    );
+
+    // Gather everything this Window needs behind one borrow. Built here (not in
+    // print_report) so the score and missing-clock computations above — which
+    // need &mut access to network_health and the expanded protocol list — finish
+    // before the immutable snapshot borrows take hold.
+    let snap = ReportSnapshot {
+        streams: &state.streams,
+        tcp_streams: &state.tcp_streams,
+        ptp_domains: &state.ptp_domains,
+        missing_ptp: &missing_ptp,
+        health: &state.network_health,
+        bytes_this_window: state.bytes_this_window,
+        avtp_streams: &state.avb.avtp_streams,
+        msrp_state: &state.avb.msrp_state,
+        mvrp_vlans: &state.avb.mvrp_vlans,
+        eee_ports: &state.eee_ports,
+        dante_sources: &state.dante.sources,
+        dante_names: &state.dante.names,
+        dante_conmon: &state.dante.conmon,
+        dante_unverified_windows: &state.dante.unverified_windows,
+        ndi_sources: &state.ndi.sources,
+        ndi_names: &state.ndi.names,
+        avdecc_entities: &state.avb.avdecc_entities,
+        pause_frames: state.pause_frames_this_window,
+        pfc_frames: state.pfc_frames_this_window,
+        pcap_stats,
+        packets_dispatched: state.packets_dispatched,
+        ip_config_alerts: &ip_config_alerts,
+        conmon_bridge_alerts: &conmon_bridge_alerts,
+        follower_census_alerts: &follower_census_alerts,
+        ptp_sync_alerts: &ptp_sync_alerts,
+    };
+    print_report(&snap, session, logger);
     state.reset_window();
 }
 
