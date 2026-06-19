@@ -244,6 +244,17 @@ pub fn detect_protocol(eth: &EthernetPacket) -> Option<AvProtocol> {
         return Some(AvProtocol::Igmp { src, src_mac, group, igmp_type });
     }
 
+    // ── TCP (NDI's only transport) — plain decode, no NDI awareness here ──
+    // `is_selected` gates this on NDI; `handle_tcp` does the is-this-actually-NDI
+    // judgment against `ndi.sources` and the NDI port range.
+    if let Some((src, dst, src_port, dst_port, has_fin, has_syn, has_rst, seq, ack)) =
+        parse_tcp_packet(eth)
+    {
+        return Some(AvProtocol::Tcp(crate::protocols::TcpSegment {
+            src, dst, src_port, dst_port, seq, ack, has_fin, has_syn, has_rst,
+        }));
+    }
+
     // Try to extract IPv4/UDP layers
     let ip  = Ipv4Packet::new(l2_payload)?;
     let udp = UdpPacket::new(ip.payload())?;

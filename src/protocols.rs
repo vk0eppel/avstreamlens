@@ -57,6 +57,27 @@ pub enum AvProtocol {
     Igmp   { src: Ipv4Addr, src_mac: [u8; 6], group: Ipv4Addr, igmp_type: IgmpType },
     LldpEee { chassis_id: String, port_id: String, tx_wake_us: u16, rx_wake_us: u16 },
     FlowControl { kind: FlowControlKind },
+    /// Any IPv4 TCP segment. NDI is the only protocol carried over TCP, so
+    /// `is_selected` gates this on NDI — but detection itself stays a plain
+    /// decode with no knowledge of NDI or `ndi.sources`. The is-this-actually-NDI
+    /// judgment (port range, or a source IP already known from mDNS) happens in
+    /// `handle_tcp`, the same place every other protocol's state-dependent
+    /// narrowing happens.
+    Tcp(TcpSegment),
+}
+
+/// A decoded TCP segment, independent of any protocol riding on top of it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TcpSegment {
+    pub src:      Ipv4Addr,
+    pub dst:      Ipv4Addr,
+    pub src_port: u16,
+    pub dst_port: u16,
+    pub seq:      u32,
+    pub ack:      u32,
+    pub has_fin:  bool,
+    pub has_syn:  bool,
+    pub has_rst:  bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -190,7 +211,8 @@ impl AvProtocol {
             AvProtocol::Aes67  { .. } => expanded.iter().any(|c| matches!(c, ProtocolChoice::AES67)),
             AvProtocol::St2110 { .. } => expanded.iter().any(|c| matches!(c, ProtocolChoice::ST2110)),
             AvProtocol::Dante  { .. } => expanded.iter().any(|c| matches!(c, ProtocolChoice::Dante)),
-            AvProtocol::Ndi    { .. } => expanded.iter().any(|c| matches!(c, ProtocolChoice::NDI)),
+            AvProtocol::Ndi    { .. }
+            | AvProtocol::Tcp  { .. } => expanded.iter().any(|c| matches!(c, ProtocolChoice::NDI)),
             AvProtocol::Avb    { .. }
             | AvProtocol::Msrp { .. }
             | AvProtocol::Mvrp { .. }

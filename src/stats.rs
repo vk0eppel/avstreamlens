@@ -175,6 +175,35 @@ impl StreamStats {
         stats
     }
 
+    /// Apply Session Announcement metadata to this stream. The single seam for
+    /// SDP → StreamStats field transfer, called both when a stream is created
+    /// and a cached SDP already matches its port, and retroactively from
+    /// `handle_sap` for every existing stream a new announcement matches —
+    /// previously these were two independently-maintained copies that had
+    /// already drifted (one skipped `ptime_ms`, the other skipped `channels`).
+    /// `sdp_name` is written once — re-announcements never overwrite a name
+    /// already shown, avoiding display flicker on a session rename. Every
+    /// technical field always re-applies, so a mid-run codec change (sample
+    /// rate, ptime, payload type) takes effect immediately. Returns whether
+    /// this call confirmed the clock rate, for protocol-specific fallbacks
+    /// (e.g. ST2110 video is always clock-confirmed regardless of SDP).
+    pub fn apply_sdp(&mut self, media: &crate::protocols::SdpMedia, session_name: &str) -> bool {
+        if self.sdp_name.is_none() {
+            self.sdp_name = Some(session_name.to_string());
+        }
+        self.sdp_rtpmap = Some(media.rtpmap.clone());
+        if media.clock_hz > 0.0 {
+            self.clock_hz = media.clock_hz;
+            self.clock_hz_confirmed = true;
+        }
+        if media.ptime_ms > 0.0 { self.ptime_ms = media.ptime_ms; }
+        if media.channels > 0   { self.channels = media.channels; }
+        if let Some(pt) = media.payload_types.first().copied() {
+            self.expected_pt = Some(pt);
+        }
+        media.clock_hz > 0.0
+    }
+
     /// `udp_payload_len`: actual length of UDP payload (without IP/UDP header),
     /// used for exact bitrate calculation.
     pub fn update(&mut self, seq: u16, rtp_ts: u32, ssrc: u32, udp_payload_len: usize) {
@@ -1456,5 +1485,63 @@ mod tests {
         let mut s = aes67();
         s.iat_samples = vec![1.0; 4];
         assert_eq!(s.timing_metronomic(), None);
+    }
+
+    // ── apply_sdp (Session Announcement enrichment) ──────────────────────────
+
+    fn media(clock_hz: f64, channels: u8, ptime_ms: f64, pt: u8) -> crate::protocols::SdpMedia {
+        crate::protocols::SdpMedia {
+            media_type: "audio".to_string(),
+            port: 5004,
+            payload_types: vec![pt],
+            connection: String::new(),
+            rtpmap: "L24/48000/2".to_string(),
+            clock_hz, channels, ptime_ms,
+            ts_refclk: String::new(),
+            mediaclk: String::new(),
+        }
+    }
+
+    #[test]
+    fn apply_sdp_transfers_all_technical_fields() {
+        let mut s = aes67();
+        let confirmed = s.apply_sdp(&media(96_000.0, 2, 1.0, 97), "Studio Mix");
+        assert!(confirmed);
+        assert_eq!(s.clock_hz, 96_000.0);
+        assert!(s.clock_hz_confirmed);
+        assert_eq!(s.channels, 2);
+        assert_eq!(s.ptime_ms, 1.0);
+        assert_eq!(s.expected_pt, Some(97));
+        assert_eq!(s.sdp_rtpmap.as_deref(), Some("L24/48000/2"));
+        assert_eq!(s.sdp_name.as_deref(), Some("Studio Mix"));
+    }
+
+    #[test]
+    fn apply_sdp_returns_false_when_clock_hz_zero() {
+        let mut s = aes67();
+        let confirmed = s.apply_sdp(&media(0.0, 2, 1.0, 97), "Studio Mix");
+        assert!(!confirmed);
+        assert!(!s.clock_hz_confirmed);
+    }
+
+    #[test]
+    fn apply_sdp_name_written_once() {
+        let mut s = aes67();
+        s.apply_sdp(&media(48_000.0, 2, 1.0, 96), "First Name");
+        s.apply_sdp(&media(96_000.0, 2, 1.0, 97), "Second Name");
+        assert_eq!(s.sdp_name.as_deref(), Some("First Name"), "name must not be overwritten");
+        assert_eq!(s.clock_hz, 96_000.0, "technical fields must still refresh");
+    }
+
+    #[test]
+    fn apply_sdp_zero_fields_do_not_clobber_existing_values() {
+        let mut s = aes67();
+        s.channels = 4;
+        s.ptime_ms = 4.0;
+        // A re-announcement with channels/ptime_ms left at 0 (not present in this
+        // media block) must not stomp values set by an earlier announcement.
+        s.apply_sdp(&media(48_000.0, 0, 0.0, 96), "Name");
+        assert_eq!(s.channels, 4);
+        assert_eq!(s.ptime_ms, 4.0);
     }
 }

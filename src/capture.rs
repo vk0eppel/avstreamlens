@@ -20,7 +20,7 @@ use pnet_packet::Packet;
 use crate::parser::{is_aes67_multicast, is_st2110_multicast, parse_rtp};
 use crate::protocols::{
     AvProtocol, AvdeccAdp, DanteKind, FlowControlKind, IgmpType, MsrpDeclType, MsrpDeclaration,
-    NdiKind, ProtocolChoice, PtpInfo, SdpSession, St2110Type, TransmitterClass, DEFAULT_CLOCK_HZ,
+    NdiKind, ProtocolChoice, PtpInfo, SdpMedia, SdpSession, St2110Type, TransmitterClass, DEFAULT_CLOCK_HZ,
     PTP_VERSION_V2, STREAM_TIMEOUT_SECS, avtp_subtype_name, classify_transmitter, msrp_failure_reason,
 };
 use crate::report::Logger;
@@ -530,32 +530,14 @@ impl CaptureState {
 
     // ── Handlers ────────────────────────────────────────────────────────────
 
-    /// SAP/SDP: cache the SDP and enrich any matching streams with metadata.
-    ///
-    /// Technical fields (clock_hz, ptime_ms, expected_pt, codec) are always
-    /// re-applied so a mid-run codec change is picked up immediately. The
-    /// session name is only written once — subsequent re-announcements with the
-    /// same or different name do not overwrite a name already shown to the user.
+    /// SAP/SDP: cache the SDP and retroactively enrich any existing stream
+    /// whose port matches an announced media — see `StreamStats::apply_sdp`
+    /// for the field-transfer rules.
     pub fn handle_sap(&mut self, sdp: SdpSession) {
         for m in &sdp.media {
             for stats in self.streams.values_mut() {
                 if stats.dst_port == m.port {
-                    // Name: set on first announcement only.
-                    if stats.sdp_name.is_none() {
-                        stats.sdp_name = Some(sdp.session_name.clone());
-                    }
-                    // Technical fields: always refresh so mid-run codec changes
-                    // (sample rate, ptime, payload type) are reflected immediately.
-                    stats.sdp_rtpmap = Some(m.rtpmap.clone());
-                    if m.clock_hz > 0.0 {
-                        stats.clock_hz = m.clock_hz;
-                        stats.clock_hz_confirmed = true;
-                    }
-                    if m.ptime_ms > 0.0 { stats.ptime_ms = m.ptime_ms; }
-                    if m.channels > 0   { stats.channels = m.channels; }
-                    if let Some(pt) = m.payload_types.first().copied() {
-                        stats.expected_pt = Some(pt);
-                    }
+                    stats.apply_sdp(m, &sdp.session_name);
                     break;
                 }
             }
@@ -681,23 +663,26 @@ impl CaptureState {
         }
     }
 
+    /// Find the cached Session Announcement (if any) whose media matches a
+    /// destination port, paired with its session name. Used at stream creation
+    /// to enrich a stream whose SDP was already announced before the first
+    /// packet arrived — see `StreamStats::apply_sdp` for what gets transferred.
+    fn find_sdp_media(&self, port: u16) -> Option<(&str, &SdpMedia)> {
+        self.sdp_cache.values()
+            .find_map(|s| s.media.iter().find(|m| m.port == port).map(|m| (s.session_name.as_str(), m)))
+    }
+
     /// AES67 RTP audio.
     pub fn handle_aes67(&mut self, dst: Ipv4Addr, dst_port: u16, payload_type: u8, l2_payload: &[u8]) {
         let key = format!("AES67 {}:{}", dst, dst_port);
+        let sdp_match = self.find_sdp_media(dst_port).map(|(name, m)| (name.to_string(), m.clone()));
         let stats = self.streams.entry(key).or_insert_with(|| {
-            let sdp_media = self.sdp_cache.values()
-                .flat_map(|s| s.media.iter())
-                .find(|m| m.port == dst_port);
-            let (clock, rtpmap, exp_pt, channels, confirmed) = sdp_media
-                .map(|m| (m.clock_hz, Some(m.rtpmap.clone()), m.payload_types.first().copied(),
-                          if m.channels > 0 { m.channels } else { 1 }, m.clock_hz > 0.0))
-                .unwrap_or((DEFAULT_CLOCK_HZ, None, None, 1, false));
-            let mut s = StreamStats::new_with_info("AES67", clock, is_aes67_multicast(dst), dst, dst_port);
-            s.sdp_rtpmap = rtpmap;
+            let mut s = StreamStats::new_with_info("AES67", DEFAULT_CLOCK_HZ, is_aes67_multicast(dst), dst, dst_port);
             s.media_type = "audio".to_string();
-            s.channels = channels;
-            s.expected_pt = exp_pt;
-            s.clock_hz_confirmed = confirmed;
+            s.channels = 1;
+            if let Some((name, media)) = &sdp_match {
+                s.apply_sdp(media, name);
+            }
             s
         });
         if let Some(ip) = pnet_packet::ipv4::Ipv4Packet::new(l2_payload)
@@ -725,22 +710,16 @@ impl CaptureState {
         };
         let key = format!("ST {} {}:{}", label, dst, dst_port);
         let default_clock = if matches!(stream_type, St2110Type::Video) { 90_000.0 } else { DEFAULT_CLOCK_HZ };
+        let sdp_match = self.find_sdp_media(dst_port).map(|(name, m)| (name.to_string(), m.clone()));
         let stats = self.streams.entry(key).or_insert_with(|| {
-            let sdp_media = self.sdp_cache.values()
-                .flat_map(|s| s.media.iter())
-                .find(|m| m.port == dst_port);
-            let (clock, rtpmap, exp_pt, confirmed) = sdp_media
-                .map(|m| (m.clock_hz, Some(m.rtpmap.clone()), m.payload_types.first().copied(), m.clock_hz > 0.0))
-                .unwrap_or((default_clock, None, None, false));
-            let mut s = StreamStats::new_with_info(label, clock, is_st2110_multicast(dst), dst, dst_port);
-            s.sdp_rtpmap = rtpmap;
+            let mut s = StreamStats::new_with_info(label, default_clock, is_st2110_multicast(dst), dst, dst_port);
             s.media_type = match stream_type {
                 St2110Type::Video => "video".to_string(),
                 St2110Type::Audio => "audio".to_string(),
                 St2110Type::Ancdata => "ancillary".to_string(),
                 St2110Type::Unknown => "unknown".to_string(),
             };
-            s.expected_pt = exp_pt;
+            let confirmed = sdp_match.as_ref().is_some_and(|(name, media)| s.apply_sdp(media, name));
             // ST2110-20 video always uses 90 kHz per spec — enable TS discontinuity
             // detection even without SDP. ST2110-30 audio: default 1 ms ptime.
             s.clock_hz_confirmed = confirmed || matches!(stream_type, St2110Type::Video);
@@ -840,27 +819,13 @@ impl CaptureState {
                     s.sdp_name = self.dante.names.get(&src).cloned();
                     s
                 });
+                let mut dscp_seen = None;
                 if let Some(ip) = pnet_packet::ipv4::Ipv4Packet::new(l2_payload)
                     && let Some(udp) = pnet_packet::udp::UdpPacket::new(ip.payload())
                 {
                     let dscp = ip.get_dscp();
                     if stats.observed_dscp.is_none() { stats.observed_dscp = Some(dscp); }
-                    // Dante hardware audio requires DSCP EF (46). DVS/Via intentionally
-                    // send Best Effort (DSCP 0), so DSCP 0 is NOT a violation for a
-                    // software source. The gating class is derived WITHOUT the DSCP
-                    // signal (control-plane + timing only) to avoid circularity —
-                    // otherwise DSCP 0 would suppress its own violation and a
-                    // misconfigured hardware device at DSCP 0 would go unflagged.
-                    let gating_class = classify_transmitter(&crate::protocols::TransmitterSignals {
-                        control_plane: cp_class,
-                        metronomic: stats.timing_metronomic(),
-                        ..Default::default()
-                    }).map(|v| v.class);
-                    let software = matches!(gating_class,
-                        Some(TransmitterClass::Dvs | TransmitterClass::Via));
-                    if dscp != 46 && !(dscp == 0 && software) {
-                        stats.dscp_violations += 1;
-                    }
+                    dscp_seen = Some(dscp);
                     if ip.get_ecn() == 3 { self.network_health.ecn_congestion_marks += 1; }
                     // TTL routing check: Dante is L2-only; track minimum TTL so the
                     // report can alert when a router decremented it (TTL < 64 from a
@@ -876,14 +841,34 @@ impl CaptureState {
                 }
                 // Transmitter Class verdict — recomputed each packet so an early
                 // inference upgrades to a confirmed verdict as signals accumulate.
-                let metronomic = stats.timing_metronomic();
+                // Built once: the DSCP gate below derives from a copy of this same
+                // struct rather than an independently-built one — the prior code
+                // built two literals that had already drifted (the gating one
+                // silently dropped the TTL signal too, not just dscp_zero, so a
+                // Windows-hosted DVS source visible only via TTL could be displayed
+                // as DVS yet still flagged for a DSCP violation).
                 let signals = crate::protocols::TransmitterSignals {
                     control_plane: cp_class,
-                    metronomic,
+                    metronomic: stats.timing_metronomic(),
                     ttl: stats.min_ttl, // TTL 128 → Windows host → software (corroborating)
                     dscp_zero: stats.observed_dscp == Some(0),
                 };
                 stats.transmitter = classify_transmitter(&signals);
+
+                if let Some(dscp) = dscp_seen {
+                    // Dante hardware audio requires DSCP EF (46). DVS/Via intentionally
+                    // send Best Effort (DSCP 0), so DSCP 0 is NOT a violation for a
+                    // software source. Gate on a verdict computed WITHOUT the
+                    // dscp_zero signal — otherwise DSCP 0 would suppress its own
+                    // violation and a misconfigured hardware device at DSCP 0 would
+                    // go unflagged.
+                    let gating_signals = crate::protocols::TransmitterSignals { dscp_zero: false, ..signals };
+                    let software = classify_transmitter(&gating_signals)
+                        .is_some_and(|v| matches!(v.class, TransmitterClass::Dvs | TransmitterClass::Via));
+                    if dscp != 46 && !(dscp == 0 && software) {
+                        stats.dscp_violations += 1;
+                    }
+                }
                 vec![]
             }
         }
@@ -898,6 +883,65 @@ impl CaptureState {
         }
         let label = source_name.as_deref().unwrap_or("unknown source");
         vec![Alert::info(format!("🔍 NDI source: {}  \"{}\"", src, label))]
+    }
+
+    /// Any TCP segment — NDI is the only protocol carried over TCP. Narrows to
+    /// NDI here (port range, or a source/dest IP already known from mDNS) rather
+    /// than in `detect_protocol`, which stays a stateless decode. No-ops for any
+    /// TCP traffic that isn't NDI-relevant. Maintains two things every report
+    /// window reads: the per-connection quality/retransmission state in
+    /// `tcp_streams`, and the `"NDI {ip}"` entry in `streams` (packet count +
+    /// liveness) that `aggregate_ndi_bitrate` later sums `tcp_streams` bitrate into.
+    pub fn handle_tcp(&mut self, segment: crate::protocols::TcpSegment, frame_bytes: u64, now: Instant) {
+        let crate::protocols::TcpSegment { src, dst, src_port, dst_port, seq, ack, has_fin, has_syn, has_rst } = segment;
+        let ndi_range = crate::protocols::NDI_PORT_MIN..=crate::protocols::NDI_PORT_MAX;
+        let is_ndi = ndi_range.contains(&src_port) || ndi_range.contains(&dst_port)
+            || self.ndi.sources.contains(&src) || self.ndi.sources.contains(&dst);
+        if !is_ndi { return; }
+
+        let sender = if self.ndi.sources.contains(&src) { Some(src) }
+                     else if self.ndi.sources.contains(&dst) { Some(dst) }
+                     else { None };
+        if let Some(sender_ip) = sender {
+            let names = &self.ndi.names;
+            let stats = self.streams.entry(format!("NDI {}", sender_ip))
+                .or_insert_with(|| {
+                    let mut s = StreamStats::new_with_info("NDI", 0.0, false, sender_ip, 0);
+                    s.sdp_name = names.get(&sender_ip).cloned();
+                    s
+                });
+            stats.packets += 1;
+            stats.last_packet_time = Some(now);
+        }
+
+        let key = format!("TCP {}:{} → {}:{}", src, src_port, dst, dst_port);
+        let tcp_stat = self.tcp_streams.entry(key)
+            .or_insert_with(|| crate::stats::TcpStreamStats::new(src, dst));
+        tcp_stat.packets += 1;
+        tcp_stat.last_seen = now;
+        let estimated_payload = frame_bytes.saturating_sub(40);
+        tcp_stat.bytes += estimated_payload;
+        if has_fin { tcp_stat.fin_packets += 1; }
+        if has_rst {
+            tcp_stat.rst_packets += 1;
+            self.network_health.tcp_retransmissions += 1;
+        }
+        if !has_syn
+            && let Some(last_seq) = tcp_stat.last_seq
+            && (seq.wrapping_sub(last_seq) as i32) < 0
+            && tcp_stat.packets > 2
+        {
+            tcp_stat.retransmissions += 1;
+            self.network_health.tcp_retransmissions += 1;
+        }
+        if let Some(last_seq) = tcp_stat.last_seq {
+            if (seq.wrapping_sub(last_seq) as i32) > 0 { tcp_stat.last_seq = Some(seq); }
+        } else {
+            tcp_stat.last_seq = Some(seq);
+        }
+        tcp_stat.last_ack = Some(ack);
+        tcp_stat.update_bitrate();
+        tcp_stat.update_quality();
     }
 
     /// AVB AVTP frame — updates the per-subtype aggregate stream and per-stream_id entry.
@@ -1335,6 +1379,10 @@ pub fn dispatch(
             state.handle_flow_control(kind);
             vec![]
         }
+        AvProtocol::Tcp(segment) => {
+            state.handle_tcp(segment, frame_bytes, now);
+            vec![]
+        }
     };
     emit(&alerts, logger);
 }
@@ -1410,6 +1458,12 @@ mod tests {
         assert_eq!(s.expected_pt, Some(96));
         assert!(s.clock_hz_confirmed, "SAP-confirmed clock should flip the flag");
         assert_eq!(s.sdp_rtpmap.as_deref(), Some("L24/48000/2"));
+        // Previously missing from the AES67 lazy-enrichment closure — a stream
+        // created after its SDP was already cached got no ptime_ms/channels/name
+        // until the next re-announcement. apply_sdp closes that gap.
+        assert_eq!(s.ptime_ms, 1.0);
+        assert_eq!(s.channels, 2);
+        assert_eq!(s.sdp_name.as_deref(), Some("Test Mix"));
     }
 
     /// SAP re-announcement with changed technical fields (e.g. payload type) must
@@ -1530,6 +1584,22 @@ mod tests {
         state.handle_st2110(Ipv4Addr::new(239, 1, 2, 3), 5004, St2110Type::Video, &pkt);
         let s = state.streams.values().find(|s| s.protocol == "2110-20").unwrap();
         assert!(s.clock_hz_confirmed, "video uses 90 kHz by spec, no SDP needed");
+    }
+
+    #[test]
+    fn st2110_audio_new_stream_inherits_sdp_when_present() {
+        // Previously missing from the ST2110 lazy-enrichment closure — channels
+        // wasn't transferred at all, and ptime_ms/name only arrived on the next
+        // re-announcement. apply_sdp closes that gap, same as for AES67.
+        let mut state = CaptureState::new();
+        state.sdp_cache.insert("1".to_string(), sdp_for_port(5004, 96, 48_000.0));
+        let pkt = ip_udp_rtp(46 << 2, 5004, 96, 0, 0, 0xAAAA);
+        state.handle_st2110(Ipv4Addr::new(239, 1, 2, 3), 5004, St2110Type::Audio, &pkt);
+        let s = state.streams.values().find(|s| s.protocol == "2110-30").unwrap();
+        assert_eq!(s.channels, 2);
+        assert_eq!(s.ptime_ms, 1.0);
+        assert_eq!(s.sdp_name.as_deref(), Some("Test Mix"));
+        assert!(s.clock_hz_confirmed);
     }
 
     // ── Dante ────────────────────────────────────────────────────────────────
@@ -1661,6 +1731,26 @@ mod tests {
         state.handle_dante(DanteKind::AudioStream, src, Ipv4Addr::new(239,255,1,3), 5004, &pkt, Instant::now());
         let s = state.streams.values().find(|s| s.src_ip == Some(src)).unwrap();
         assert_eq!(s.dscp_violations, 1);
+    }
+
+    #[test]
+    fn ttl_only_dvs_at_dscp_zero_is_not_a_violation() {
+        // No control-plane signal, no timing evidence (single packet), but a
+        // Windows host TTL (128) on its own infers DVS (see ttl_128_alone_infers_dvs
+        // in protocols.rs). The DSCP gate must agree with the displayed verdict:
+        // before centralizing signal construction, the gating struct silently
+        // dropped the TTL field too (not just dscp_zero), so this exact source
+        // was displayed as "DVS (likely)" yet still flagged for a DSCP violation.
+        let mut state = CaptureState::new();
+        let src = Ipv4Addr::new(192, 168, 1, 95);
+        let mut pkt = ip_udp_rtp(0, 5004, 96, 0, 0, 1); // DSCP 0
+        pkt[8] = 128; // TTL 128 — Windows host
+        state.handle_dante(DanteKind::AudioStream, src, Ipv4Addr::new(239,255,1,4), 5004, &pkt, Instant::now());
+        let s = state.streams.values().find(|s| s.src_ip == Some(src)).unwrap();
+        assert_eq!(s.transmitter.map(|v| v.class), Some(TransmitterClass::Dvs),
+            "TTL 128 alone should infer DVS");
+        assert_eq!(s.dscp_violations, 0,
+            "gating must agree with the displayed DVS verdict, not silently drop the TTL signal");
     }
 
     #[test]
@@ -2241,6 +2331,71 @@ mod tests {
         assert_eq!(alerts.len(), 1);
         assert!(state.ndi.sources.contains(&src));
         assert_eq!(state.ndi.names.get(&src).map(|s| s.as_str()), Some("Studio Cam"));
+    }
+
+    fn tcp_segment(src: Ipv4Addr, dst: Ipv4Addr, src_port: u16, dst_port: u16, seq: u32) -> crate::protocols::TcpSegment {
+        crate::protocols::TcpSegment {
+            src, dst, src_port, dst_port, seq, ack: 0,
+            has_fin: false, has_syn: false, has_rst: false,
+        }
+    }
+
+    #[test]
+    fn tcp_to_known_ndi_source_tracked() {
+        let mut state = CaptureState::new();
+        let cam = Ipv4Addr::new(192, 168, 1, 60);
+        let viewer = Ipv4Addr::new(192, 168, 1, 100);
+        state.handle_ndi_discovery(cam, Some("Studio Cam".to_string()));
+
+        state.handle_tcp(tcp_segment(cam, viewer, 6000, 51000, 1000), 1200, Instant::now());
+
+        let stream = state.streams.get("NDI 192.168.1.60").expect("NDI stream entry created");
+        assert_eq!(stream.packets, 1);
+        assert_eq!(stream.sdp_name.as_deref(), Some("Studio Cam"));
+        assert!(state.tcp_streams.contains_key("TCP 192.168.1.60:6000 → 192.168.1.100:51000"));
+    }
+
+    #[test]
+    fn tcp_in_ndi_port_range_tracked_even_without_discovery() {
+        // Port-range match alone is enough to track the TCP connection, but the
+        // "NDI {ip}" display entry additionally requires a known source/dest —
+        // mirrors the pre-refactor behavior in main.rs.
+        let mut state = CaptureState::new();
+        let a = Ipv4Addr::new(10, 0, 0, 1);
+        let b = Ipv4Addr::new(10, 0, 0, 2);
+
+        state.handle_tcp(tcp_segment(a, b, 5965, 51000, 1), 1000, Instant::now());
+
+        assert!(state.tcp_streams.contains_key("TCP 10.0.0.1:5965 → 10.0.0.2:51000"));
+        assert!(state.streams.is_empty());
+    }
+
+    #[test]
+    fn tcp_outside_ndi_range_and_unknown_source_ignored() {
+        let mut state = CaptureState::new();
+        let a = Ipv4Addr::new(10, 0, 0, 1);
+        let b = Ipv4Addr::new(10, 0, 0, 2);
+
+        state.handle_tcp(tcp_segment(a, b, 443, 51000, 1), 1000, Instant::now());
+
+        assert!(state.tcp_streams.is_empty());
+        assert!(state.streams.is_empty());
+    }
+
+    #[test]
+    fn tcp_backward_seq_counted_as_retransmission() {
+        let mut state = CaptureState::new();
+        let cam = Ipv4Addr::new(192, 168, 1, 60);
+        let viewer = Ipv4Addr::new(192, 168, 1, 100);
+        state.handle_ndi_discovery(cam, None);
+
+        state.handle_tcp(tcp_segment(cam, viewer, 6000, 51000, 1000), 100, Instant::now());
+        state.handle_tcp(tcp_segment(cam, viewer, 6000, 51000, 2000), 100, Instant::now());
+        state.handle_tcp(tcp_segment(cam, viewer, 6000, 51000, 1500), 100, Instant::now());
+
+        let tcp_stat = state.tcp_streams.get("TCP 192.168.1.60:6000 → 192.168.1.100:51000").unwrap();
+        assert_eq!(tcp_stat.retransmissions, 1);
+        assert_eq!(state.network_health.tcp_retransmissions, 1);
     }
 
     // ── IGMP ─────────────────────────────────────────────────────────────────

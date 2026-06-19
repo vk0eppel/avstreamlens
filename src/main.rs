@@ -9,8 +9,9 @@
 // - Terminal reporting every 5 seconds
 //
 // The capture loop here is intentionally thin. Per-protocol handlers live in
-// capture.rs as methods on CaptureState; this fn owns the pcap handle, the
-// 5-second report timer, and the post-dispatch IPv4/TCP tracking.
+// capture.rs as methods on CaptureState, reached through dispatch() for every
+// protocol including NDI/TCP; this fn owns the pcap handle, the 5-second
+// report timer, and dynamic IGMP join draining.
 
 mod cli;
 mod parser;
@@ -26,9 +27,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::capture::{Alert, CaptureState};
-use crate::parser::{detect_protocol, parse_tcp_packet, parse_ts_refclk, is_multicast, unwrap_vlan};
+use crate::parser::{detect_protocol, parse_ts_refclk, is_multicast, unwrap_vlan};
 use crate::report::{create_logger, print_report, ReportSnapshot, ReportSession};
-use crate::stats::StreamStats;
 
 use std::collections::HashSet;
 use std::net::{Ipv4Addr, UdpSocket};
@@ -133,7 +133,6 @@ fn main() {
     let expanded_protocols: Vec<protocols::ProtocolChoice> = selected_protocols.iter()
         .flat_map(|c| c.includes())
         .collect();
-    let ndi_selected = expanded_protocols.iter().any(|c| matches!(c, protocols::ProtocolChoice::NDI));
     let mut logger = create_logger(&protocol_names).expect("Unable to create log file");
 
     let proto_display = cli::selected_protocol_display(&selected_protocols);
@@ -203,7 +202,7 @@ fn main() {
             .filter_map(|a| if let std::net::IpAddr::V4(v4) = a.addr { Some(v4) } else { None })
             .collect();
         run_loop(&mut cap, &mut state, Some(LiveConfig {
-                     iface_ip, ndi_selected, duration_secs,
+                     iface_ip, duration_secs,
                      mc_sockets: &mut mc_sockets, mc_joined: &mut mc_joined,
                  }), &expanded_protocols, quiet, &mut logger);
     }
@@ -212,7 +211,6 @@ fn main() {
 /// Parameters used only in live-capture mode. Passed as `None` for offline replay.
 struct LiveConfig<'a> {
     iface_ip:      Ipv4Addr,
-    ndi_selected:  bool,
     duration_secs: Option<u64>,
     mc_sockets:    &'a mut Vec<UdpSocket>,
     mc_joined:     &'a mut HashSet<Ipv4Addr>,
@@ -313,77 +311,12 @@ fn run_loop<T: Activated>(
             state.pending_join_groups.clear();
         }
 
-        // ── Hoist IPv4 parse — shared by NDI detection and health tracking ───
+        // ── IPv4 parse for multicast/unicast health tracking ─────────────────
         let outer_ip = if l2_et == 0x0800 {
             pnet_packet::ipv4::Ipv4Packet::new(l2_payload)
         } else {
             None
         };
-
-        // ── NDI stream via known source IP ───────────────────────────────────
-        if live.as_ref().is_some_and(|l| l.ndi_selected)
-            && let Some(ref ip) = outer_ip
-            && !state.ndi.sources.is_empty()
-            && ip.get_next_level_protocol() == pnet_packet::ip::IpNextHeaderProtocols::Tcp
-        {
-            let s = ip.get_source();
-            let d = ip.get_destination();
-            let sender = if state.ndi.sources.contains(&s) { Some(s) }
-                        else if state.ndi.sources.contains(&d) { Some(d) }
-                        else { None };
-            if let Some(sender_ip) = sender {
-                let names = &state.ndi.names;
-                let stats = state.streams.entry(format!("NDI {}", sender_ip))
-                    .or_insert_with(|| {
-                        let mut s = StreamStats::new_with_info("NDI", 0.0, false, sender_ip, 0);
-                        s.sdp_name = names.get(&sender_ip).cloned();
-                        s
-                    });
-                stats.packets += 1;
-                stats.last_packet_time = Some(now);
-            }
-        }
-
-        // ── TCP monitoring — NDI flows only ──────────────────────────────────
-        let is_tcp = outer_ip.as_ref().is_some_and(|ip| {
-            ip.get_next_level_protocol() == pnet_packet::ip::IpNextHeaderProtocols::Tcp
-        });
-        if is_tcp
-            && let Some((src_ip, dst_ip, src_port, dst_port, has_fin, has_syn, has_rst, seq, ack)) = parse_tcp_packet(&eth)
-        {
-            let ndi_range = protocols::NDI_PORT_MIN..=protocols::NDI_PORT_MAX;
-            let is_ndi = ndi_range.contains(&src_port) || ndi_range.contains(&dst_port)
-                      || state.ndi.sources.contains(&src_ip) || state.ndi.sources.contains(&dst_ip);
-            if is_ndi {
-                let key = format!("TCP {}:{} → {}:{}", src_ip, src_port, dst_ip, dst_port);
-                let tcp_stat = state.tcp_streams.entry(key).or_insert_with(|| crate::stats::TcpStreamStats::new(src_ip, dst_ip));
-                tcp_stat.packets += 1;
-                tcp_stat.last_seen = now;
-                let estimated_payload = frame_bytes.saturating_sub(40);
-                tcp_stat.bytes += estimated_payload;
-                if has_fin { tcp_stat.fin_packets += 1; }
-                if has_rst {
-                    tcp_stat.rst_packets += 1;
-                    state.network_health.tcp_retransmissions += 1;
-                }
-                if !has_syn
-                    && let Some(last_seq) = tcp_stat.last_seq
-                    && (seq.wrapping_sub(last_seq) as i32) < 0
-                    && tcp_stat.packets > 2
-                {
-                    tcp_stat.retransmissions += 1;
-                    state.network_health.tcp_retransmissions += 1;
-                }
-                if let Some(last_seq) = tcp_stat.last_seq {
-                    if (seq.wrapping_sub(last_seq) as i32) > 0 { tcp_stat.last_seq = Some(seq); }
-                } else {
-                    tcp_stat.last_seq = Some(seq);
-                }
-                tcp_stat.last_ack = Some(ack);
-                tcp_stat.update_bitrate();
-                tcp_stat.update_quality();
-            }
-        }
 
         // ── Network health tracking ───────────────────────────────────────────
         state.network_health.total_packets += 1;
