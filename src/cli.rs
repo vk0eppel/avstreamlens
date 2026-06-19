@@ -315,14 +315,11 @@ pub fn build_bpf_filter(selected: &[ProtocolChoice]) -> String {
 /// Suffix showing which infrastructure protocols are auto-enabled alongside the
 /// user's selection.  Returns e.g. `"  (+ PTP, IGMP)"`, `"  (+ PTP)"`, or `""`.
 ///
-/// Rules (matching the actual `is_selected()` gating in `protocols.rs`):
-/// - PTP:  enabled when AES67, ST2110, Dante, or AVB is selected
-/// - IGMP: enabled when AES67, ST2110, or Dante is selected
+/// Reads `ProtocolChoice::needs_ptp`/`needs_igmp` — the same rule `is_selected()`
+/// gates real packet dispatch on, so this display can't drift from the gate.
 pub fn selected_extras_display(expanded: &[ProtocolChoice]) -> String {
-    let has_ptp  = expanded.iter().any(|c| matches!(c,
-        ProtocolChoice::AES67 | ProtocolChoice::ST2110 | ProtocolChoice::Dante | ProtocolChoice::AVB));
-    let has_igmp = expanded.iter().any(|c| matches!(c,
-        ProtocolChoice::AES67 | ProtocolChoice::ST2110 | ProtocolChoice::Dante));
+    let has_ptp  = expanded.iter().any(|c| c.needs_ptp());
+    let has_igmp = expanded.iter().any(|c| c.needs_igmp());
     match (has_ptp, has_igmp) {
         (true,  true)  => "  (+ PTP, IGMP)".to_string(),
         (true,  false) => "  (+ PTP)".to_string(),

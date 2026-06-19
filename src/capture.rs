@@ -130,6 +130,22 @@ impl DanteState {
         self.unverified_windows.retain(|ip, _| self.sources.contains(ip));
     }
 
+    /// Consecutive windows of mDNS-only silence before a discovered source is
+    /// considered unverified rather than just quiet — see `unverified()`.
+    const UNVERIFIED_THRESHOLD: u32 = 3;
+
+    /// Source IPs in `sources` that have gone `UNVERIFIED_THRESHOLD` or more
+    /// consecutive windows without ConMon activity or an active stream — likely
+    /// a management NIC or non-Dante device that happened to answer a Dante
+    /// mDNS query, not a genuine live device. Owns the threshold next to the
+    /// counter it judges, so the report layer only renders what this decides.
+    pub fn unverified(&self) -> HashSet<Ipv4Addr> {
+        self.sources.iter()
+            .filter(|ip| self.unverified_windows.get(ip).copied().unwrap_or(0) >= Self::UNVERIFIED_THRESHOLD)
+            .copied()
+            .collect()
+    }
+
     /// Record a Transmitter Class learned from control-plane traffic.
     /// DVS/Via are more specific than Hardware and overwrite it; Hardware never
     /// downgrades an existing DVS/Via verdict.
@@ -1987,6 +2003,46 @@ mod tests {
         state.dante.sources.insert(Ipv4Addr::new(10, 0, 0, 5));
         let alerts = state.dante.check_ip_config();
         assert!(alerts[0].message.contains("Domain Manager"));
+    }
+
+    // ── DanteState::unverified (mDNS-only device flagging) ───────────────────
+
+    #[test]
+    fn unverified_empty_below_threshold() {
+        let mut state = CaptureState::new();
+        let src = Ipv4Addr::new(192, 168, 1, 50);
+        state.dante.sources.insert(src);
+        // Two silent windows — one below the 3-window threshold.
+        state.dante.reset_window(&state.streams);
+        state.dante.reset_window(&state.streams);
+        assert!(state.dante.unverified().is_empty());
+    }
+
+    #[test]
+    fn unverified_flags_source_at_threshold() {
+        let mut state = CaptureState::new();
+        let src = Ipv4Addr::new(192, 168, 1, 50);
+        state.dante.sources.insert(src);
+        for _ in 0..3 {
+            state.dante.reset_window(&state.streams);
+        }
+        assert!(state.dante.unverified().contains(&src));
+    }
+
+    #[test]
+    fn unverified_resets_when_stream_appears() {
+        let mut state = CaptureState::new();
+        let src = Ipv4Addr::new(192, 168, 1, 50);
+        state.dante.sources.insert(src);
+        state.dante.reset_window(&state.streams);
+        state.dante.reset_window(&state.streams);
+        // A stream from this source appears before the third silent window —
+        // the counter must clear, not just stop incrementing.
+        let mut s = StreamStats::new_with_info("Dante", 48_000.0, false, Ipv4Addr::new(239,255,1,1), 5004);
+        s.src_ip = Some(src);
+        state.streams.insert("Dante test".to_string(), s);
+        state.dante.reset_window(&state.streams);
+        assert!(state.dante.unverified().is_empty());
     }
 
     // ── IGMP interval advisory and multiple-querier detection ────────────────

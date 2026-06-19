@@ -375,6 +375,7 @@ fn do_report(
     let conmon_bridge_alerts = state.dante.check_conmon_bridge();
     let follower_census_alerts = state.dante.check_follower_census(&state.ptpv1_followers, &state.ptp_domains);
     let ptp_sync_alerts      = state.check_ptp_sync_conflict();
+    let dante_unverified     = state.dante.unverified();
 
     state.network_health.calculate_score(
         &state.streams, &state.tcp_streams, &state.ptp_domains,
@@ -400,7 +401,7 @@ fn do_report(
         dante_sources: &state.dante.sources,
         dante_names: &state.dante.names,
         dante_conmon: &state.dante.conmon,
-        dante_unverified_windows: &state.dante.unverified_windows,
+        dante_unverified: &dante_unverified,
         ndi_sources: &state.ndi.sources,
         ndi_names: &state.ndi.names,
         avdecc_entities: &state.avb.avdecc_entities,

@@ -201,6 +201,24 @@ impl ProtocolChoice {
             other => vec![other.clone()],
         }
     }
+
+    /// Whether this protocol choice's traffic requires a PTP clock — the single
+    /// source of truth for the rule, read both by `AvProtocol::is_selected`'s
+    /// `Ptp` arm (gates real packet dispatch) and by `cli::selected_extras_display`
+    /// (drives the cosmetic "(+ PTP)" startup-banner suffix). The two used to
+    /// repeat the same variant list independently; a comment in cli.rs flagged
+    /// the risk of them drifting apart.
+    pub fn needs_ptp(&self) -> bool {
+        matches!(self, ProtocolChoice::AES67 | ProtocolChoice::ST2110
+            | ProtocolChoice::Dante | ProtocolChoice::AVB)
+    }
+
+    /// Whether this protocol choice's traffic requires IGMP (IP multicast
+    /// protocols only) — same role as `needs_ptp`, one source of truth for both
+    /// `is_selected`'s `Igmp` arm and the startup-banner suffix.
+    pub fn needs_igmp(&self) -> bool {
+        matches!(self, ProtocolChoice::AES67 | ProtocolChoice::ST2110 | ProtocolChoice::Dante)
+    }
 }
 
 impl AvProtocol {
@@ -221,16 +239,55 @@ impl AvProtocol {
             // Flow control is universal infrastructure — always relevant.
             AvProtocol::FlowControl { .. } => true,
             // PTP is relevant for all clock-dependent protocols; NDI uses its own timing
-            AvProtocol::Ptp { .. } =>
-                expanded.iter().any(|c| matches!(c,
-                    ProtocolChoice::AES67 | ProtocolChoice::ST2110
-                    | ProtocolChoice::Dante | ProtocolChoice::AVB)),
+            AvProtocol::Ptp { .. } => expanded.iter().any(|c| c.needs_ptp()),
             // IGMP is only relevant for IP multicast protocols (AES67, ST2110, Dante)
-            AvProtocol::Igmp { .. } =>
-                expanded.iter().any(|c| matches!(c, ProtocolChoice::AES67 | ProtocolChoice::ST2110 | ProtocolChoice::Dante)),
+            AvProtocol::Igmp { .. } => expanded.iter().any(|c| c.needs_igmp()),
             // SAP/SDP is only relevant for protocols that use it (AES67 and ST2110)
             AvProtocol::Sap { .. } =>
                 expanded.iter().any(|c| matches!(c, ProtocolChoice::AES67 | ProtocolChoice::ST2110)),
+        }
+    }
+}
+
+#[cfg(test)]
+mod gating_rules_tests {
+    use super::*;
+
+    #[test]
+    fn needs_ptp_true_for_clock_dependent_protocols() {
+        for c in [ProtocolChoice::AES67, ProtocolChoice::ST2110, ProtocolChoice::Dante, ProtocolChoice::AVB] {
+            assert!(c.needs_ptp(), "{:?} should need PTP", c);
+        }
+    }
+
+    #[test]
+    fn needs_ptp_false_for_ndi() {
+        // NDI uses its own TCP-based timing, no PTP.
+        assert!(!ProtocolChoice::NDI.needs_ptp());
+    }
+
+    #[test]
+    fn needs_igmp_true_only_for_ip_multicast_protocols() {
+        for c in [ProtocolChoice::AES67, ProtocolChoice::ST2110, ProtocolChoice::Dante] {
+            assert!(c.needs_igmp(), "{:?} should need IGMP", c);
+        }
+        assert!(!ProtocolChoice::AVB.needs_igmp(), "AVB is L2-only, no IP multicast");
+        assert!(!ProtocolChoice::NDI.needs_igmp());
+    }
+
+    #[test]
+    fn is_selected_igmp_arm_agrees_with_needs_igmp() {
+        // Pins the relationship the deduplication relies on: is_selected's Igmp
+        // arm must answer exactly what needs_igmp says for every concrete choice.
+        let igmp = AvProtocol::Igmp {
+            src: "0.0.0.0".parse().unwrap(), src_mac: [0; 6],
+            group: "239.0.0.1".parse().unwrap(), igmp_type: IgmpType::Join,
+        };
+        for c in ProtocolChoice::all_choices() {
+            for concrete in c.includes() {
+                assert_eq!(igmp.is_selected(std::slice::from_ref(&concrete)), concrete.needs_igmp(),
+                    "{:?} disagreement", concrete);
+            }
         }
     }
 }

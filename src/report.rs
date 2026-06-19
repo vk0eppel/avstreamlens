@@ -50,7 +50,7 @@ pub struct ReportSnapshot<'a> {
     pub dante_sources:  &'a HashSet<Ipv4Addr>,
     pub dante_names:    &'a HashMap<Ipv4Addr, String>,
     pub dante_conmon:   &'a HashMap<Ipv4Addr, ConmonDevice>,
-    pub dante_unverified_windows: &'a HashMap<Ipv4Addr, u32>,
+    pub dante_unverified: &'a HashSet<Ipv4Addr>,
     pub ndi_sources:    &'a HashSet<Ipv4Addr>,
     pub ndi_names:      &'a HashMap<Ipv4Addr, String>,
     pub avdecc_entities: &'a HashMap<[u8; 8], AvdeccEntity>,
@@ -155,7 +155,7 @@ fn print_discovery(
     dante_sources: &std::collections::HashSet<std::net::Ipv4Addr>,
     dante_names:   &HashMap<std::net::Ipv4Addr, String>,
     dante_conmon:  &HashMap<std::net::Ipv4Addr, ConmonDevice>,
-    dante_unverified_windows: &HashMap<std::net::Ipv4Addr, u32>,
+    dante_unverified: &std::collections::HashSet<std::net::Ipv4Addr>,
     ndi_sources:   &std::collections::HashSet<std::net::Ipv4Addr>,
     ndi_names:     &HashMap<std::net::Ipv4Addr, String>,
     dante_active: usize,
@@ -166,13 +166,7 @@ fn print_discovery(
     no_flows_diagnostic_shown: &mut bool,
     logger: &mut Logger,
 ) {
-    const UNVERIFIED_THRESHOLD: u32 = 3;
-
-    let flagged: std::collections::HashSet<std::net::Ipv4Addr> = dante_sources
-        .iter()
-        .filter(|ip| dante_unverified_windows.get(ip).copied().unwrap_or(0) >= UNVERIFIED_THRESHOLD)
-        .copied()
-        .collect();
+    let flagged = dante_unverified;
     let verified_count = dante_sources.len() - flagged.len();
 
     let ndi_count = ndi_sources.len();
@@ -327,7 +321,7 @@ pub fn print_report(snap: &ReportSnapshot, session: &mut ReportSession, logger: 
     let ReportSnapshot {
         streams, tcp_streams, ptp_domains, missing_ptp, health, bytes_this_window,
         avtp_streams, msrp_state, mvrp_vlans, eee_ports, dante_sources, dante_names,
-        dante_conmon, dante_unverified_windows, ndi_sources, ndi_names, avdecc_entities,
+        dante_conmon, dante_unverified, ndi_sources, ndi_names, avdecc_entities,
         pause_frames, pfc_frames, pcap_stats, packets_dispatched,
         ip_config_alerts, conmon_bridge_alerts, follower_census_alerts, ptp_sync_alerts,
     } = *snap;
@@ -419,7 +413,7 @@ pub fn print_report(snap: &ReportSnapshot, session: &mut ReportSession, logger: 
     let dante_active = streams.values().filter(|s| s.protocol == "Dante").count();
     let ndi_active   = streams.values().filter(|s| s.protocol == "NDI").count();
     print_discovery(
-        dante_sources, dante_names, dante_conmon, dante_unverified_windows,
+        dante_sources, dante_names, dante_conmon, dante_unverified,
         ndi_sources, ndi_names, dante_active, ndi_active, streams,
         ip_config_alerts, conmon_bridge_alerts, no_flows_diagnostic_shown, logger,
     );
