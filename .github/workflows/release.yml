@@ -1,0 +1,121 @@
+name: Release
+
+# v1 distribution targets: macOS (arm64 + x86_64), Linux x86_64, Windows x86_64.
+# Explicit non-goals for now (future work, not built here):
+#   - aarch64-unknown-linux-gnu
+#   - aarch64-pc-windows-msvc
+#   - a macOS universal/lipo binary combining both Darwin artifacts
+# Binaries are unsigned in v1 — see README.md for the Gatekeeper/SmartScreen
+# bypass instructions this implies for end users.
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: write
+
+env:
+  # Keep in sync with .github/workflows/ci.yml — see the comment there for why
+  # this is pinned + checksummed rather than always fetching "latest".
+  NPCAP_SDK_VERSION: "1.16"
+  NPCAP_SDK_SHA256: "f0a8be7778ee3ae1b99bbbecb27a3ff0f6c111a4093f1c78c5c5a099607184db"
+
+jobs:
+  verify-version:
+    name: verify tag matches Cargo.toml version
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compare tag to Cargo.toml version
+        run: |
+          tag_version="${GITHUB_REF_NAME#v}"
+          cargo_version=$(grep -m1 '^version' Cargo.toml | sed -E 's/version *= *"([^"]+)"/\1/')
+          if [ "$tag_version" != "$cargo_version" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME (version $tag_version) does not match Cargo.toml version $cargo_version"
+            exit 1
+          fi
+          echo "Tag matches Cargo.toml version: $cargo_version"
+
+  build:
+    name: build (${{ matrix.target }})
+    needs: verify-version
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-14
+          - target: x86_64-apple-darwin
+            os: macos-14
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-22.04
+          - target: x86_64-pc-windows-msvc
+            os: windows-2022
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Install libpcap (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libpcap-dev
+
+      # macOS runners already ship libpcap headers via the Xcode Command
+      # Line Tools SDK — no install step needed, for either Darwin target.
+
+      - name: Install Npcap SDK (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $url = "https://npcap.com/dist/npcap-sdk-$env:NPCAP_SDK_VERSION.zip"
+          $zip = "$env:RUNNER_TEMP\npcap-sdk.zip"
+          $sdkDir = "$env:RUNNER_TEMP\npcap-sdk"
+          Invoke-WebRequest -Uri $url -OutFile $zip
+          $hash = (Get-FileHash -Path $zip -Algorithm SHA256).Hash.ToLower()
+          if ($hash -ne $env:NPCAP_SDK_SHA256) {
+            Write-Error "Npcap SDK checksum mismatch: expected $env:NPCAP_SDK_SHA256, got $hash"
+            exit 1
+          }
+          Expand-Archive -Path $zip -DestinationPath $sdkDir
+          echo "LIB=$env:LIB;$sdkDir\Lib\x64" >> $env:GITHUB_ENV
+
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Package (macOS / Linux)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          name="avstreamlens-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          mkdir "$name"
+          cp "target/${{ matrix.target }}/release/avstreamlens" "$name/"
+          cp README.md LICENSE "$name/"
+          tar czf "$name.tar.gz" "$name"
+          echo "ARCHIVE_NAME=$name.tar.gz" >> "$GITHUB_ENV"
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $name = "avstreamlens-$env:GITHUB_REF_NAME-${{ matrix.target }}"
+          New-Item -ItemType Directory -Path $name | Out-Null
+          Copy-Item "target\${{ matrix.target }}\release\avstreamlens.exe" $name
+          Copy-Item README.md,LICENSE $name
+          Compress-Archive -Path $name -DestinationPath "$name.zip"
+          echo "ARCHIVE_NAME=$name.zip" >> $env:GITHUB_ENV
+
+      - name: Upload to release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          files: ${{ env.ARCHIVE_NAME }}

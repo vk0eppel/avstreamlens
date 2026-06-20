@@ -21,7 +21,42 @@ AVStreamLens reads the network passively using pcap, identifies streams and cloc
 
 ---
 
+## Download
+
+Most users should grab a prebuilt binary from the [GitHub Releases page](https://github.com/vk0eppel/avstreamlens/releases/latest) — no Rust toolchain required.
+
+| Platform | Artifact |
+|---|---|
+| macOS (Apple Silicon) | `avstreamlens-<version>-aarch64-apple-darwin.tar.gz` |
+| macOS (Intel) | `avstreamlens-<version>-x86_64-apple-darwin.tar.gz` |
+| Linux (x86_64) | `avstreamlens-<version>-x86_64-unknown-linux-gnu.tar.gz` |
+| Windows (x86_64) | `avstreamlens-<version>-x86_64-pc-windows-msvc.zip` |
+
+**macOS / Linux:**
+```
+tar xzf avstreamlens-<version>-<target>.tar.gz
+cd avstreamlens-<version>-<target>
+sudo ./avstreamlens
+```
+
+**Windows** (from an **Administrator** terminal — use Windows Terminal or VS Code for colour output, classic `cmd.exe` does not support ANSI colour):
+```
+Expand-Archive avstreamlens-<version>-x86_64-pc-windows-msvc.zip
+cd avstreamlens-<version>-x86_64-pc-windows-msvc
+.\avstreamlens.exe
+```
+
+You still need the runtime capture library installed regardless of how you got the binary — see [Prerequisites](#prerequisites) below.
+
+**Unsigned binary — v1 releases are not code-signed or notarized.** Your OS will warn you the first time you run it:
+- **macOS (Gatekeeper):** right-click the binary → *Open* → confirm in the dialog, or run `xattr -d com.apple.quarantine ./avstreamlens` once to clear the quarantine flag.
+- **Windows (SmartScreen):** click *More info* → *Run anyway*.
+
+---
+
 ## Prerequisites
+
+These are needed whether you downloaded a binary above or are building from source.
 
 **macOS**
 ```
@@ -37,17 +72,24 @@ sudo apt install libpcap-dev
 
 Install [Npcap](https://npcap.com) (the modern WinPcap replacement). During installation, enable **"Install Npcap in WinPcap API-compatible mode"**.
 
-**Rust toolchain**
-```
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-```
-
 Capturing packets requires elevated privileges — run as `sudo` on macOS/Linux, or as **Administrator** on Windows.
 
 ---
 
 ## Build
 
+Most users should use the [prebuilt binaries](#download) above. To build from source, you'll additionally need:
+
+**Rust toolchain**
+```
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+```
+
+**Windows only — Npcap SDK** (separate from the Npcap runtime installer above; provides the `.lib` files the linker needs):
+1. Download the SDK from [npcap.com/dist](https://npcap.com/dist/).
+2. Extract it and add its `Lib\x64` folder to your `LIB` environment variable.
+
+Then:
 ```
 cargo build --release
 ```

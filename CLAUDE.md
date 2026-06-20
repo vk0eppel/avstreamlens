@@ -30,7 +30,20 @@ cargo build --release   # build
 cargo fmt               # format
 cargo clippy -- -D warnings  # lint
 cargo test              # run all 275 unit tests
+
+# Release: bump version in Cargo.toml, commit, then:
+git tag vX.Y.Z && git push --tags   # triggers .github/workflows/release.yml
 ```
+
+## Release Process
+
+- **Two workflows.** `.github/workflows/ci.yml` runs on every push/PR to `main` — `cargo clippy -- -D warnings` + `cargo test` across `ubuntu-22.04`/`macos-14`/`windows-2022`. `.github/workflows/release.yml` triggers on a pushed tag matching `v*.*.*` — builds 4 release binaries and attaches them to a GitHub Release
+- **`verify-version` job runs first** in `release.yml` and fails the release before any matrix build starts if the tag (minus its `v` prefix) doesn't match `Cargo.toml`'s `version` — the tag drives artifact naming, so this guards against the two drifting apart
+- **v1 target matrix** (4 artifacts): `aarch64-apple-darwin` + `x86_64-apple-darwin` (both built natively/cross on a single `macos-14` Apple Silicon runner — no `cross`/Docker needed for the x86_64 Darwin cross-build), `x86_64-unknown-linux-gnu` (`ubuntu-22.04`), `x86_64-pc-windows-msvc` (`windows-2022`). **Explicit non-goals**, not yet built: `aarch64-unknown-linux-gnu`, `aarch64-pc-windows-msvc`, a macOS universal/lipo binary
+- **Windows build needs the Npcap SDK, not just the Npcap runtime.** The `pcap` crate links `Packet.lib`/`wpcap.lib` found via the `LIB` env var — there's no Cargo feature that avoids this. Both workflows download a **pinned** SDK version from `npcap.com/dist`, verify its SHA-256 against a checksum pinned in the workflow's `env:` block, then append its `Lib\x64` folder to `LIB`. npcap.com has no stable permalink/checksum API, so bump `NPCAP_SDK_VERSION` + `NPCAP_SDK_SHA256` together (in both workflow files) if the SDK ever needs updating, and expect the Windows leg to break if npcap.com reorganizes `/dist/` before that bump happens
+- **Binaries are unsigned in v1** — no Apple notarization, no Windows Authenticode signing. README documents the Gatekeeper/SmartScreen bypass this requires of end users
+- **Packaging**: each archive (`avstreamlens-{tag}-{target-triple}.tar.gz` or `.zip`) bundles the binary + `README.md` + `LICENSE`. Published via `softprops/action-gh-release`, chosen because it idempotently creates-or-appends-to the Release keyed by tag — safe for the 4 matrix legs to upload in parallel without a race
+- **`Cargo.lock` is committed** (not gitignored) — standard for an application binary, keeps release builds reproducible as dependencies publish new semver-compatible versions over time
 
 ## Open Work
 

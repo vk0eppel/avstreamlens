@@ -1,0 +1,63 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  # Pinned Npcap SDK used to build pcap-linking code on Windows. The pcap
+  # crate does not vendor this — it links Packet.lib/wpcap.lib found via the
+  # LIB env var. Bump the version + checksum together if a newer SDK is
+  # needed; npcap.com has no stable permalink/checksum API, so this is
+  # fetched fresh each run and verified against a checksum pinned here.
+  NPCAP_SDK_VERSION: "1.16"
+  NPCAP_SDK_SHA256: "f0a8be7778ee3ae1b99bbbecb27a3ff0f6c111a4093f1c78c5c5a099607184db"
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, macos-14, windows-2022]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install libpcap (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libpcap-dev
+
+      # macOS runners already ship libpcap headers via the Xcode Command
+      # Line Tools SDK — no install step needed.
+
+      - name: Install Npcap SDK (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $url = "https://npcap.com/dist/npcap-sdk-$env:NPCAP_SDK_VERSION.zip"
+          $zip = "$env:RUNNER_TEMP\npcap-sdk.zip"
+          $sdkDir = "$env:RUNNER_TEMP\npcap-sdk"
+          Invoke-WebRequest -Uri $url -OutFile $zip
+          $hash = (Get-FileHash -Path $zip -Algorithm SHA256).Hash.ToLower()
+          if ($hash -ne $env:NPCAP_SDK_SHA256) {
+            Write-Error "Npcap SDK checksum mismatch: expected $env:NPCAP_SDK_SHA256, got $hash"
+            exit 1
+          }
+          Expand-Archive -Path $zip -DestinationPath $sdkDir
+          echo "LIB=$env:LIB;$sdkDir\Lib\x64" >> $env:GITHUB_ENV
+
+      - name: cargo clippy
+        run: cargo clippy -- -D warnings
+
+      - name: cargo test
+        run: cargo test
