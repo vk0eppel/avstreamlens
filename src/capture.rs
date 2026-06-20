@@ -512,6 +512,7 @@ impl CaptureState {
             s.lost_this_window               = 0;
             s.ts_discontinuities_this_window = 0;
             s.reorders_this_window           = 0;
+            s.packets_this_window            = 0;
         }
         self.streams.retain(|_, s| {
             s.last_packet_time
@@ -857,12 +858,6 @@ impl CaptureState {
                 }
                 // Transmitter Class verdict — recomputed each packet so an early
                 // inference upgrades to a confirmed verdict as signals accumulate.
-                // Built once: the DSCP gate below derives from a copy of this same
-                // struct rather than an independently-built one — the prior code
-                // built two literals that had already drifted (the gating one
-                // silently dropped the TTL signal too, not just dscp_zero, so a
-                // Windows-hosted DVS source visible only via TTL could be displayed
-                // as DVS yet still flagged for a DSCP violation).
                 let signals = crate::protocols::TransmitterSignals {
                     control_plane: cp_class,
                     metronomic: stats.timing_metronomic(),
@@ -874,13 +869,9 @@ impl CaptureState {
                 if let Some(dscp) = dscp_seen {
                     // Dante hardware audio requires DSCP EF (46). DVS/Via intentionally
                     // send Best Effort (DSCP 0), so DSCP 0 is NOT a violation for a
-                    // software source. Gate on a verdict computed WITHOUT the
-                    // dscp_zero signal — otherwise DSCP 0 would suppress its own
-                    // violation and a misconfigured hardware device at DSCP 0 would
-                    // go unflagged.
-                    let gating_signals = crate::protocols::TransmitterSignals { dscp_zero: false, ..signals };
-                    let software = classify_transmitter(&gating_signals)
-                        .is_some_and(|v| matches!(v.class, TransmitterClass::Dvs | TransmitterClass::Via));
+                    // software source — see `is_software_ignoring_dscp` for why the
+                    // gate can't just reuse `stats.transmitter` above.
+                    let software = crate::protocols::is_software_ignoring_dscp(&signals);
                     if dscp != 46 && !(dscp == 0 && software) {
                         stats.dscp_violations += 1;
                     }

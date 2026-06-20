@@ -504,6 +504,19 @@ pub fn classify_transmitter(s: &TransmitterSignals) -> Option<TransmitterVerdict
 
     None
 }
+
+/// Whether `s` classifies as software (DVS/Via) when the DSCP-zero signal is
+/// excluded. The DSCP-violation gate needs this rather than the displayed
+/// verdict from `classify_transmitter(s)` directly — otherwise DSCP 0 would
+/// suppress its own violation, and a misconfigured hardware device sending
+/// DSCP 0 would go unflagged. Keeping the override here, rather than at each
+/// call site building its own `TransmitterSignals { dscp_zero: false, ..s }`
+/// copy, is what stops the two from drifting again — they already have once
+/// (a prior copy silently dropped the TTL signal too, not just dscp_zero).
+pub fn is_software_ignoring_dscp(s: &TransmitterSignals) -> bool {
+    let s = TransmitterSignals { dscp_zero: false, ..*s };
+    classify_transmitter(&s).is_some_and(|v| matches!(v.class, TransmitterClass::Dvs | TransmitterClass::Via))
+}
 #[derive(Debug, Clone, PartialEq)]
 pub enum NdiKind {
     Discovery { source_name: Option<String> },
@@ -688,5 +701,32 @@ mod transmitter_tests {
         assert_eq!(v.class, TransmitterClass::Dvs);
         assert_eq!(v.confidence, TransmitterConfidence::Confirmed);
         assert_eq!(v.signals, 4);
+    }
+
+    // ── is_software_ignoring_dscp ──────────────────────────────────────────────
+
+    #[test]
+    fn is_software_ignoring_dscp_agrees_with_ttl_only_verdict() {
+        // Regression for the drift bug: TTL 128 alone infers DVS (see
+        // ttl_128_alone_infers_dvs above). The DSCP gate must reach the same
+        // class without dscp_zero in play, not just without it explicitly set.
+        let s = TransmitterSignals { ttl: Some(128), dscp_zero: true, ..Default::default() };
+        assert!(is_software_ignoring_dscp(&s));
+    }
+
+    #[test]
+    fn is_software_ignoring_dscp_false_for_hardware_control_plane() {
+        let s = TransmitterSignals {
+            control_plane: Some(TransmitterClass::Hardware), dscp_zero: true, ..Default::default()
+        };
+        assert!(!is_software_ignoring_dscp(&s));
+    }
+
+    #[test]
+    fn is_software_ignoring_dscp_false_with_no_other_signals() {
+        // dscp_zero is the ONLY signal — excluding it must leave no verdict at all,
+        // so the unclassified/hardware case still gets flagged for DSCP 0.
+        let s = TransmitterSignals { dscp_zero: true, ..Default::default() };
+        assert!(!is_software_ignoring_dscp(&s));
     }
 }

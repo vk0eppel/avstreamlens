@@ -14,6 +14,16 @@ fn ansi(code: &str, text: &str) -> String {
         text.to_string()
     }
 }
+
+/// Log `text` to the file and print it coloured to stdout. The single place
+/// `report.rs` pairs file and console output — every report section used to
+/// repeat this same `logger.log(&x); println!("{}", ansi(c, &x));` pair at
+/// each call site.
+#[inline]
+fn emit_line(logger: &mut Logger, color: &str, text: &str) {
+    logger.log(text);
+    println!("{}", ansi(color, text));
+}
 use std::collections::{HashMap, HashSet};
 use std::net::Ipv4Addr;
 use std::time::Duration;
@@ -215,8 +225,7 @@ fn print_discovery(
             } else {
                 format!("  ⚠  {}   (mDNS only, no ConMon){}", ip, suffix)
             };
-            logger.log(&line);
-            println!("{}", ansi("33", &line));
+            emit_line(logger, "33", &line);
         }
     }
 
@@ -245,9 +254,7 @@ fn print_discovery(
     // No-active-flows diagnostic — shown at most once per session
     let no_flows = (verified_count > 0 && dante_active == 0) || (ndi_count > 0 && ndi_active == 0);
     if no_flows && !*no_flows_diagnostic_shown {
-        let alert = "  ⚠  Devices announced but no active flows — mirror port may be needed";
-        logger.log(alert);
-        println!("{}", ansi("33", alert));
+        emit_line(logger, "33", "  ⚠  Devices announced but no active flows — mirror port may be needed");
         *no_flows_diagnostic_shown = true;
     }
 }
@@ -405,8 +412,7 @@ pub fn print_report(snap: &ReportSnapshot, session: &mut ReportSession, logger: 
     // Rendered only when the Health Score is below 100% (non-empty summary). A
     // fully healthy report shows no status line at all — the score line says 100%.
     for bullet in &health_summary {
-        logger.log(bullet);
-        println!("{}", ansi("33", bullet));
+        emit_line(logger, "33", bullet);
     }
 
     // ── 3. Discovered (mDNS/ConMon) ────────────────────────────────────────
@@ -499,9 +505,7 @@ pub fn print_report(snap: &ReportSnapshot, session: &mut ReportSession, logger: 
                 logger.log(&offset_line);
                 println!("{}", offset_line);
                 if offset_ns.unsigned_abs() > 1_000 {
-                    let alert = "    ⚠  Large PTP correction field — transparent clock or path issue";
-                    logger.log(alert);
-                    println!("{}", ansi("33", alert));
+                    emit_line(logger, "33", "    ⚠  Large PTP correction field — transparent clock or path issue");
                 }
             }
 
@@ -522,14 +526,10 @@ pub fn print_report(snap: &ReportSnapshot, session: &mut ReportSession, logger: 
                 logger.log(&line);
                 println!("{}", line);
                 if spread_ns > 10_000 {
-                    let alert = "    ⚠  PTP path-delay variance > 10µs — unstable link (EEE, half-duplex, or cable)";
-                    logger.log(alert);
-                    println!("{}", ansi("33", alert));
+                    emit_line(logger, "33", "    ⚠  PTP path-delay variance > 10µs — unstable link (EEE, half-duplex, or cable)");
                 }
                 if max > 1_000_000 {
-                    let alert = "    ⚠  PTP path delay > 1ms — too many hops between this node and grandmaster";
-                    logger.log(alert);
-                    println!("{}", ansi("33", alert));
+                    emit_line(logger, "33", "    ⚠  PTP path delay > 1ms — too many hops between this node and grandmaster");
                 }
                 if *version == PTP_VERSION_V1 && hops >= 3 {
                     let min_latency = if hops >= 10 { "5ms" } else if hops >= 5 { "2ms" } else { "0.5ms" };
@@ -540,23 +540,17 @@ pub fn print_report(snap: &ReportSnapshot, session: &mut ReportSession, logger: 
             }
 
             if stats.protocol_clock_lost {
-                let alert = "    ⚠  Clock lost — grandmaster disappeared";
-                logger.log(alert);
-                println!("{}", ansi("33", alert));
+                emit_line(logger, "33", "    ⚠  Clock lost — grandmaster disappeared");
             }
 
             if stats.protocol_changes_count > 0 {
-                let alert = format!("    ⚠  Clock source changed {} time(s)", stats.protocol_changes_count);
-                logger.log(&alert);
-                println!("{}", ansi("33", &alert));
+                emit_line(logger, "33", &format!("    ⚠  Clock source changed {} time(s)", stats.protocol_changes_count));
             }
         }
 
         // Missing clock alerts
         for mc in missing_ptp {
-            let alert = format_missing_clock(mc);
-            logger.log(&alert);
-            println!("{}", ansi("31", &alert));
+            emit_line(logger, "31", &format_missing_clock(mc));
         }
 
         // Follower census and sync conflict belong inside Clock Sources
@@ -657,117 +651,10 @@ pub fn print_report(snap: &ReportSnapshot, session: &mut ReportSession, logger: 
             println!("{}", metrics);
         }
 
-        if s.ts_discontinuities_this_window > 0 {
-            let alert = format!(
-                "    ⚠  Audio glitch risk — timing discontinuity detected ({} in last 5s)",
-                s.ts_discontinuities_this_window
-            );
-            logger.log(&alert);
-            println!("{}", ansi("33", &alert));
-        }
-
-        if s.lost_this_window > 0 {
-            let alert = format!(
-                "    ⚠  Packet loss detected ({} in last 5s, {:.2}% cumulative)",
-                s.lost_this_window, s.loss_pct()
-            );
-            logger.log(&alert);
-            println!("{}", ansi("33", &alert));
-        }
-
-        if s.reorders_this_window > 0 {
-            let total = (s.packets + s.lost_packets).max(1);
-            let pct = 100.0 * s.reorders_this_window as f64 / total as f64;
-            if pct > 1.0 {
-                let alert = format!(
-                    "    ⚠  Packet reorder {:.1}% ({} in last 5s) — possible per-packet load-balancing",
-                    pct, s.reorders_this_window
-                );
-                logger.log(&alert);
-                println!("{}", ansi("33", &alert));
-            }
-        }
-
-        if s.dscp_violations > 0 {
-            let expected = if s.protocol == "2110-20" { "EF (46), AF41 (34), or CS5 (40)" } else { "EF (46)" };
-            let alert = format!(
-                "    ⚠  QoS: {} packet(s) not marked {} — may be deprioritised by switches",
-                s.dscp_violations, expected
-            );
-            logger.log(&alert);
-            println!("{}", ansi("33", &alert));
-        }
-
-        if s.protocol == "Dante" && s.min_ttl.is_some_and(|t| t < 64) {
-            let alert = format!(
-                "    ⚠  Dante traffic routed (TTL {}) — Dante is L2-only; a router is in the path",
-                s.min_ttl.unwrap()
-            );
-            logger.log(&alert);
-            println!("{}", ansi("33", &alert));
-        }
-
-        if s.jitter_ms() > 20.0 {
-            let alert = "    ⚠  High jitter — stream quality at risk";
-            logger.log(alert);
-            println!("{}", ansi("33", alert));
-        }
-
-        if s.protocol == "AES67" && s.jitter_ms() > 10.0 {
-            let alert = "    ⚠  AES67 timing issue — check PTP lock";
-            logger.log(alert);
-            println!("{}", ansi("33", alert));
-        }
-
-        if s.protocol == "Dante" && (s.loss_pct() > 0.1 || s.jitter_ms() > 15.0) {
-            let alert = "    ⚠  Dante clock or subscription issue";
-            logger.log(alert);
-            println!("{}", ansi("33", alert));
-        }
-
-        if s.ssrc_changes > 0 {
-            let alert = format!("    ⚠  Source interrupted and reconnected ({} time(s))", s.ssrc_changes);
-            logger.log(&alert);
-            println!("{}", ansi("33", &alert));
-        }
-
-        if s.pt_mismatches > 0 {
-            let alert = format!("    ⚠  RTP payload type mismatch ({} packet(s)) — encoder/SDP misconfiguration", s.pt_mismatches);
-            logger.log(&alert);
-            println!("{}", ansi("33", &alert));
-        }
-
-        let expects_sdp = (s.protocol == "AES67"
-            || s.protocol == "Dante"
-            || s.protocol.starts_with("2110-"))
-            && s.rtp_seen;
-        if expects_sdp && !s.clock_hz_confirmed && s.packets > 10 {
-            let alert = "    ⚠  Stream not announced (no SAP) — audio glitch detection unavailable";
-            logger.log(alert);
-            println!("{}", ansi("33", alert));
-        }
-
-        if s.protocol == "2110-??" {
-            let alert = "    ⚠  Stream type unknown — SDP required to classify as video/audio/ancillary";
-            logger.log(alert);
-            println!("{}", ansi("33", alert));
-        }
-
-        if s.gap_events >= 2 {
-            let alert = format!(
-                "    ⚠  Signal gap detected ({} in last 5s, worst {:.1} ms) — stream interrupted",
-                s.gap_events, s.max_iat_ms
-            );
-            logger.log(&alert);
-            println!("{}", ansi("33", &alert));
-        }
-
-        if let Some(last_time) = s.last_packet_time
-            && last_time.elapsed() > Duration::from_secs(STREAM_TIMEOUT_SECS)
-        {
-            let alert = format!("    💀 No signal for {:.0}s", last_time.elapsed().as_secs_f64());
-            logger.log(&alert);
-            println!("{}", ansi("31", &alert));
+        for diag in s.diagnostics() {
+            let Some(line) = diag.message() else { continue };
+            let color = if diag.is_critical() { "31" } else { "33" };
+            emit_line(logger, color, &line);
         }
     }
 
@@ -813,22 +700,16 @@ pub fn print_report(snap: &ReportSnapshot, session: &mut ReportSession, logger: 
                             Some(code) => format!("code {}: {}", code, msrp_failure_reason(code)),
                             None       => "failed".to_string(),
                         };
-                        let alert = format!("    ⚠  Reservation failed — {}", code_str);
-                        logger.log(&alert);
-                        println!("{}", ansi("33", &alert));
+                        emit_line(logger, "33", &format!("    ⚠  Reservation failed — {}", code_str));
                     }
                     MsrpDeclType::Listener => {}
                 }
             } else if mvrp_vlans.is_empty() {
-                let alert = "    ⚠  No VLAN registration — L2 QoS may not be configured";
-                logger.log(alert);
-                println!("{}", ansi("33", alert));
+                emit_line(logger, "33", "    ⚠  No VLAN registration — L2 QoS may not be configured");
             }
 
             if dead {
-                let alert = format!("    💀 No signal for {:.0}s", avtp.last_seen.elapsed().as_secs_f64());
-                logger.log(&alert);
-                println!("{}", ansi("31", &alert));
+                emit_line(logger, "31", &format!("    💀 No signal for {:.0}s", avtp.last_seen.elapsed().as_secs_f64()));
             }
         }
     }
@@ -878,38 +759,30 @@ pub fn print_report(snap: &ReportSnapshot, session: &mut ReportSession, logger: 
     println!("{}", breakdown);
 
     if health.ecn_congestion_marks > 0 {
-        let alert = format!(
+        emit_line(logger, "33", &format!(
             "   ⚠  ECN: {} congestion mark(s) — router congestion detected on the path",
             health.ecn_congestion_marks
-        );
-        logger.log(&alert);
-        println!("{}", ansi("33", &alert));
+        ));
     }
 
     if pause_frames > 0 {
-        let alert = format!(
+        emit_line(logger, "33", &format!(
             "   ⚠  PAUSE frames: {} in last 5s — upstream link congestion causing tx-side freezes",
             pause_frames
-        );
-        logger.log(&alert);
-        println!("{}", ansi("33", &alert));
+        ));
     }
     if pfc_frames > 0 {
-        let alert = format!(
+        emit_line(logger, "33", &format!(
             "   ⚠  PFC frames: {} in last 5s — priority flow control engaged on upstream link",
             pfc_frames
-        );
-        logger.log(&alert);
-        println!("{}", ansi("33", &alert));
+        ));
     }
 
     if !eee_ports.is_empty() {
-        let eee_alert = format!(
+        emit_line(logger, "33", &format!(
             "   ⚠  EEE active on {} switch port(s) — may cause audio/video glitches  (disable EEE on all AV switch ports)",
             eee_ports.len()
-        );
-        logger.log(&eee_alert);
-        println!("{}", ansi("33", &eee_alert));
+        ));
         for ((chassis, port), (tx, rx)) in eee_ports.iter() {
             let detail = format!("      port \"{}\"  chassis {}  Tx wake: {}µs  Rx wake: {}µs", port, chassis, tx, rx);
             logger.log(&detail);
@@ -925,10 +798,8 @@ pub fn print_report(snap: &ReportSnapshot, session: &mut ReportSession, logger: 
         logger.log(&stats_line);
         if dropped > 0 || if_dropped > 0 {
             println!("{}", ansi("31", &stats_line));
-            let warn = "   ❌ Capture drops detected — loss/jitter figures may be understated. \
-                        Reduce load or increase pcap buffer size.";
-            logger.log(warn);
-            println!("{}", ansi("31", warn));
+            emit_line(logger, "31", "   ❌ Capture drops detected — loss/jitter figures may be understated. \
+                        Reduce load or increase pcap buffer size.");
         } else {
             println!("{}", stats_line);
         }

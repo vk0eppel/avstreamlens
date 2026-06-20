@@ -63,6 +63,12 @@ pub struct StreamStats {
     // Out-of-order packets (negative seq delta). Distinct from loss: indicates
     // path instability or per-packet ECMP load-balancing rather than drops.
     pub reorders_this_window:           u64,
+    // Packets received this window (not lost). Denominator for the window-scoped
+    // loss percentage that drives the PacketLoss diagnostic's score deduction —
+    // kept separate from the lifetime `packets` count so a stream that stops
+    // losing recovers its score next Window instead of staying penalised forever
+    // by its lifetime loss ratio.
+    pub packets_this_window:            u64,
     // True once at least one packet parsed as RTP. Dante ATP flows (official
     // ports 4321 / 14336–15359) are not RTP-framed — they are tracked via
     // update_non_rtp and must not render 0% loss / 0 ms jitter as if measured,
@@ -128,6 +134,7 @@ impl StreamStats {
             lost_this_window:               0,
             ts_discontinuities_this_window: 0,
             reorders_this_window:           0,
+            packets_this_window:            0,
             rtp_seen:                       false,
             min_ttl:                        None,
             ts_delta_samples:               Vec::new(),
@@ -208,6 +215,7 @@ impl StreamStats {
     /// used for exact bitrate calculation.
     pub fn update(&mut self, seq: u16, rtp_ts: u32, ssrc: u32, udp_payload_len: usize) {
         self.packets += 1;
+        self.packets_this_window += 1;
         self.rtp_seen = true;
 
         // ── Losses (16-bit wrapping) ──────────────────
@@ -321,6 +329,7 @@ impl StreamStats {
     /// No sequence, timestamp, or jitter analysis — those need RTP fields.
     pub fn update_non_rtp(&mut self, udp_payload_len: usize, now: Instant) {
         self.packets += 1;
+        self.packets_this_window += 1;
         // Timing-regularity sampling (Transmitter Class) for ATP flows.
         if let Some(last) = self.last_arrival {
             self.push_iat(now.duration_since(last).as_secs_f64() * 1000.0);
@@ -385,7 +394,185 @@ impl StreamStats {
         if total == 0 { 0.0 } else { 100.0 * self.lost_packets as f64 / total as f64 }
     }
 
+    /// Loss percentage for the current Window only (denominator resets each
+    /// Window, unlike `loss_pct`'s lifetime ratio). Drives the PacketLoss
+    /// diagnostic's score deduction so a stream that stops losing recovers.
+    fn loss_pct_this_window(&self) -> f64 {
+        let total = self.packets_this_window + self.lost_this_window;
+        if total == 0 { 0.0 } else { 100.0 * self.lost_this_window as f64 / total as f64 }
+    }
+
     pub fn jitter_ms(&self) -> f64 { self.jitter * 1000.0 }
+
+    /// Every per-stream Diagnostic for this Window, scored and informational
+    /// alike. The single seam both `NetworkHealth::collect_penalties` (scoring)
+    /// and the report's Streams section (rendering) read from — previously each
+    /// re-evaluated the same StreamStats fields independently and the thresholds
+    /// had already drifted (Dante's combined loss/jitter check used different
+    /// numbers than the generic jitter penalty). Order matches the previous
+    /// inline checks in report.rs so rendered output is unchanged.
+    pub fn diagnostics(&self) -> Vec<StreamDiagnostic> {
+        let mut d = Vec::new();
+
+        if self.ts_discontinuities_this_window > 0 {
+            d.push(StreamDiagnostic::TsDiscontinuity { window_count: self.ts_discontinuities_this_window });
+        }
+        if self.lost_this_window > 0 {
+            d.push(StreamDiagnostic::PacketLoss {
+                window_count: self.lost_this_window,
+                window_pct:   self.loss_pct_this_window(),
+                lifetime_pct: self.loss_pct(),
+            });
+        }
+        if self.reorders_this_window > 0 {
+            let total = (self.packets + self.lost_packets).max(1);
+            let pct = 100.0 * self.reorders_this_window as f64 / total as f64;
+            if pct > 1.0 {
+                d.push(StreamDiagnostic::Reorder { window_count: self.reorders_this_window, pct });
+            }
+        }
+        if self.dscp_violations > 0 {
+            let expected = if self.protocol == "2110-20" { "EF (46), AF41 (34), or CS5 (40)" } else { "EF (46)" };
+            d.push(StreamDiagnostic::DscpViolation { count: self.dscp_violations, expected });
+        }
+        if self.protocol == "Dante" && self.min_ttl.is_some_and(|t| t < 64) {
+            d.push(StreamDiagnostic::TtlRouted { ttl: self.min_ttl.unwrap() });
+        }
+        if self.jitter_ms() > 10.0 {
+            d.push(StreamDiagnostic::HighJitter { jitter_ms: self.jitter_ms() });
+        }
+        if self.protocol == "AES67" && self.jitter_ms() > 10.0 {
+            d.push(StreamDiagnostic::Aes67PtpLockHint);
+        }
+        if self.protocol == "Dante" && (self.loss_pct() > 0.1 || self.jitter_ms() > 15.0) {
+            d.push(StreamDiagnostic::DanteClockOrSubscriptionHint);
+        }
+        if self.ssrc_changes > 0 {
+            d.push(StreamDiagnostic::SsrcChange { count: self.ssrc_changes });
+        }
+        if self.pt_mismatches > 0 {
+            d.push(StreamDiagnostic::PtMismatch { count: self.pt_mismatches });
+        }
+        let expects_sdp = (self.protocol == "AES67" || self.protocol == "Dante" || self.protocol.starts_with("2110-"))
+            && self.rtp_seen;
+        if expects_sdp && !self.clock_hz_confirmed && self.packets > 10 {
+            d.push(StreamDiagnostic::NotAnnounced);
+        }
+        if self.protocol == "2110-??" {
+            d.push(StreamDiagnostic::UnknownStreamType);
+        }
+        if self.gap_events >= 2 {
+            d.push(StreamDiagnostic::SignalGap { window_count: self.gap_events, max_iat_ms: self.max_iat_ms });
+        }
+        if let Some(last_time) = self.last_packet_time
+            && last_time.elapsed() > Duration::from_secs(crate::protocols::STREAM_TIMEOUT_SECS)
+        {
+            d.push(StreamDiagnostic::Dead { silent_secs: last_time.elapsed().as_secs_f64() });
+        }
+
+        d
+    }
+}
+
+/// A persistent, per-stream condition re-evaluated every Window (see CONTEXT.md
+/// "Diagnostic"). Some variants carry a Health Score deduction (`deduction() >
+/// 0.0`) and are aggregated by `NetworkHealth::collect_penalties`; others are
+/// informational only and exist solely to render under their stream in the
+/// report. One source of truth for both consumers — see `StreamStats::diagnostics`.
+#[derive(Debug, Clone, Copy)]
+pub enum StreamDiagnostic {
+    PacketLoss { window_count: u64, window_pct: f64, lifetime_pct: f64 },
+    HighJitter { jitter_ms: f64 },
+    TsDiscontinuity { window_count: u64 },
+    SsrcChange { count: u64 },
+    SignalGap { window_count: u64, max_iat_ms: f64 },
+    DscpViolation { count: u64, expected: &'static str },
+    Dead { silent_secs: f64 },
+    Reorder { window_count: u64, pct: f64 },
+    TtlRouted { ttl: u8 },
+    PtMismatch { count: u64 },
+    NotAnnounced,
+    UnknownStreamType,
+    Aes67PtpLockHint,
+    DanteClockOrSubscriptionHint,
+}
+
+impl StreamDiagnostic {
+    /// Health Score deduction this single stream's instance of the Diagnostic
+    /// contributes (already capped where the original per-stream cap applied —
+    /// e.g. loss at 10.0, ts-discontinuity count at 5, ssrc count at 3). Any
+    /// aggregate-level cap across all affected streams (currently DSCP, at 20)
+    /// is applied by the caller, not here.
+    pub fn deduction(&self) -> f64 {
+        match self {
+            StreamDiagnostic::PacketLoss { window_pct, .. } => window_pct.min(10.0),
+            StreamDiagnostic::HighJitter { jitter_ms } => if *jitter_ms > 20.0 { 5.0 } else { 2.0 },
+            StreamDiagnostic::TsDiscontinuity { window_count } => 3.0 * (*window_count as f64).min(5.0),
+            StreamDiagnostic::SsrcChange { count } => 10.0 * (*count as f64).min(3.0),
+            StreamDiagnostic::SignalGap { .. } => 10.0,
+            StreamDiagnostic::DscpViolation { .. } => 5.0,
+            StreamDiagnostic::Dead { .. } => 30.0,
+            StreamDiagnostic::Reorder { .. }
+            | StreamDiagnostic::TtlRouted { .. }
+            | StreamDiagnostic::PtMismatch { .. }
+            | StreamDiagnostic::NotAnnounced
+            | StreamDiagnostic::UnknownStreamType
+            | StreamDiagnostic::Aes67PtpLockHint
+            | StreamDiagnostic::DanteClockOrSubscriptionHint => 0.0,
+        }
+    }
+
+    /// `true` for the one variant rendered in red (💀) rather than yellow (⚠).
+    pub fn is_critical(&self) -> bool { matches!(self, StreamDiagnostic::Dead { .. }) }
+
+    /// Full report line, including leading indent and glyph — matches the
+    /// pre-deepening report.rs text exactly so output is unchanged. `None` for
+    /// `HighJitter` in the 10–20ms band: scored (2.0, see `deduction`) but, as
+    /// before this deepening, silent in the per-stream Streams section — only
+    /// the aggregate Health Summary bullet surfaces it.
+    pub fn message(&self) -> Option<String> {
+        let s = match self {
+            StreamDiagnostic::TsDiscontinuity { window_count } => format!(
+                "    ⚠  Audio glitch risk — timing discontinuity detected ({} in last 5s)", window_count
+            ),
+            StreamDiagnostic::PacketLoss { window_count, lifetime_pct, .. } => format!(
+                "    ⚠  Packet loss detected ({} in last 5s, {:.2}% cumulative)", window_count, lifetime_pct
+            ),
+            StreamDiagnostic::Reorder { window_count, pct } => format!(
+                "    ⚠  Packet reorder {:.1}% ({} in last 5s) — possible per-packet load-balancing", pct, window_count
+            ),
+            StreamDiagnostic::DscpViolation { count, expected } => format!(
+                "    ⚠  QoS: {} packet(s) not marked {} — may be deprioritised by switches", count, expected
+            ),
+            StreamDiagnostic::TtlRouted { ttl } => format!(
+                "    ⚠  Dante traffic routed (TTL {}) — Dante is L2-only; a router is in the path", ttl
+            ),
+            StreamDiagnostic::HighJitter { jitter_ms } if *jitter_ms > 20.0 =>
+                "    ⚠  High jitter — stream quality at risk".to_string(),
+            StreamDiagnostic::HighJitter { .. } => return None,
+            StreamDiagnostic::Aes67PtpLockHint =>
+                "    ⚠  AES67 timing issue — check PTP lock".to_string(),
+            StreamDiagnostic::DanteClockOrSubscriptionHint =>
+                "    ⚠  Dante clock or subscription issue".to_string(),
+            StreamDiagnostic::SsrcChange { count } => format!(
+                "    ⚠  Source interrupted and reconnected ({} time(s))", count
+            ),
+            StreamDiagnostic::PtMismatch { count } => format!(
+                "    ⚠  RTP payload type mismatch ({} packet(s)) — encoder/SDP misconfiguration", count
+            ),
+            StreamDiagnostic::NotAnnounced =>
+                "    ⚠  Stream not announced (no SAP) — audio glitch detection unavailable".to_string(),
+            StreamDiagnostic::UnknownStreamType =>
+                "    ⚠  Stream type unknown — SDP required to classify as video/audio/ancillary".to_string(),
+            StreamDiagnostic::SignalGap { window_count, max_iat_ms } => format!(
+                "    ⚠  Signal gap detected ({} in last 5s, worst {:.1} ms) — stream interrupted", window_count, max_iat_ms
+            ),
+            StreamDiagnostic::Dead { silent_secs } => format!(
+                "    💀 No signal for {:.0}s", silent_secs
+            ),
+        };
+        Some(s)
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -662,6 +849,9 @@ impl NetworkHealth {
         let mut p: Vec<ScorePenalty> = Vec::new();
 
         // ── Per-stream penalties (aggregated by category) ─────────────────────
+        // Sourced from StreamStats::diagnostics() — the same per-stream evaluation
+        // the Streams section renders from, so score and inline alert text can no
+        // longer drift apart the way the old, independently-authored copies did.
         let mut has_multicast       = false;
         let mut loss_count          = 0usize; let mut loss_total          = 0.0f64;
         let mut jitter_count        = 0usize; let mut jitter_total        = 0.0f64;
@@ -669,29 +859,25 @@ impl NetworkHealth {
         let mut ssrc_count          = 0usize; let mut ssrc_total          = 0.0f64;
         let mut dead_count          = 0usize;
         let mut gap_count           = 0usize;
+        let mut dscp_count          = 0usize;
 
         for s in streams.values() {
             if s.is_multicast && s.packets > 0 { has_multicast = true; }
 
-            let loss = s.loss_pct();
-            if loss > 0.0 { loss_count += 1; loss_total += loss.min(10.0); }
-
-            let jit = s.jitter_ms();
-            if jit > 20.0 { jitter_count += 1; jitter_total += 5.0; }
-            else if jit > 10.0 { jitter_count += 1; jitter_total += 2.0; }
-
-            if s.ts_discontinuities_this_window > 0 {
-                tsd_count += 1;
-                tsd_total += 3.0 * (s.ts_discontinuities_this_window as f64).min(5.0);
+            for diag in s.diagnostics() {
+                match diag {
+                    StreamDiagnostic::PacketLoss { .. }      => { loss_count   += 1; loss_total   += diag.deduction(); }
+                    StreamDiagnostic::HighJitter { .. }      => { jitter_count += 1; jitter_total += diag.deduction(); }
+                    StreamDiagnostic::TsDiscontinuity { .. } => { tsd_count    += 1; tsd_total    += diag.deduction(); }
+                    StreamDiagnostic::SsrcChange { .. }      => { ssrc_count   += 1; ssrc_total   += diag.deduction(); }
+                    StreamDiagnostic::Dead { .. }            => { dead_count   += 1; }
+                    StreamDiagnostic::SignalGap { .. }       => { gap_count    += 1; }
+                    StreamDiagnostic::DscpViolation { .. }   => { dscp_count   += 1; }
+                    // Informational-only — Reorder, TtlRouted, PtMismatch, NotAnnounced,
+                    // UnknownStreamType, the AES67/Dante jitter hints: deduction() is 0.0.
+                    _ => {}
+                }
             }
-            if s.ssrc_changes > 0 {
-                ssrc_count += 1;
-                ssrc_total += 10.0 * (s.ssrc_changes as f64).min(3.0);
-            }
-            if s.last_packet_time.is_some_and(|t| t.elapsed() > Duration::from_secs(crate::protocols::STREAM_TIMEOUT_SECS)) {
-                dead_count += 1;
-            }
-            if s.gap_events >= 2 { gap_count += 1; }
         }
 
         macro_rules! per_stream {
@@ -710,9 +896,7 @@ impl NetworkHealth {
         per_stream!(ssrc_count,   ssrc_total,                     "⚠  {} stream(s) with SSRC changes");
         per_stream!(dead_count,   dead_count as f64 * 30.0,       "⚠  {} dead stream(s) (silent)");
         per_stream!(gap_count,    gap_count  as f64 * 10.0,       "⚠  {} stream(s) with signal gaps");
-
-        let dscp_bad = streams.values().filter(|s| s.dscp_violations > 0).count();
-        per_stream!(dscp_bad, (dscp_bad as f64 * 5.0).min(20.0), "⚠  {} stream(s) with incorrect DSCP");
+        per_stream!(dscp_count,   (dscp_count as f64 * 5.0).min(20.0), "⚠  {} stream(s) with incorrect DSCP");
 
         // ── TCP quality ───────────────────────────────────────────────────────
         let mut tcp_count = 0usize; let mut tcp_total = 0.0f64;
@@ -1261,6 +1445,85 @@ mod tests {
         assert!((pct - 50.0).abs() < 0.1, "expected 50%, got {:.1}%", pct);
     }
 
+    // ── StreamDiagnostic ───────────────────────────────────────────────────────
+
+    #[test]
+    fn diagnostics_empty_for_clean_stream() {
+        let mut s = aes67();
+        s.update(0, 0,  1, 100);
+        s.update(1, 48, 1, 100);
+        assert!(s.diagnostics().is_empty());
+    }
+
+    #[test]
+    fn diagnostics_packet_loss_scores_window_pct_not_lifetime() {
+        let mut s = aes67();
+        s.packets = 9_990;
+        s.lost_packets = 10; // heavy lifetime loss from a past window
+        s.packets_this_window = 100;
+        s.lost_this_window = 0; // but nothing lost in the current window
+        assert!(
+            s.diagnostics().is_empty(),
+            "a stream that recovered this window must not still be flagged"
+        );
+    }
+
+    #[test]
+    fn diagnostics_packet_loss_fires_on_window_delta() {
+        let mut s = aes67();
+        s.packets = 100;
+        s.lost_packets = 2;
+        s.packets_this_window = 98;
+        s.lost_this_window = 2;
+        let diags = s.diagnostics();
+        let loss = diags.iter().find(|d| matches!(d, StreamDiagnostic::PacketLoss { .. }));
+        assert!(loss.is_some(), "got {diags:?}");
+        assert!(loss.unwrap().deduction() > 0.0);
+        assert!(loss.unwrap().message().unwrap().contains("2 in last 5s"));
+    }
+
+    #[test]
+    fn diagnostics_jitter_10_to_20ms_scores_silently() {
+        // 2.0 deduction (Health Summary bullet) but no per-stream report line —
+        // matches pre-deepening behaviour where this band had no inline alert.
+        let mut s = aes67();
+        s.jitter = 0.015; // 15 ms
+        let diags = s.diagnostics();
+        let jit = diags.iter().find(|d| matches!(d, StreamDiagnostic::HighJitter { .. })).unwrap();
+        assert_eq!(jit.deduction(), 2.0);
+        assert!(jit.message().is_none());
+    }
+
+    #[test]
+    fn diagnostics_jitter_above_20ms_renders_and_scores() {
+        let mut s = aes67();
+        s.jitter = 0.025; // 25 ms
+        let diags = s.diagnostics();
+        let jit = diags.iter().find(|d| matches!(d, StreamDiagnostic::HighJitter { .. })).unwrap();
+        assert_eq!(jit.deduction(), 5.0);
+        assert!(jit.message().unwrap().contains("High jitter"));
+    }
+
+    #[test]
+    fn diagnostics_aes67_jitter_hint_is_informational() {
+        let mut s = aes67();
+        s.jitter = 0.012; // 12 ms — above AES67's 10ms hint, below generic 20ms
+        let diags = s.diagnostics();
+        let hint = diags.iter().find(|d| matches!(d, StreamDiagnostic::Aes67PtpLockHint)).unwrap();
+        assert_eq!(hint.deduction(), 0.0, "the hint itself carries no score weight");
+        assert!(hint.message().unwrap().contains("check PTP lock"));
+    }
+
+    #[test]
+    fn diagnostics_dead_stream_is_critical() {
+        let mut s = aes67();
+        s.last_packet_time = Some(Instant::now() - Duration::from_secs(crate::protocols::STREAM_TIMEOUT_SECS + 1));
+        let diags = s.diagnostics();
+        let dead = diags.iter().find(|d| matches!(d, StreamDiagnostic::Dead { .. })).unwrap();
+        assert!(dead.is_critical());
+        assert_eq!(dead.deduction(), 30.0);
+    }
+
     // ── TS discontinuity sign fix ─────────────────────────────────────────────
 
     #[test]
@@ -1305,6 +1568,11 @@ mod tests {
         let mut s = aes67();
         s.packets = 100;
         s.lost_packets = lost;
+        // Loss scoring is window-scoped (see StreamStats::diagnostics) — a
+        // "currently lossy" fixture needs the loss to have happened in the
+        // window under test, not just in some unspecified past window.
+        s.packets_this_window = 100;
+        s.lost_this_window = lost;
         s.last_packet_time = Some(Instant::now());
         s
     }
