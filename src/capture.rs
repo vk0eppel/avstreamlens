@@ -1060,17 +1060,28 @@ impl CaptureState {
                 // No console output — infrastructure detail, not user-visible.
             }
             IgmpType::Query { version } => {
-                // Track interval between consecutive queries (RFC 3376 default 125s).
-                if let Some(last) = self.network_health.last_igmp_query {
-                    self.network_health.igmp_query_interval_secs = Some(last.elapsed().as_secs());
+                // Only a General Query (dst = all-systems 224.0.0.1) establishes the
+                // querier. A Group-Specific Query (dst = the group) is membership
+                // verification — IGMP-snooping switches commonly source these from
+                // 0.0.0.0 (RFC 4541), which must NOT register as a second querier or
+                // reset the interval/silence timers. See [[IGMP_ALL_SYSTEMS]].
+                let is_general_query = group == crate::protocols::IGMP_ALL_SYSTEMS;
+                if is_general_query {
+                    // Track interval between consecutive General Queries (RFC 3376 default 125s).
+                    if let Some(last) = self.network_health.last_igmp_query {
+                        self.network_health.igmp_query_interval_secs = Some(last.elapsed().as_secs());
+                    }
+                    self.network_health.last_igmp_query = Some(now);
+                    self.network_health.igmp_querier_ip = Some(src);
+                    self.network_health.igmp_querier_mac = Some(src_mac);
+                    self.igmp.querier_ips_this_window.insert(src);
+                    // Track querier version for v2/v3 mismatch detection.
+                    self.igmp.querier_version = Some(version);
+                    alerts.push(Alert::info(format!("❓ IGMP General Query (v{}): {}", version, src)));
+                } else {
+                    alerts.push(Alert::info(format!(
+                        "❓ IGMP Group-Specific Query (v{}): {} → group {}", version, src, group)));
                 }
-                self.network_health.last_igmp_query = Some(now);
-                self.network_health.igmp_querier_ip = Some(src);
-                self.network_health.igmp_querier_mac = Some(src_mac);
-                self.igmp.querier_ips_this_window.insert(src);
-                // Track querier version for v2/v3 mismatch detection.
-                self.igmp.querier_version = Some(version);
-                alerts.push(Alert::info(format!("❓ IGMP Query (v{}): {} → group {}", version, src, group)));
             }
             IgmpType::Unknown(t) => {
                 alerts.push(Alert::info(format!("❔ IGMP Unknown(0x{:02x}): {} → group {}", t, src, group)));
@@ -2086,6 +2097,56 @@ mod tests {
         state.reset_window();
         assert!(!state.network_health.multiple_queriers_this_window);
         assert!(state.igmp.querier_ips_this_window.is_empty());
+    }
+
+    // ── Querier election: General vs Group-Specific Query ────────────────────
+
+    #[test]
+    fn igmp_general_query_registers_querier() {
+        // A query to the all-systems group (224.0.0.1) is the General Query that
+        // establishes the querier — it records identity and counts toward election.
+        let mut state = CaptureState::new();
+        let querier = Ipv4Addr::new(10, 244, 70, 241);
+        let mac = [0xd0, 0x69, 0x9e, 0x10, 0x10, 0xe4];
+        state.handle_igmp(querier, mac, crate::protocols::IGMP_ALL_SYSTEMS,
+                          IgmpType::Query { version: 3 }, Instant::now());
+        assert_eq!(state.network_health.igmp_querier_ip, Some(querier));
+        assert_eq!(state.network_health.igmp_querier_mac, Some(mac));
+        assert!(state.igmp.querier_ips_this_window.contains(&querier));
+    }
+
+    #[test]
+    fn igmp_group_specific_query_does_not_register_querier() {
+        // A Group-Specific Query (dst = the group, not 224.0.0.1) is membership
+        // verification, not querier election. An IGMP-snooping switch commonly
+        // sources these from 0.0.0.0 (RFC 4541); that must not become a querier.
+        let mut state = CaptureState::new();
+        state.handle_igmp(Ipv4Addr::UNSPECIFIED, [0u8; 6], Ipv4Addr::new(224, 0, 1, 129),
+                          IgmpType::Query { version: 3 }, Instant::now());
+        assert_eq!(state.network_health.igmp_querier_ip, None);
+        assert!(state.igmp.querier_ips_this_window.is_empty());
+        assert!(state.network_health.last_igmp_query.is_none(),
+                "group-specific query must not start the querier silence timer");
+    }
+
+    #[test]
+    fn igmp_group_specific_query_does_not_create_phantom_second_querier() {
+        // Regression: one real General Query querier plus a switch's 0.0.0.0
+        // group-specific verification queries must NOT trip the multiple-queriers
+        // conflict alert.
+        let mut state = CaptureState::new();
+        let querier = Ipv4Addr::new(10, 244, 70, 241);
+        state.handle_igmp(querier, [0xd0, 0x69, 0x9e, 0x10, 0x10, 0xe4],
+                          crate::protocols::IGMP_ALL_SYSTEMS,
+                          IgmpType::Query { version: 3 }, Instant::now());
+        for g in [(224, 0, 1, 129), (224, 0, 1, 130), (224, 0, 1, 131)] {
+            state.handle_igmp(Ipv4Addr::UNSPECIFIED, [0u8; 6],
+                              Ipv4Addr::new(g.0, g.1, g.2, g.3),
+                              IgmpType::Query { version: 3 }, Instant::now());
+        }
+        assert_eq!(state.igmp.querier_ips_this_window.len(), 1);
+        assert!(state.igmp.check_multiple_queriers(&mut state.network_health).is_empty());
+        assert!(!state.network_health.multiple_queriers_this_window);
     }
 
     // ── IGMPv2/v3 mismatch, filter-unregistered-multicast, snooping-blocking-ptp ──

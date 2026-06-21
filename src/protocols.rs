@@ -22,6 +22,14 @@ pub const ETHERTYPE_FLOW_CTRL: u16 = 0x8808; // IEEE 802.3x PAUSE / 802.1Qbb PFC
 // IGMP protocol number
 pub const IP_PROTO_IGMP:     u8  = 0x02;
 
+// IGMP "all-systems" group (224.0.0.1). A Membership Query sent to this address
+// is a General Query — the message that establishes the querier and its interval.
+// A query sent to a specific group address is a Group-Specific Query (membership
+// verification, e.g. after a Leave or by an IGMP-snooping switch per RFC 4541),
+// and must NOT be treated as querier election: snooping switches commonly source
+// these from 0.0.0.0, which would otherwise register as a phantom second querier.
+pub const IGMP_ALL_SYSTEMS: Ipv4Addr = Ipv4Addr::new(224, 0, 0, 1);
+
 // Timeout for "dead stream" detection (seconds)
 pub const STREAM_TIMEOUT_SECS: u64 = 10;
 
