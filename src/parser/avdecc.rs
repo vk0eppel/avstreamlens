@@ -42,9 +42,6 @@ pub fn parse_adp(payload: &[u8]) -> Option<AvdeccAdp> {
 
     let entity_id: [u8; 8] = payload[4..12].try_into().ok()?;
 
-    // Fields past entity_id require at least 49 bytes total.
-    if payload.len() < 49 { return None; }
-
     let entity_model_id: [u8; 8] = payload[12..20].try_into().ok()?;
     let entity_capabilities = u32::from_be_bytes(payload[20..24].try_into().ok()?);
     let talker_stream_sources = u16::from_be_bytes(payload[24..26].try_into().ok()?);

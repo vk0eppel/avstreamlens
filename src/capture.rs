@@ -335,7 +335,18 @@ impl IgmpState {
     /// Multiple IGMP queriers on the same LAN cause multicast group lists to
     /// desync across switches, leading to lost PTP/audio traffic.
     /// Sets `health.multiple_queriers_this_window` for the score penalty.
-    pub fn check_multiple_queriers(&self, health: &mut NetworkHealth) -> Vec<Alert> {
+    ///
+    /// Gated on `has_active_multicast` — same rule as the querier-*absent* penalty
+    /// (`collect_penalties`): IGMP querier topology only affects the observable AV
+    /// delivery path when multicast is actually flowing, so on a network with no
+    /// active multicast streams this stays silent (no alert, no score penalty)
+    /// rather than docking the score for a condition that harms nothing here.
+    /// `querier_ips_this_window` only ever holds General-Query sources (see
+    /// `handle_igmp`), so two entries already means two real queriers.
+    pub fn check_multiple_queriers(&self, health: &mut NetworkHealth, has_active_multicast: bool) -> Vec<Alert> {
+        if !has_active_multicast {
+            return vec![];
+        }
         let mut sorted: Vec<String> = self.querier_ips_this_window
             .iter().map(|ip| ip.to_string()).collect();
         if sorted.len() < 2 {
@@ -1154,6 +1165,14 @@ impl CaptureState {
         alerts
     }
 
+    /// True when at least one multicast stream has carried traffic. Mirrors the
+    /// `has_multicast` predicate in `NetworkHealth::collect_penalties` so the
+    /// IGMP querier checks (absent / multiple) share one definition of "multicast
+    /// is actually in use here."
+    pub fn has_active_multicast(&self) -> bool {
+        self.streams.values().any(|s| s.is_multicast && s.packets > 0)
+    }
+
     /// Advisory when the IGMP query interval exceeds Audinate's recommended 30s.
     /// Longer intervals slow multicast convergence after a device join.
     /// Only fires once the interval has been measured (two consecutive queries seen).
@@ -1416,6 +1435,15 @@ mod tests {
     use crate::stats::PtpStats;
 
     // ── helpers ──────────────────────────────────────────────────────────────
+
+    /// Insert one active multicast stream so `state.has_active_multicast()` is
+    /// true — required for the IGMP querier checks (absent / multiple) to engage.
+    fn add_active_multicast_stream(state: &mut CaptureState) {
+        let mut s = StreamStats::new_with_info(
+            "AES67", 48_000.0, true, Ipv4Addr::new(239, 69, 0, 1), 5004);
+        s.packets = 1;
+        state.streams.insert("AES67 test-mc".to_string(), s);
+    }
 
     /// Build an IPv4 + UDP + minimal RTP byte buffer suitable for handlers
     /// that call `Ipv4Packet::new(l2_payload)`.
@@ -2069,9 +2097,11 @@ mod tests {
     #[test]
     fn igmp_multiple_queriers_fires_error_and_sets_flag() {
         let mut state = CaptureState::new();
+        add_active_multicast_stream(&mut state);
         state.igmp.querier_ips_this_window.insert(Ipv4Addr::new(10, 0, 0, 1));
         state.igmp.querier_ips_this_window.insert(Ipv4Addr::new(10, 0, 0, 2));
-        let alerts = state.igmp.check_multiple_queriers(&mut state.network_health);
+        let mc = state.has_active_multicast();
+        let alerts = state.igmp.check_multiple_queriers(&mut state.network_health, mc);
         assert_eq!(alerts.len(), 1);
         assert!(matches!(alerts[0].level, AlertLevel::Error));
         assert!(alerts[0].message.contains("10.0.0.1"));
@@ -2082,17 +2112,34 @@ mod tests {
     #[test]
     fn igmp_single_querier_no_alert() {
         let mut state = CaptureState::new();
+        add_active_multicast_stream(&mut state);
         state.igmp.querier_ips_this_window.insert(Ipv4Addr::new(10, 0, 0, 1));
-        assert!(state.igmp.check_multiple_queriers(&mut state.network_health).is_empty());
+        let mc = state.has_active_multicast();
+        assert!(state.igmp.check_multiple_queriers(&mut state.network_health, mc).is_empty());
+        assert!(!state.network_health.multiple_queriers_this_window);
+    }
+
+    #[test]
+    fn igmp_multiple_queriers_silent_without_active_multicast() {
+        // Two real queriers but no multicast flowing — IGMP topology can't harm an
+        // observable AV path that doesn't exist, so no alert and no score penalty.
+        let mut state = CaptureState::new();
+        state.igmp.querier_ips_this_window.insert(Ipv4Addr::new(10, 0, 0, 1));
+        state.igmp.querier_ips_this_window.insert(Ipv4Addr::new(10, 0, 0, 2));
+        let mc = state.has_active_multicast();
+        assert!(!mc);
+        assert!(state.igmp.check_multiple_queriers(&mut state.network_health, mc).is_empty());
         assert!(!state.network_health.multiple_queriers_this_window);
     }
 
     #[test]
     fn igmp_multiple_querier_flag_clears_on_reset_window() {
         let mut state = CaptureState::new();
+        add_active_multicast_stream(&mut state);
         state.igmp.querier_ips_this_window.insert(Ipv4Addr::new(10, 0, 0, 1));
         state.igmp.querier_ips_this_window.insert(Ipv4Addr::new(10, 0, 0, 2));
-        state.igmp.check_multiple_queriers(&mut state.network_health);
+        let mc = state.has_active_multicast();
+        state.igmp.check_multiple_queriers(&mut state.network_health, mc);
         assert!(state.network_health.multiple_queriers_this_window);
         state.reset_window();
         assert!(!state.network_health.multiple_queriers_this_window);
@@ -2145,7 +2192,11 @@ mod tests {
                               IgmpType::Query { version: 3 }, Instant::now());
         }
         assert_eq!(state.igmp.querier_ips_this_window.len(), 1);
-        assert!(state.igmp.check_multiple_queriers(&mut state.network_health).is_empty());
+        // With active multicast present, an empty result proves only one querier
+        // was counted (not that the check was gated out).
+        add_active_multicast_stream(&mut state);
+        let mc = state.has_active_multicast();
+        assert!(state.igmp.check_multiple_queriers(&mut state.network_health, mc).is_empty());
         assert!(!state.network_health.multiple_queriers_this_window);
     }
 

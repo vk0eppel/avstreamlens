@@ -29,7 +29,7 @@
 cargo build --release   # build
 cargo fmt               # format
 cargo clippy -- -D warnings  # lint
-cargo test              # run all 278 unit tests
+cargo test              # run all 279 unit tests
 
 # Release: bump version in Cargo.toml, commit, then:
 git tag vX.Y.Z && git push --tags   # triggers .github/workflows/release.yml
@@ -61,7 +61,7 @@ See **[TODO.md](TODO.md)** for the full list. Quick summary:
 ## Architecture
 
 ### General
-- **Test harness**: 278 unit tests in `#[cfg(test)]` modules across `parser.rs` + `parser/{sdp,ptp,avb,avdecc,lldp,mdns,flow_control,conmon}.rs`, `stats.rs`, and `capture.rs` — run with `cargo test`. Each parser submodule keeps its own fixtures and tests. `capture.rs` tests exercise handlers with hand-built IP/UDP/RTP byte buffers (see `ip_udp_rtp()` helper); no pcap dependency in tests
+- **Test harness**: 279 unit tests in `#[cfg(test)]` modules across `parser.rs` + `parser/{sdp,ptp,avb,avdecc,lldp,mdns,flow_control,conmon}.rs`, `stats.rs`, and `capture.rs` — run with `cargo test`. Each parser submodule keeps its own fixtures and tests. `capture.rs` tests exercise handlers with hand-built IP/UDP/RTP byte buffers (see `ip_udp_rtp()` helper); no pcap dependency in tests
 - Logging: timestamped `.log` files written on every run in the working directory; `Logger::log()` flushes after every write so the last report survives SIGINT
 - **`emit_line(logger, color, text)`** (`report.rs`, next to `ansi()`) is the single place report sections pair file output with coloured console output. Every report section used to repeat `logger.log(&x); println!("{}", ansi(c, &x));` at each call site (~20 sites across `print_discovery`, the Clock Sources loop, the Streams loop, AVB MSRP/VLAN lines, Network Status). Lines where the logged text and the printed text intentionally differ (the header rule block, the pcap-drops stats line) are NOT call sites for `emit_line` — they stay as separate `logger.log` / `println!` calls because collapsing them would change what's written to the log file
 - Bitrate computed as `byte_delta / elapsed_secs` — never assumed 1s exactly
@@ -94,6 +94,7 @@ See **[TODO.md](TODO.md)** for the full list. Quick summary:
 - Adding a new protocol = one new variant in `protocols::AvProtocol` + one new `handle_*` method + one new arm in `dispatch()`. No edits to `main.rs`
 
 ### Protocol Dispatch
+- **Entry point**: `detect_protocol_unwrapped(eth, raw_et, l2_payload)` holds all the dispatch logic; `main.rs` peels VLAN tags once with `unwrap_vlan` and passes the result in, so the tag stack isn't walked twice per packet. (`detect_protocol(&eth)` — which unwraps then delegates — exists only as a test-module convenience wrapper.) Both names are used interchangeably below to mean "the dispatcher."
 - Detection order (first match wins):
   `MSRP → LLDP → Flow-control (PAUSE/PFC) → MVRP → AVTP/AVB → gPTP → IGMP → SAP → mDNS → **Dante ConMon (8700–8708 + "Audinate" signature)** → Dante control → UDP PTP → **Dante ATP (239.255/16:4321 or both ports 14336–15359 — pre-RTP-gate, ATP is not RTP)** → RTP gate → **Dante audio (port heuristic)** → **Dante multicast (239.255/16 block)** → AES67 → ST2110`
 - **Dante audio runs before AES67/ST2110 IP checks** — Dante multicast (239.255.x.x) would otherwise match `is_st2110_multicast`. Two Dante-audio gates: `is_likely_dante_audio` (strict — both src AND dst ports even in 5000–6000, for unicast) then `is_dante_multicast` (dst in `239.255.0.0/16` AND dst port even in 5000–6000 — catches multicast transmit flows whose source port is out of range, which the strict gate misses and the ST2110 catch-all would otherwise steal)
@@ -225,7 +226,7 @@ See **[TODO.md](TODO.md)** for the full list. Quick summary:
 - `igmp_joins_seen` deduplicates Join prints per (src, group); Queries always printed
 - **General vs Group-Specific Query** (`handle_igmp`): only a **General Query** — destination = the all-systems group `224.0.0.1` (`protocols::IGMP_ALL_SYSTEMS`) — establishes querier identity. It alone updates `igmp_querier_ip`/`igmp_querier_mac`, advances `last_igmp_query` (the silence timer) and `igmp_query_interval_secs`, inserts into `igmp.querier_ips_this_window` (conflict detection), and sets `querier_version`. A **Group-Specific Query** (destination = the queried group, e.g. `224.0.1.129`) is membership verification, not election — it is rendered as an informational line but does **not** touch any querier state. This matters because IGMP-snooping switches commonly emit RFC 4541 group-specific verification queries sourced from `0.0.0.0`; counting those as queriers produced a phantom "Multiple IGMP queriers" conflict (−15 + misleading "disable querier" advice) and a bogus `interval 0s` from the rapid group-specific burst. Gating on `224.0.0.1` is the RFC-correct definition of querier election
 - Querier absence penalizes health score only when active multicast streams exist (−10 pts); "silent" threshold is interval-aware via `NetworkHealth::querier_silent_after_secs()` ≈ 2× the observed query interval (default 260s), per RFC 3376 "Other Querier Present Interval" — a fixed 130s left too little margin on a default 125s querier
-- **Multiple queriers**: `IgmpState::check_multiple_queriers(&mut NetworkHealth)` fires an `Error` alert and sets `multiple_queriers_this_window` (−15 score penalty in `collect_penalties`) when ≥2 distinct General-Query source IPs are seen in one Window
+- **Multiple queriers**: `IgmpState::check_multiple_queriers(&mut NetworkHealth, has_active_multicast)` fires an `Error` alert and sets `multiple_queriers_this_window` (−15 score penalty in `collect_penalties`) when ≥2 distinct General-Query source IPs are seen in one Window. **Gated on `has_active_multicast`** (`CaptureState::has_active_multicast()`, computed in `emit_periodic_alerts`) — same rule as the querier-absent penalty: IGMP querier topology only matters when multicast is actually flowing, so an idle/non-AV segment stays silent rather than docking the score
 - `igmp_query_interval_secs` tracks detected interval between consecutive queries — shown in footer as `(interval Xs)`; `igmp_querier_mac: Option<[u8; 6]>` on `NetworkHealth` stores the Ethernet source MAC of the last querier — shown in the footer alongside the IP as `[xx:xx:xx:xx:xx:xx]` to identify the physical switch even when it has different IPs on different interfaces. `AvProtocol::Igmp` carries `src_mac: [u8; 6]` extracted from the Ethernet frame in `detect_protocol`
 - **IGMPv3 Membership Report parsing** (`IgmpType::MembershipReportV3 { groups: Vec<Ipv4Addr> }`): type `0x22` is now parsed separately from IGMPv2 Join (`0x16`). `parse_igmpv3_report()` in `parser.rs` walks the Group Records (RFC 3376 §4.2): `payload[6..7]` = num_records, then per record: `[0]` record_type, `[1]` aux_data_len, `[2-3]` num_sources, `[4-7]` multicast address; offset advances by `8 + 4*num_sources + 4*aux_data_len`. Extracted groups are pushed to `CaptureState::pending_join_groups` by `handle_igmp` (filtered to `239.x.x.x` only)
 - **Dynamic IGMP join bootstrap**: startup joins `224.0.0.22` (IGMPv3 all-routers, normally flooded) + PTP groups + SAP `224.2.127.254` + Dante's SAP group `239.255.255.255` (per Audinate's port list; inside the snooped 239.255/16 block, so the join is required). From SAP, `handle_sap` pushes stream multicast IPs from `SdpMedia.connection` ("IN IP4 x.x.x.x[/ttl]"). From IGMPv3 reports, `handle_igmp` pushes all `239.x.x.x` groups. `main.rs` drains `pending_join_groups` after each `dispatch()` call: `should_join_group()` gates by octet[1] (69→AES67, 255→Dante, other→ST2110) against `expanded_protocols`; approved groups get a `UdpSocket::join_multicast_v4` call; socket kept in `mc_sockets: Vec<UdpSocket>` (process-lifetime); success written to `state.joined_multicast`. Limitation: Dante IGMPv2 on old switches sends reports to the group address (snooped), creating a chicken/egg that the v3 path cannot resolve
@@ -292,7 +293,7 @@ See **[TODO.md](TODO.md)** for the full list. Quick summary:
 | DSCP wrong (per stream with violations) | −5/stream, capped at −20 |
 | ECN congestion marks | −2 each, capped at −20 |
 | IGMP querier absent (multicast active) | −10 |
-| Multiple IGMP queriers on segment | −15 |
+| Multiple IGMP queriers on segment (multicast active) | −15 |
 | PTP clock confirmed lost | −25/domain |
 | PTP traffic seen, no grandmaster | −15/domain |
 | PTP grandmaster changed | −10/domain × changes, capped at 3 |

@@ -150,15 +150,19 @@ fn parse_igmpv3_report(payload: &[u8]) -> crate::protocols::IgmpType {
     crate::protocols::IgmpType::MembershipReportV3 { groups }
 }
 
-/// Analyzes an Ethernet frame to determine the encapsulated AV protocol.
+/// Analyzes an Ethernet frame (with VLAN tags already peeled by the caller) to
+/// determine the encapsulated AV protocol. `main.rs` peels the tags once via
+/// [`unwrap_vlan`] and passes the result here so the tag stack isn't walked
+/// twice on the per-packet hot path. `eth` is still needed for the Ethernet
+/// source MAC (IGMP querier identity) and for `parse_tcp_packet`; `AvProtocol`
+/// is fully owned, so nothing in the result borrows `l2_payload`. Tests call the
+/// `detect_protocol(&eth)` convenience wrapper at the bottom of this file.
 ///
 /// Dispatch order matters and is documented in CLAUDE.md under "Protocol Dispatch":
 /// MSRP → LLDP → Flow-control → MVRP → AVTP/AVB → gPTP → IGMP → SAP → mDNS →
 /// Dante control → UDP PTP → RTP gate → Dante audio (before AES67/ST2110 IP
 /// checks) → AES67 → ST2110.
-pub fn detect_protocol(eth: &EthernetPacket) -> Option<AvProtocol> {
-    let (raw_et, l2_payload) = unwrap_vlan(eth)?;
-
+pub fn detect_protocol_unwrapped(eth: &EthernetPacket, raw_et: u16, l2_payload: &[u8]) -> Option<AvProtocol> {
     // ── MSRP : L2 (EtherType 0x22EA) ────────────────────
     if raw_et == crate::protocols::ETHERTYPE_MSRP {
         let decls = parse_msrp(l2_payload);
@@ -442,6 +446,14 @@ pub fn parse_rtp(payload: &[u8]) -> Option<(u16, u32, u32)> {
 mod tests {
     use super::*;
     use pnet_packet::ethernet::EthernetPacket;
+
+    /// Convenience wrapper used throughout these tests: peel VLAN tags then
+    /// dispatch. Production code calls `detect_protocol_unwrapped` directly,
+    /// reusing the unwrap it already performs per packet.
+    fn detect_protocol(eth: &EthernetPacket) -> Option<AvProtocol> {
+        let (raw_et, l2_payload) = unwrap_vlan(eth)?;
+        detect_protocol_unwrapped(eth, raw_et, l2_payload)
+    }
 
     /// Build a raw Ethernet frame: 12-byte dst+src prefix, then ethertype bytes,
     /// optional extra bytes (VLAN tags), then payload.

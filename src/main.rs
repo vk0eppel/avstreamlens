@@ -27,7 +27,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::capture::{Alert, CaptureState};
-use crate::parser::{detect_protocol, parse_ts_refclk, is_multicast, unwrap_vlan};
+use crate::parser::{detect_protocol_unwrapped, parse_ts_refclk, is_multicast, unwrap_vlan};
 use crate::report::{create_logger, print_report, ReportSnapshot, ReportSession};
 
 use std::collections::HashSet;
@@ -282,7 +282,9 @@ fn run_loop<T: Activated>(
         let frame_bytes = eth.packet().len() as u64;
 
         state.packets_dispatched += 1;
-        if let Some(proto) = detect_protocol(&eth)
+        // Reuse the VLAN unwrap above instead of letting detect_protocol walk the
+        // tag stack a second time on every packet.
+        if let Some(proto) = detect_protocol_unwrapped(&eth, l2_et, l2_payload)
             && proto.is_selected(expanded_protocols)
         {
             capture::dispatch(state, proto, l2_payload, frame_bytes, now, logger);
@@ -353,7 +355,8 @@ fn emit_periodic_alerts(state: &mut CaptureState, is_offline: bool, logger: &mut
     capture::emit(&state.check_ptp_timeouts(),        logger);
     capture::emit(&state.check_stream_count_anomaly(), logger);
     capture::emit(&state.check_igmp_query_interval(),      logger);
-    capture::emit(&state.igmp.check_multiple_queriers(&mut state.network_health), logger);
+    let has_active_multicast = state.has_active_multicast();
+    capture::emit(&state.igmp.check_multiple_queriers(&mut state.network_health, has_active_multicast), logger);
     capture::emit(&state.igmp.check_version_mismatch(),    logger);
     capture::emit(&state.check_filter_unregistered_multicast(), logger);
     capture::emit(&state.check_high_multicast_bandwidth(), logger);
