@@ -254,7 +254,7 @@ See **[TODO.md](TODO.md)** for the full list. Quick summary:
   4. `📡 Discovered (AVDECC — N entities):` — ADP-discovered AVDECC entities (conditional)
   5. `🕐 Clock Sources:` — PTP domains; periodic diagnostics rendered inline: `check_dante_follower_census()` (names specific devices not sending Delay_Req) and `check_ptp_sync_conflict()` (multiple preferred masters)
   6. `📡 Streams:` — unified list of all active streams (AES67, Dante, ST2110, NDI, AVB), no blank lines between entries
-  7. `📊 Network Status:` — bandwidth + QoS/DSCP + IGMP querier + EEE + PAUSE/PFC + pcap capture stats. Always shown regardless of Health Score; pcap drops appear here only (tool limitation, never a Health Summary bullet)
+  7. `📊 Network Status:` — bandwidth + QoS/DSCP + IGMP querier + EEE + PAUSE/PFC + pcap capture stats. **One metric per line** (no `|`-joined rows) for at-a-glance scanning — `plain_line()` is the uncoloured sibling of `emit_line()` used for these. Always shown regardless of Health Score; pcap drops appear here only (tool limitation, never a Health Summary bullet)
 - Stream entry format: `  ▸ Protocol  "Name"  [codec]  —  IP:port` / `    metrics line` / `    ⚠  alerts`
   - Protocol label: ST2110 subtypes shown as `ST2110-20` etc.; AES67 streams whose `src_ip` is in `dante.sources` shown as `AES67 (Dante: "Name")` or `AES67 (Dante)` — identifies Dante devices operating in AES67 mode
   - RTP streams (AES67/Dante/ST2110): metrics = `loss: X%  |  jitter: X ms  |  X Mbps`
@@ -269,7 +269,7 @@ See **[TODO.md](TODO.md)** for the full list. Quick summary:
 - ECN congestion marks: penalise score (−2 each, capped −20) **and** shown as `⚠  ECN: N congestion mark(s)` in Network Health section
 - EEE: shown only when detected — absence is NOT reported (switch may not send LLDP, so absence ≠ disabled)
 - Clock Sources: protocol label prominent; domain number only when multiple domains
-- **pcap capture stats**: `cap.stats()` is called once per 5s cycle just before `print_report`; result passed as `Option<(u32, u32, u32)>` (received, dropped, if_dropped). Rendered at the bottom of Network Health: `📦 N pkts received | N kernel drop(s) | N interface drop(s)`. If either drop counter is non-zero the line is printed in red and a second red line warns that loss/jitter figures may be understated. Both `dropped` (kernel ring buffer overflow) and `if_dropped` (NIC-level drops before pcap) are shown — both corrupt measurements equally
+- **pcap capture stats**: `cap.stats()` is called once per 5s cycle just before `print_report`; result passed as `Option<(u32, u32, u32)>` (received, dropped, if_dropped). Rendered at the bottom of Network Status, one counter per line under a `📦` group marker: `📦 N pkts received` / `N kernel drop(s)` / `N interface drop(s)` / `N parsed`. Each drop line turns **red only when its own counter is non-zero** (so the offending counter stands out), and a trailing red line then warns that loss/jitter figures may be understated. Both `dropped` (kernel ring buffer overflow) and `if_dropped` (NIC-level drops before pcap) are shown — both corrupt measurements equally. Offline replay has no `cap.stats()`, so only `📦 N parsed` is shown
 
 ---
 

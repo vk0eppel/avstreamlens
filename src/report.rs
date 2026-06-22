@@ -24,6 +24,13 @@ fn emit_line(logger: &mut Logger, color: &str, text: &str) {
     logger.log(text);
     println!("{}", ansi(color, text));
 }
+
+/// Log + print an uncoloured line (the no-colour sibling of `emit_line`).
+#[inline]
+fn plain_line(logger: &mut Logger, text: &str) {
+    logger.log(text);
+    println!("{}", text);
+}
 use std::collections::{HashMap, HashSet};
 use std::net::Ipv4Addr;
 use std::time::Duration;
@@ -718,10 +725,8 @@ pub fn print_report(snap: &ReportSnapshot, session: &mut ReportSession, logger: 
     logger.log("\nNetwork Status:");
     println!("\n{}", ansi("36", "📊 Network Status:"));
 
-    // Bandwidth
-    let bw_line = format!("   Bandwidth: {:.1} Mbps (last 5s)", mbps);
-    logger.log(&bw_line);
-    println!("{}", bw_line);
+    // One metric per line for at-a-glance scanning.
+    plain_line(logger, &format!("   Bandwidth: {:.1} Mbps (last 5s)", mbps));
 
     let dscp_bad = streams.values().filter(|s| s.dscp_violations > 0).count();
     let qos_str = if streams.values().all(|s| s.protocol == "NDI" || s.protocol == "AVB" || s.protocol.starts_with("AVB ")) {
@@ -731,6 +736,7 @@ pub fn print_report(snap: &ReportSnapshot, session: &mut ReportSession, logger: 
     } else {
         format!("QoS: ⚠ {} stream(s) with incorrect DSCP", dscp_bad)
     };
+    plain_line(logger, &format!("   {}", qos_str));
 
     let querier_str = match health.last_igmp_query {
         None => "IGMP: – (no querier seen)".to_string(),
@@ -753,10 +759,7 @@ pub fn print_report(snap: &ReportSnapshot, session: &mut ReportSession, logger: 
             }
         }
     };
-
-    let breakdown = format!("   {}  |  {}", qos_str, querier_str);
-    logger.log(&breakdown);
-    println!("{}", breakdown);
+    plain_line(logger, &format!("   {}", querier_str));
 
     if health.ecn_congestion_marks > 0 {
         emit_line(logger, "33", &format!(
@@ -784,29 +787,32 @@ pub fn print_report(snap: &ReportSnapshot, session: &mut ReportSession, logger: 
             eee_ports.len()
         ));
         for ((chassis, port), (tx, rx)) in eee_ports.iter() {
-            let detail = format!("      port \"{}\"  chassis {}  Tx wake: {}µs  Rx wake: {}µs", port, chassis, tx, rx);
-            logger.log(&detail);
-            println!("{}", detail);
+            plain_line(logger, &format!("      port \"{}\"  chassis {}  Tx wake: {}µs  Rx wake: {}µs", port, chassis, tx, rx));
         }
     }
 
+    // Capture statistics — 📦 marks the group, one counter per line. Drop counters
+    // turn red when non-zero so the offending counter is obvious at a glance.
     if let Some((received, dropped, if_dropped)) = pcap_stats {
-        let stats_line = format!(
-            "   📦 {:} pkts received  |  {} kernel drop(s)  |  {} interface drop(s)  |  {} parsed",
-            received, dropped, if_dropped, packets_dispatched
-        );
-        logger.log(&stats_line);
+        plain_line(logger, &format!("   📦 {} pkts received", received));
+        let drop_line = |n: u32, label: &str| format!("      {} {}", n, label);
+        if dropped > 0 {
+            emit_line(logger, "31", &drop_line(dropped, "kernel drop(s)"));
+        } else {
+            plain_line(logger, &drop_line(dropped, "kernel drop(s)"));
+        }
+        if if_dropped > 0 {
+            emit_line(logger, "31", &drop_line(if_dropped, "interface drop(s)"));
+        } else {
+            plain_line(logger, &drop_line(if_dropped, "interface drop(s)"));
+        }
+        plain_line(logger, &format!("      {} parsed", packets_dispatched));
         if dropped > 0 || if_dropped > 0 {
-            println!("{}", ansi("31", &stats_line));
             emit_line(logger, "31", "   ❌ Capture drops detected — loss/jitter figures may be understated. \
                         Reduce load or increase pcap buffer size.");
-        } else {
-            println!("{}", stats_line);
         }
     } else {
-        let line = format!("   📦 {} parsed", packets_dispatched);
-        logger.log(&line);
-        println!("{}", line);
+        plain_line(logger, &format!("   📦 {} parsed", packets_dispatched));
     }
 
     logger.log("");
