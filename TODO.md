@@ -24,7 +24,7 @@
 
 - **IGMP snooping blocking PTP multicast** — ✅ DONE (2026-06-15). `check_igmp_snooping_blocking_ptp(is_offline)` fires ⚠ warn when Dante devices found (sources or ConMon) but no PTP traffic and no querier; suppressed in offline mode. 3 unit tests. (`src/capture.rs`, `src/main.rs`)
 
-- **Multiple IGMP queriers** — ✅ DONE (2026-06-15). `igmp_querier_ips_this_window: HashSet<Ipv4Addr>` in `CaptureState`, populated in `handle_igmp` on Query. `check_igmp_multiple_queriers()` fires ❌ error + sets `multiple_queriers_this_window` flag on `NetworkHealth` for −15 score penalty. Reset in `reset_window`. 3 unit tests. (`src/capture.rs`, `src/stats.rs`)
+- **Multiple IGMP queriers** — ✅ DONE (2026-06-15; refined 2026-06-21). `IgmpState::querier_ips_this_window: HashSet<Ipv4Addr>`, populated in `handle_igmp`. `IgmpState::check_multiple_queriers()` fires ❌ error + sets `multiple_queriers_this_window` on `NetworkHealth` for −15 score penalty. Reset in `reset_window`. **Refinement (2026-06-21):** only **General Queries** (dst `224.0.0.1`, `IGMP_ALL_SYSTEMS`) count toward querier election — Group-Specific Queries (often sourced from `0.0.0.0` by snooping switches per RFC 4541) no longer register as phantom queriers; and the check is gated on `has_active_multicast` like the querier-absent penalty. (`src/capture.rs`, `src/stats.rs`, `src/protocols.rs`)
 
 - **IGMPv2 querier / IGMPv3 host mismatch** — ✅ DONE (2026-06-15). `IgmpType::Query` now carries `version: u8` (2 if payload=8B, 3 if ≥12B). `igmp_querier_version: Option<u8>` + `igmp_v3_report_seen_this_window: bool` tracked in `CaptureState`. `check_igmp_version_mismatch()` fires ⚠ warn. 3 unit tests. (`src/protocols.rs`, `src/parser.rs`, `src/capture.rs`)
 

@@ -337,10 +337,14 @@ Choose the protocols to monitor:
 
 📊 Network Status:
    Bandwidth: 12.4 Mbps (last 5s)
-   QoS: ✓ all streams correctly marked  |  IGMP: ✓ querier 192.168.1.1 [d0:69:9e:10:10:e4] 42s ago  (interval 125s)
+   QoS: ✓ all streams correctly marked
+   IGMP: ✓ querier 192.168.1.1 [d0:69:9e:10:10:e4] 42s ago  (interval 125s)
    ⚠  EEE active on 1 switch port(s) — may cause audio/video glitches
       port "Gi0/1"  chassis 00:1a:2b:3c:4d:5e  Tx wake: 16µs  Rx wake: 16µs
-   📦 48120 pkts received  |  0 kernel drop(s)  |  0 interface drop(s)  |  48120 parsed
+   📦 48120 pkts received
+      0 kernel drop(s)
+      0 interface drop(s)
+      48120 parsed
 ```
 
 **Health Summary** — directly under the score line, a `⚠` bullet for every factor pulling the Health Score below 100%: stream issues collapsed by type (e.g. `⚠ 2 stream(s) with packet loss`) and infrastructure issues listed individually. A fully healthy (100%) report shows no summary at all. pcap capture drops are a tool limitation, not a network fault — they appear only in **Network Status** at the bottom, never as a summary bullet.
@@ -405,13 +409,13 @@ Some devices respond to Dante mDNS queries without being real Dante audio endpoi
 
 PAUSE and PFC detection is best-effort: most NICs consume these frames at the MAC layer before pcap sees them. The absence of these alerts therefore does NOT prove no upstream congestion is happening.
 
-The **pcap capture stats line** (`📦 N pkts received | N kernel drop(s) | N interface drop(s)`) always appears at the bottom of the Network Health section. Kernel drops mean the pcap ring buffer overflowed; interface drops mean packets were lost at the NIC before pcap. Either type of drop corrupts loss and jitter numbers — if you see this alert, reduce traffic load or increase the pcap buffer size.
+The **pcap capture stats** (`📦 N pkts received`, then `kernel drop(s)`, `interface drop(s)`, and `parsed` each on their own line) always appear at the bottom of the Network Status section. Kernel drops mean the pcap ring buffer overflowed; interface drops mean packets were lost at the NIC before pcap. A drop count turns red when non-zero. Either type of drop corrupts loss and jitter numbers — if you see this, reduce traffic load or increase the pcap buffer size.
 
 ---
 
 ## Health Score
 
-The health percentage reflects the overall network quality. Factors that reduce the score include packet loss, high jitter, timestamp discontinuities, source interruptions (SSRC changes), dead streams, PTP clock loss or instability, QoS tagging violations, IGMP querier absence, AVB bandwidth reservation failures, and EEE active on switch ports.
+The health percentage reflects the overall network quality. Factors that reduce the score include packet loss, high jitter, timestamp discontinuities, source interruptions (SSRC changes), dead streams, PTP clock loss or instability, QoS tagging violations, IGMP querier absence or multiple competing queriers, AVB bandwidth reservation failures, and EEE active on switch ports.
 
 ---
 
