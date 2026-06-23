@@ -112,7 +112,23 @@ fn should_join_group(group: &Ipv4Addr, expanded: &[protocols::ProtocolChoice]) -
     }
 }
 
+/// Resets SIGPIPE to its default disposition (SIG_DFL) so a write to a
+/// closed stdout (e.g. piping into `head`) kills the process directly
+/// instead of the standard library turning the failed write into a panic
+/// inside `println!`/`print!`. Rust installs SIG_IGN for SIGPIPE at startup;
+/// this undoes that, matching the behavior of ripgrep, fd, and other Unix
+/// CLI tools. No equivalent needed on Windows, which has no SIGPIPE.
+#[cfg(unix)]
+fn reset_sigpipe() {
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+}
+
 fn main() {
+    #[cfg(unix)]
+    reset_sigpipe();
+
     let args = cli::parse_cli_args();
     let stdout_is_tty = std::io::stdout().is_terminal();
     COLOR.store(cli::resolve_color_enabled(args.no_color, stdout_is_tty), Ordering::Relaxed);
