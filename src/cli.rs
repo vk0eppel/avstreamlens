@@ -108,6 +108,40 @@ pub fn parse_cli_args() -> CliArgs {
     CliArgs { interface, protocols, no_color, quiet, duration, read_file }
 }
 
+/// Decide whether ANSI colour output should be enabled. `no_color_requested` is
+/// the already-merged result of `--no-color`/`--no-colour` or the `NO_COLOR` env
+/// var (see `parse_cli_args` above — both collapse into `CliArgs::no_color`).
+/// Colour defaults on only when nothing forces it off AND stdout is an
+/// interactive terminal — piping or redirecting output disables it automatically.
+pub fn resolve_color_enabled(no_color_requested: bool, stdout_is_tty: bool) -> bool {
+    !no_color_requested && stdout_is_tty
+}
+
+#[cfg(test)]
+mod color_tests {
+    use super::resolve_color_enabled;
+
+    #[test]
+    fn enabled_on_tty_with_no_color_not_requested() {
+        assert!(resolve_color_enabled(false, true));
+    }
+
+    #[test]
+    fn disabled_on_non_tty_with_no_color_not_requested() {
+        assert!(!resolve_color_enabled(false, false));
+    }
+
+    #[test]
+    fn disabled_on_tty_when_no_color_requested() {
+        assert!(!resolve_color_enabled(true, true));
+    }
+
+    #[test]
+    fn disabled_on_non_tty_when_no_color_requested() {
+        assert!(!resolve_color_enabled(true, false));
+    }
+}
+
 /// Resolve a device by exact pcap name (e.g. `en0`).
 /// Exits with a clear error if the name is not found.
 pub fn resolve_interface_by_name(name: &str) -> Device {

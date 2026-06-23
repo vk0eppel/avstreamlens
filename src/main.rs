@@ -23,6 +23,7 @@ mod capture;
 use pcap::{Activated, Capture};
 use pnet_packet::ethernet::EthernetPacket;
 use pnet_packet::Packet;
+use std::io::IsTerminal;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
@@ -113,9 +114,8 @@ fn should_join_group(group: &Ipv4Addr, expanded: &[protocols::ProtocolChoice]) -
 
 fn main() {
     let args = cli::parse_cli_args();
-    if args.no_color {
-        COLOR.store(false, Ordering::Relaxed);
-    }
+    let stdout_is_tty = std::io::stdout().is_terminal();
+    COLOR.store(cli::resolve_color_enabled(args.no_color, stdout_is_tty), Ordering::Relaxed);
     let quiet = args.quiet;
     let duration_secs = args.duration;
     let is_offline = args.read_file.is_some();
