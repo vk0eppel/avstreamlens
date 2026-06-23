@@ -368,7 +368,7 @@ fn run_loop<T: Activated>(
 /// The four Discovered/Clock Sources diagnostics are computed in do_report and
 /// rendered inline in print_report instead of emitted here as free-standing output.
 fn emit_periodic_alerts(state: &mut CaptureState, is_offline: bool, logger: &mut crate::report::Logger) {
-    capture::emit(&state.check_ptp_timeouts(),        logger);
+    capture::emit(&state.ptp.check_ptp_timeouts(),    logger);
     capture::emit(&state.check_stream_count_anomaly(), logger);
     capture::emit(&state.check_igmp_query_interval(),      logger);
     let has_active_multicast = state.has_active_multicast();
@@ -392,12 +392,12 @@ fn do_report(
     // Compute the four section-level diagnostics before borrowing state fields.
     let ip_config_alerts     = state.dante.check_ip_config();
     let conmon_bridge_alerts = state.dante.check_conmon_bridge();
-    let follower_census_alerts = state.dante.check_follower_census(&state.ptpv1_followers, &state.ptp_domains);
-    let ptp_sync_alerts      = state.check_ptp_sync_conflict();
+    let follower_census_alerts = state.dante.check_follower_census(&state.ptp);
+    let ptp_sync_alerts      = state.ptp.check_ptp_sync_conflict();
     let dante_unverified     = state.dante.unverified();
 
     state.network_health.calculate_score(
-        &state.streams, &state.tcp_streams, &state.ptp_domains,
+        &state.streams, &state.tcp_streams, &state.ptp.domains,
         &state.avb.msrp_state, &state.eee_ports,
     );
     let missing_ptp = state.missing_ptp_clocks(expanded_protocols);
@@ -409,7 +409,7 @@ fn do_report(
     let snap = ReportSnapshot {
         streams: &state.streams,
         tcp_streams: &state.tcp_streams,
-        ptp_domains: &state.ptp_domains,
+        ptp_domains: &state.ptp.domains,
         missing_ptp: &missing_ptp,
         health: &state.network_health,
         bytes_this_window: state.bytes_this_window,
@@ -502,8 +502,8 @@ fn ts_refclk_alerts(state: &CaptureState) -> Vec<Alert> {
         for m in &sdp.media {
             if m.ts_refclk.is_empty() { continue; }
             let Some((claimed_gm, claimed_domain)) = parse_ts_refclk(&m.ts_refclk) else { continue };
-            let entry = state.ptp_domains.get(&(claimed_domain, protocols::PTP_VERSION_V2))
-                .or_else(|| state.ptp_domains.get(&(claimed_domain, protocols::PTP_VERSION_V1)));
+            let entry = state.ptp.domains.get(&(claimed_domain, protocols::PTP_VERSION_V2))
+                .or_else(|| state.ptp.domains.get(&(claimed_domain, protocols::PTP_VERSION_V1)));
             match entry {
                 None => {
                     alerts.push(Alert::warn(format!(

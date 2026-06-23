@@ -226,25 +226,19 @@ impl DanteState {
     }
 
     /// Alert when fewer Dante devices than expected are sending PTPv1 Delay_Req.
-    /// Takes the PTP maps directly (interim signature — will accept `&PtpState`
-    /// once that substate is extracted in the follow-on refactor).
-    pub fn check_follower_census(
-        &self,
-        ptpv1_followers: &HashMap<Ipv4Addr, Instant>,
-        ptp_domains: &HashMap<(u8, u8), PtpStats>,
-    ) -> Vec<Alert> {
+    pub fn check_follower_census(&self, ptp: &PtpState) -> Vec<Alert> {
         let total   = self.sources.len();
-        let syncing = ptpv1_followers.len();
-        let has_ptpv1 = ptp_domains.keys().any(|(_, v)| *v == crate::protocols::PTP_VERSION_V1);
+        let syncing = ptp.v1_followers.len();
+        let has_ptpv1 = ptp.domains.keys().any(|(_, v)| *v == crate::protocols::PTP_VERSION_V1);
         if !has_ptpv1 || total < 2 || syncing == 0 {
             return vec![];
         }
-        let gm_ip: Option<Ipv4Addr> = ptp_domains.iter()
+        let gm_ip: Option<Ipv4Addr> = ptp.domains.iter()
             .filter(|((_, v), _)| *v == crate::protocols::PTP_VERSION_V1)
             .filter_map(|(_, stats)| stats.grandmaster_src_ip)
             .next();
         let mut candidates: Vec<Ipv4Addr> = self.sources.iter()
-            .filter(|ip| !ptpv1_followers.contains_key(ip))
+            .filter(|ip| !ptp.v1_followers.contains_key(ip))
             .copied()
             .collect();
         candidates.sort();
@@ -425,14 +419,98 @@ impl Default for AvbState {
     fn default() -> Self { Self::new() }
 }
 
+/// PTP-specific substate: domains keyed by (domain, version) — separates
+/// Dante PTPv1 from AES67/ST2110 PTPv2 on the same domain number — plus the
+/// PTPv1 Delay_Req follower census used to detect Dante devices that have
+/// stopped syncing.
+pub struct PtpState {
+    pub domains:     HashMap<(u8, u8), PtpStats>,
+    pub v1_followers: HashMap<Ipv4Addr, Instant>,
+}
+
+impl PtpState {
+    pub fn new() -> Self {
+        Self { domains: HashMap::new(), v1_followers: HashMap::new() }
+    }
+
+    /// Clear per-window PTPv1 Sync sender census and prune stale followers.
+    /// Must run AFTER `check_ptp_sync_conflict()` (called by main.rs before
+    /// `reset_window`), which reads `sync_senders_this_window`.
+    pub fn reset_window(&mut self) {
+        for ptp in self.domains.values_mut() {
+            ptp.sync_senders_this_window.clear();
+        }
+        // PTPv1 followers: Delay_Req rate is ~1/s; prune after 15s to survive
+        // inter-cycle gaps without false-positive census drops.
+        self.v1_followers.retain(|_, t| t.elapsed().as_secs() < 15);
+    }
+
+    /// Periodic clock-loss check, called from the report cycle. Returns
+    /// Error alerts for any domain whose PTP clock has timed out.
+    pub fn check_ptp_timeouts(&mut self) -> Vec<Alert> {
+        let mut alerts = Vec::new();
+        for stats in self.domains.values_mut() {
+            if let Some(PtpEvent::ClockLost) = stats.check_timeout() {
+                alerts.push(Alert::error(format!(
+                    "❌ PTP Clock LOST (Domain {} v{}) [{}]",
+                    stats.domain,
+                    stats.version,
+                    stats.protocol_kind.as_deref().unwrap_or("?")
+                )));
+            }
+        }
+        alerts
+    }
+
+    /// PTPv1 multiple-master conflict detection, called from the periodic report cycle
+    /// **before** `reset_window` (which clears `sync_senders_this_window`).
+    ///
+    /// Healthy Dante PTPv1: one device wins BMCA and is the sole Sync sender. Two
+    /// devices sending Sync in the same domain signals BMCA election instability.
+    /// Two devices both with stratum 0 (Dante "preferred master" setting) is the
+    /// common misconfiguration — a second AV engineer set their console's Dante
+    /// interface to "preferred master" without realising one was already set.
+    pub fn check_ptp_sync_conflict(&self) -> Vec<Alert> {
+        let mut alerts = Vec::new();
+        for ptp in self.domains.values() {
+            if ptp.version != crate::protocols::PTP_VERSION_V1 { continue; }
+            let senders = &ptp.sync_senders_this_window;
+            if senders.len() <= 1 { continue; }
+
+            let preferred: Vec<_> = senders.iter()
+                .filter(|(_, s)| **s == 0)
+                .map(|(ip, _)| ip.to_string())
+                .collect();
+
+            if preferred.len() >= 2 {
+                alerts.push(Alert::error(format!(
+                    "❌ Multiple Preferred Leaders in PTP domain {} ({}) — if one device has an external word clock and another is set as Preferred Leader, the word-clock device will lose sync and be muted unless both share the same external reference; disable Preferred Leader on all but one device",
+                    ptp.domain,
+                    preferred.join(", "),
+                )));
+            } else {
+                let all_ips: Vec<_> = senders.keys().map(|ip| ip.to_string()).collect();
+                alerts.push(Alert::warn(format!(
+                    "⚠ Multiple PTP Sync senders in domain {} ({}) — possible IGMP snooping partition or 'Sync to External' mismatch; check that only one device is the clock leader",
+                    ptp.domain,
+                    all_ips.join(", "),
+                )));
+            }
+        }
+        alerts
+    }
+}
+
+impl Default for PtpState {
+    fn default() -> Self { Self::new() }
+}
+
 /// All per-loop state owned by the capture loop. Handlers mutate fields here
 /// and return alerts to the dispatch layer.
 pub struct CaptureState {
     pub streams:        HashMap<String, StreamStats>,
     pub tcp_streams:    HashMap<String, TcpStreamStats>,
     pub sdp_cache:      HashMap<String, SdpSession>,
-    // PTP stats keyed by (domain, version) — separates Dante PTPv1 from AES67/ST2110 PTPv2.
-    pub ptp_domains:    HashMap<(u8, u8), PtpStats>,
     pub network_health: NetworkHealth,
     // Protocol-family substates — each groups its fields with its own
     // reset_window/check_* methods for locality and independent testability.
@@ -440,6 +518,7 @@ pub struct CaptureState {
     pub ndi:   NdiState,
     pub igmp:  IgmpState,
     pub avb:   AvbState,
+    pub ptp:   PtpState,
     // EEE detection: (chassis_id, port_id) → (tx_wake_us, rx_wake_us)
     pub eee_ports:      HashMap<(String, String), (u16, u16)>,
     pub bytes_this_window: u64,
@@ -461,11 +540,6 @@ pub struct CaptureState {
     pub filter_unregistered_suspect_cycles: u32,
     // Multicast byte count for the current 5s window (for 80 Mbps threshold check).
     pub multicast_bytes_this_window: u64,
-    // PTPv1 Delay_Req census: tracks which Dante devices are actively syncing.
-    // Key = source IP of a Delay_Req sender; value = last seen Instant.
-    // Populated in handle_ptp; pruned in reset_window; compared to dante_sources
-    // in check_dante_follower_census to surface devices not locked to the clock.
-    pub ptpv1_followers: HashMap<Ipv4Addr, Instant>,
     // Rolling history of total stream counts (RTP + TCP + AVTP) at the end of
     // each 5s window, used to detect sudden flood-style anomalies. Capped at 3
     // entries; the oldest is dropped when a fourth would be added.
@@ -485,12 +559,12 @@ impl CaptureState {
             streams: HashMap::new(),
             tcp_streams: HashMap::new(),
             sdp_cache: HashMap::new(),
-            ptp_domains: HashMap::new(),
             network_health: NetworkHealth::new(),
             dante: DanteState::new(),
             ndi:   NdiState::new(),
             igmp:  IgmpState::new(),
             avb:   AvbState::new(),
+            ptp:   PtpState::new(),
             eee_ports: HashMap::new(),
             bytes_this_window: 0,
             pause_frames_this_window: 0,
@@ -500,7 +574,6 @@ impl CaptureState {
             joined_multicast:    HashSet::new(),
             filter_unregistered_suspect_cycles: 0,
             multicast_bytes_this_window: 0,
-            ptpv1_followers:     HashMap::new(),
             stream_count_history: Vec::new(),
             local_ips:           HashSet::new(),
         }
@@ -535,18 +608,14 @@ impl CaptureState {
         });
         // AVB substate: AVTP prune + dependent MSRP/MVRP/AVDECC pruning.
         self.avb.reset_window();
-        // Clear per-window PTPv1 Sync sender census. Must happen AFTER
-        // check_ptp_sync_conflict() (called by main.rs before reset_window).
-        for ptp in self.ptp_domains.values_mut() {
-            ptp.sync_senders_this_window.clear();
-        }
+        // PTP substate: clear per-window Sync sender census + prune stale
+        // followers. Must happen AFTER check_ptp_sync_conflict() (called by
+        // main.rs before reset_window).
+        self.ptp.reset_window();
         // Dante substate: ConMon pruning + unverified-windows update.
         // Must run after check_conmon_bridge / check_follower_census (they read
         // the pre-reset data) and before the next capture window begins.
         self.dante.reset_window(&self.streams);
-        // PTPv1 followers: Delay_Req rate is ~1/s; prune after 15s to survive
-        // inter-cycle gaps without false-positive census drops.
-        self.ptpv1_followers.retain(|_, t| t.elapsed().as_secs() < 15);
         // IGMP substate: per-window querier/report reset + Join-dedup pruning.
         // Must run AFTER check_multiple_queriers() (which reads
         // querier_ips_this_window). The network_health flag is reset here
@@ -661,12 +730,12 @@ impl CaptureState {
             && info.message_type == 0x01
             && let Some(ip) = info.src_ip
         {
-            self.ptpv1_followers.insert(ip, Instant::now());
+            self.ptp.v1_followers.insert(ip, Instant::now());
         }
 
         let kind   = info.protocol_kind.clone();
         let src_ip = info.src_ip;
-        let stats  = self.ptp_domains
+        let stats  = self.ptp.domains
             .entry((info.domain, info.version))
             .or_insert_with(|| PtpStats::new(info.domain, info.version));
         let event  = stats.update(&info, &kind);
@@ -1110,61 +1179,6 @@ impl CaptureState {
         }
     }
 
-    /// PTP clock-loss check, called from the periodic report cycle.
-    /// Returns one ClockLost alert per domain that transitioned to LOST.
-    pub fn check_ptp_timeouts(&mut self) -> Vec<Alert> {
-        let mut alerts = Vec::new();
-        for stats in self.ptp_domains.values_mut() {
-            if let Some(PtpEvent::ClockLost) = stats.check_timeout() {
-                alerts.push(Alert::error(format!(
-                    "❌ PTP Clock LOST (Domain {} v{}) [{}]",
-                    stats.domain,
-                    stats.version,
-                    stats.protocol_kind.as_deref().unwrap_or("?")
-                )));
-            }
-        }
-        alerts
-    }
-
-    /// PTPv1 multiple-master conflict detection, called from the periodic report cycle
-    /// **before** `reset_window` (which clears `sync_senders_this_window`).
-    ///
-    /// Healthy Dante PTPv1: one device wins BMCA and is the sole Sync sender. Two
-    /// devices sending Sync in the same domain signals BMCA election instability.
-    /// Two devices both with stratum 0 (Dante "preferred master" setting) is the
-    /// common misconfiguration — a second AV engineer set their console's Dante
-    /// interface to "preferred master" without realising one was already set.
-    pub fn check_ptp_sync_conflict(&self) -> Vec<Alert> {
-        let mut alerts = Vec::new();
-        for ptp in self.ptp_domains.values() {
-            if ptp.version != crate::protocols::PTP_VERSION_V1 { continue; }
-            let senders = &ptp.sync_senders_this_window;
-            if senders.len() <= 1 { continue; }
-
-            let preferred: Vec<_> = senders.iter()
-                .filter(|(_, s)| **s == 0)
-                .map(|(ip, _)| ip.to_string())
-                .collect();
-
-            if preferred.len() >= 2 {
-                alerts.push(Alert::error(format!(
-                    "❌ Multiple Preferred Leaders in PTP domain {} ({}) — if one device has an external word clock and another is set as Preferred Leader, the word-clock device will lose sync and be muted unless both share the same external reference; disable Preferred Leader on all but one device",
-                    ptp.domain,
-                    preferred.join(", "),
-                )));
-            } else {
-                let all_ips: Vec<_> = senders.keys().map(|ip| ip.to_string()).collect();
-                alerts.push(Alert::warn(format!(
-                    "⚠ Multiple PTP Sync senders in domain {} ({}) — possible IGMP snooping partition or 'Sync to External' mismatch; check that only one device is the clock leader",
-                    ptp.domain,
-                    all_ips.join(", "),
-                )));
-            }
-        }
-        alerts
-    }
-
     /// True when at least one multicast stream has carried traffic. Mirrors the
     /// `has_multicast` predicate in `NetworkHealth::collect_penalties` so the
     /// IGMP querier checks (absent / multiple) share one definition of "multicast
@@ -1197,7 +1211,7 @@ impl CaptureState {
     pub fn check_filter_unregistered_multicast(&mut self) -> Vec<Alert> {
         let conmon_active = !self.dante.conmon.is_empty();
         let no_mdns       = self.dante.names.is_empty();
-        let no_ptp        = self.ptp_domains.values().all(|p| p.packets == 0);
+        let no_ptp        = self.ptp.domains.values().all(|p| p.packets == 0);
         let no_streams    = self.streams.is_empty() && self.avb.avtp_streams.is_empty();
 
         if conmon_active && no_mdns && no_ptp && no_streams {
@@ -1236,7 +1250,7 @@ impl CaptureState {
         if is_offline { return vec![]; }
         let has_dante_devices = !self.dante.sources.is_empty() || !self.dante.conmon.is_empty();
         if !has_dante_devices { return vec![]; }
-        let has_ptp = self.ptp_domains.values().any(|p| p.packets > 0);
+        let has_ptp = self.ptp.domains.values().any(|p| p.packets > 0);
         if has_ptp { return vec![]; }
         if self.network_health.last_igmp_query.is_some() { return vec![]; }
         vec![Alert::warn(
@@ -1296,7 +1310,7 @@ impl CaptureState {
             && self.streams.values().any(|s| s.protocol == "AES67");
         let st2110_active = expanded.iter().any(|c| matches!(c, ProtocolChoice::ST2110))
             && self.streams.values().any(|s| s.protocol.starts_with("2110-"));
-        let has_ptpv2 = self.ptp_domains.values().any(|s|
+        let has_ptpv2 = self.ptp.domains.values().any(|s|
             s.clock_valid && s.version == PTP_VERSION_V2
             && s.protocol_kind.as_deref() != Some("AVB"));
         if (aes67_active || st2110_active) && !has_ptpv2 {
@@ -1311,7 +1325,7 @@ impl CaptureState {
             && self.streams.values().any(|s| s.protocol == "Dante");
         // Dante needs PTPv1/PTPv2 on the IP network — an L2 gPTP (AVB) clock does
         // not satisfy it, so exclude AVB domains just like the PTPv2 check above.
-        let has_ptp = self.ptp_domains.values().any(|s|
+        let has_ptp = self.ptp.domains.values().any(|s|
             s.clock_valid && s.protocol_kind.as_deref() != Some("AVB"));
         if dante_active && !has_ptp {
             missing.push(MissingClock { kind: MissingClockKind::Ptp, affected: vec!["Dante"] });
@@ -1320,7 +1334,7 @@ impl CaptureState {
         // ── L2 gPTP (AVB) ────────────────────────────────────────────────────
         let avb_active = expanded.iter().any(|c| matches!(c, ProtocolChoice::AVB))
             && !self.avb.avtp_streams.is_empty();
-        let has_gptp = self.ptp_domains.values().any(|s|
+        let has_gptp = self.ptp.domains.values().any(|s|
             s.clock_valid && s.protocol_kind.as_deref() == Some("AVB"));
         if avb_active && !has_gptp {
             missing.push(MissingClock { kind: MissingClockKind::Gptp, affected: vec!["AVB"] });
@@ -2364,7 +2378,7 @@ mod tests {
 
     fn make_ptpv1_domain(state: &mut CaptureState) {
         use crate::protocols::PTP_VERSION_V1;
-        state.ptp_domains.insert((0, PTP_VERSION_V1), {
+        state.ptp.domains.insert((0, PTP_VERSION_V1), {
             let mut s = crate::stats::PtpStats::new(0, PTP_VERSION_V1);
             s.clock_valid = true;
             s
@@ -2376,8 +2390,8 @@ mod tests {
         let mut state = CaptureState::new();
         state.dante.sources.insert(Ipv4Addr::new(192, 168, 1, 1));
         state.dante.sources.insert(Ipv4Addr::new(192, 168, 1, 2));
-        state.ptpv1_followers.insert(Ipv4Addr::new(192, 168, 1, 2), Instant::now());
-        assert!(state.dante.check_follower_census(&state.ptpv1_followers, &state.ptp_domains).is_empty());
+        state.ptp.v1_followers.insert(Ipv4Addr::new(192, 168, 1, 2), Instant::now());
+        assert!(state.dante.check_follower_census(&state.ptp).is_empty());
     }
 
     #[test]
@@ -2387,7 +2401,7 @@ mod tests {
         state.dante.sources.insert(Ipv4Addr::new(192, 168, 1, 1));
         state.dante.sources.insert(Ipv4Addr::new(192, 168, 1, 2));
         // No Delay_Req seen yet — startup grace, no alert.
-        assert!(state.dante.check_follower_census(&state.ptpv1_followers, &state.ptp_domains).is_empty());
+        assert!(state.dante.check_follower_census(&state.ptp).is_empty());
     }
 
     #[test]
@@ -2398,9 +2412,9 @@ mod tests {
         state.dante.sources.insert(Ipv4Addr::new(192, 168, 1, 1));
         state.dante.sources.insert(Ipv4Addr::new(192, 168, 1, 2));
         state.dante.sources.insert(Ipv4Addr::new(192, 168, 1, 3));
-        state.ptpv1_followers.insert(Ipv4Addr::new(192, 168, 1, 2), Instant::now());
-        state.ptpv1_followers.insert(Ipv4Addr::new(192, 168, 1, 3), Instant::now());
-        assert!(state.dante.check_follower_census(&state.ptpv1_followers, &state.ptp_domains).is_empty());
+        state.ptp.v1_followers.insert(Ipv4Addr::new(192, 168, 1, 2), Instant::now());
+        state.ptp.v1_followers.insert(Ipv4Addr::new(192, 168, 1, 3), Instant::now());
+        assert!(state.dante.check_follower_census(&state.ptp).is_empty());
     }
 
     #[test]
@@ -2410,13 +2424,13 @@ mod tests {
         // 4 devices: GM (.1) + 2 followers (.2, .3) + 1 not syncing (.4).
         for i in 1..=4 { state.dante.sources.insert(Ipv4Addr::new(192, 168, 1, i)); }
         // Set the grandmaster IP on the domain so the GM is excluded from missing.
-        state.ptp_domains.values_mut()
+        state.ptp.domains.values_mut()
             .find(|s| s.version == crate::protocols::PTP_VERSION_V1)
             .unwrap()
             .grandmaster_src_ip = Some(Ipv4Addr::new(192, 168, 1, 1));
-        state.ptpv1_followers.insert(Ipv4Addr::new(192, 168, 1, 2), Instant::now());
-        state.ptpv1_followers.insert(Ipv4Addr::new(192, 168, 1, 3), Instant::now());
-        let alerts = state.dante.check_follower_census(&state.ptpv1_followers, &state.ptp_domains);
+        state.ptp.v1_followers.insert(Ipv4Addr::new(192, 168, 1, 2), Instant::now());
+        state.ptp.v1_followers.insert(Ipv4Addr::new(192, 168, 1, 3), Instant::now());
+        let alerts = state.dante.check_follower_census(&state.ptp);
         assert_eq!(alerts.len(), 1);
         assert!(matches!(alerts[0].level, AlertLevel::Warn));
         assert!(alerts[0].message.contains("192.168.1.4"));
@@ -2430,14 +2444,14 @@ mod tests {
         let gm = Ipv4Addr::new(192, 168, 1, 1);
         let missing = Ipv4Addr::new(192, 168, 1, 4);
         for i in 1..=4 { state.dante.sources.insert(Ipv4Addr::new(192, 168, 1, i)); }
-        state.ptp_domains.values_mut()
+        state.ptp.domains.values_mut()
             .find(|s| s.version == crate::protocols::PTP_VERSION_V1)
             .unwrap()
             .grandmaster_src_ip = Some(gm);
         state.dante.names.insert(missing, "StageBox".to_string());
-        state.ptpv1_followers.insert(Ipv4Addr::new(192, 168, 1, 2), Instant::now());
-        state.ptpv1_followers.insert(Ipv4Addr::new(192, 168, 1, 3), Instant::now());
-        let alerts = state.dante.check_follower_census(&state.ptpv1_followers, &state.ptp_domains);
+        state.ptp.v1_followers.insert(Ipv4Addr::new(192, 168, 1, 2), Instant::now());
+        state.ptp.v1_followers.insert(Ipv4Addr::new(192, 168, 1, 3), Instant::now());
+        let alerts = state.dante.check_follower_census(&state.ptp);
         assert_eq!(alerts.len(), 1);
         assert!(alerts[0].message.contains("\"StageBox\""));
         assert!(alerts[0].message.contains("192.168.1.4"));
@@ -2637,7 +2651,7 @@ mod tests {
     fn ptp_ok_when_aes67_stream_and_ptpv2_clock_present() {
         let mut state = CaptureState::new();
         seed_aes67_stream(&mut state);
-        state.ptp_domains.insert((0, PTP_VERSION_V2), valid_ptp_stats(PTP_VERSION_V2, "PTPv2"));
+        state.ptp.domains.insert((0, PTP_VERSION_V2), valid_ptp_stats(PTP_VERSION_V2, "PTPv2"));
         assert!(state.missing_ptp_clocks(&[ProtocolChoice::AES67]).is_empty());
     }
 
@@ -2653,7 +2667,7 @@ mod tests {
         // AES67 requires PTPv2 — a PTPv1 clock is not sufficient.
         let mut state = CaptureState::new();
         seed_aes67_stream(&mut state);
-        state.ptp_domains.insert((0, PTP_VERSION_V1), valid_ptp_stats(PTP_VERSION_V1, "PTPv1"));
+        state.ptp.domains.insert((0, PTP_VERSION_V1), valid_ptp_stats(PTP_VERSION_V1, "PTPv1"));
         assert!(!state.missing_ptp_clocks(&[ProtocolChoice::AES67]).is_empty());
     }
 
@@ -2662,7 +2676,7 @@ mod tests {
         // Dante accepts either PTPv1 or PTPv2.
         let mut state = CaptureState::new();
         state.handle_dante(DanteKind::AudioStream, Ipv4Addr::new(192,168,1,10), Ipv4Addr::new(192,168,1,60), 5004, &[], Instant::now());
-        state.ptp_domains.insert((0, PTP_VERSION_V1), valid_ptp_stats(PTP_VERSION_V1, "PTPv1"));
+        state.ptp.domains.insert((0, PTP_VERSION_V1), valid_ptp_stats(PTP_VERSION_V1, "PTPv1"));
         assert!(state.missing_ptp_clocks(&[ProtocolChoice::Dante]).is_empty());
     }
 
@@ -2673,7 +2687,7 @@ mod tests {
         // source" because needs_gptp was true based on selection alone.
         let mut state = CaptureState::new();
         seed_aes67_stream(&mut state);
-        state.ptp_domains.insert((0, PTP_VERSION_V2), valid_ptp_stats(PTP_VERSION_V2, "PTPv2"));
+        state.ptp.domains.insert((0, PTP_VERSION_V2), valid_ptp_stats(PTP_VERSION_V2, "PTPv2"));
         let expanded = ProtocolChoice::All.includes();
         assert!(state.missing_ptp_clocks(&expanded).is_empty());
     }
@@ -2684,7 +2698,7 @@ mod tests {
         // Seed an AVTP stream so the "observed" gate fires.
         state.handle_avb(0x00, Some([1,2,3,4,5,6,7,8]), 100, Some(0), Instant::now());
         // UDP PTPv2 is present but L2 gPTP (protocol_kind="AVB") is not.
-        state.ptp_domains.insert((0, PTP_VERSION_V2), valid_ptp_stats(PTP_VERSION_V2, "PTPv2"));
+        state.ptp.domains.insert((0, PTP_VERSION_V2), valid_ptp_stats(PTP_VERSION_V2, "PTPv2"));
         assert!(!state.missing_ptp_clocks(&[ProtocolChoice::AVB]).is_empty());
     }
 
@@ -2692,7 +2706,7 @@ mod tests {
     fn ptp_ok_for_avb_with_l2_gptp() {
         let mut state = CaptureState::new();
         state.handle_avb(0x00, Some([1,2,3,4,5,6,7,8]), 100, Some(0), Instant::now());
-        state.ptp_domains.insert((0, PTP_VERSION_V2), valid_ptp_stats(PTP_VERSION_V2, "AVB"));
+        state.ptp.domains.insert((0, PTP_VERSION_V2), valid_ptp_stats(PTP_VERSION_V2, "AVB"));
         assert!(state.missing_ptp_clocks(&[ProtocolChoice::AVB]).is_empty());
     }
 
@@ -2748,7 +2762,7 @@ mod tests {
         // PTPv1/PTPv2 on the IP network, so the gPTP clock must not satisfy it.
         let mut state = CaptureState::new();
         state.handle_dante(DanteKind::AudioStream, Ipv4Addr::new(192,168,1,50), Ipv4Addr::new(192,168,1,60), 5004, &[], Instant::now());
-        state.ptp_domains.insert((0, PTP_VERSION_V2), valid_ptp_stats(PTP_VERSION_V2, "AVB"));
+        state.ptp.domains.insert((0, PTP_VERSION_V2), valid_ptp_stats(PTP_VERSION_V2, "AVB"));
         let missing = state.missing_ptp_clocks(&[ProtocolChoice::Dante]);
         assert!(missing.iter().any(|m| m.kind == MissingClockKind::Ptp && m.affected == vec!["Dante"]),
             "AVB gPTP must not satisfy Dante's clock requirement");
@@ -2759,7 +2773,7 @@ mod tests {
         let mut state = CaptureState::new();
         state.handle_avb(0x00, Some([1,2,3,4,5,6,7,8]), 100, Some(0), Instant::now());
         // UDP PTPv2 present but no L2 gPTP — AVB still affected.
-        state.ptp_domains.insert((0, PTP_VERSION_V2), valid_ptp_stats(PTP_VERSION_V2, "PTPv2"));
+        state.ptp.domains.insert((0, PTP_VERSION_V2), valid_ptp_stats(PTP_VERSION_V2, "PTPv2"));
         let missing = state.missing_ptp_clocks(&[ProtocolChoice::AVB]);
         assert_eq!(missing.len(), 1);
         assert_eq!(missing[0].kind, MissingClockKind::Gptp);
@@ -2967,7 +2981,7 @@ mod tests {
         state.handle_ptp(delay_resp(0, 500));
         state.handle_ptp(delay_resp(0, 1200));
         state.handle_ptp(delay_resp(0, 800));
-        let stats = state.ptp_domains.get(&(0, PTP_VERSION_V2)).expect("entry created");
+        let stats = state.ptp.domains.get(&(0, PTP_VERSION_V2)).expect("entry created");
         assert_eq!(stats.min_path_delay_ns, Some(500));
         assert_eq!(stats.max_path_delay_ns, Some(1200));
     }
@@ -2984,11 +2998,11 @@ mod tests {
         announce.path_delay_ns = None; // Announce doesn't carry path delay
         state.handle_ptp(announce.clone());
         // Sanity: path delay still set from the earlier Delay_Resp.
-        assert!(state.ptp_domains.get(&(0, PTP_VERSION_V2)).unwrap().min_path_delay_ns.is_some());
+        assert!(state.ptp.domains.get(&(0, PTP_VERSION_V2)).unwrap().min_path_delay_ns.is_some());
 
         announce.grandmaster_id = Some("gm-B".to_string());
         state.handle_ptp(announce);
-        let stats = state.ptp_domains.get(&(0, PTP_VERSION_V2)).unwrap();
+        let stats = state.ptp.domains.get(&(0, PTP_VERSION_V2)).unwrap();
         assert_eq!(stats.min_path_delay_ns, None, "GM change should clear path-delay history");
         assert_eq!(stats.max_path_delay_ns, None);
     }
@@ -3044,7 +3058,7 @@ mod tests {
         let mut state = CaptureState::new();
         let info = ptpv1_sync(Ipv4Addr::new(192, 168, 1, 10), 0, 0);
         state.handle_ptp(info);
-        let alerts = state.check_ptp_sync_conflict();
+        let alerts = state.ptp.check_ptp_sync_conflict();
         assert!(alerts.is_empty(), "single Sync sender should produce no alert");
     }
 
@@ -3054,7 +3068,7 @@ mod tests {
         // Two devices, stratum 1 each — competing but neither is "preferred master"
         state.handle_ptp(ptpv1_sync(Ipv4Addr::new(192, 168, 1, 10), 1, 0));
         state.handle_ptp(ptpv1_sync(Ipv4Addr::new(192, 168, 1, 20), 1, 0));
-        let alerts = state.check_ptp_sync_conflict();
+        let alerts = state.ptp.check_ptp_sync_conflict();
         assert_eq!(alerts.len(), 1);
         assert_eq!(alerts[0].level, AlertLevel::Warn);
         assert!(alerts[0].message.contains("Multiple PTP Sync senders in domain"));
@@ -3066,7 +3080,7 @@ mod tests {
         // Two devices with stratum 0 = "preferred master" in Dante — misconfiguration
         state.handle_ptp(ptpv1_sync(Ipv4Addr::new(192, 168, 1, 10), 0, 0));
         state.handle_ptp(ptpv1_sync(Ipv4Addr::new(192, 168, 1, 20), 0, 0));
-        let alerts = state.check_ptp_sync_conflict();
+        let alerts = state.ptp.check_ptp_sync_conflict();
         assert_eq!(alerts.len(), 1);
         assert_eq!(alerts[0].level, AlertLevel::Error);
         assert!(alerts[0].message.contains("Multiple Preferred Leaders"));
@@ -3077,10 +3091,10 @@ mod tests {
         let mut state = CaptureState::new();
         state.handle_ptp(ptpv1_sync(Ipv4Addr::new(192, 168, 1, 10), 0, 0));
         state.handle_ptp(ptpv1_sync(Ipv4Addr::new(192, 168, 1, 20), 0, 0));
-        assert!(!state.check_ptp_sync_conflict().is_empty());
+        assert!(!state.ptp.check_ptp_sync_conflict().is_empty());
         state.reset_window();
         // After reset, no senders recorded → no conflict
-        assert!(state.check_ptp_sync_conflict().is_empty(), "conflict must clear after reset_window");
+        assert!(state.ptp.check_ptp_sync_conflict().is_empty(), "conflict must clear after reset_window");
     }
 
     // ── Dante TTL routing detection ──────────────────────────────────────────
