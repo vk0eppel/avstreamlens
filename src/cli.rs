@@ -1,7 +1,7 @@
 // AVStreamLens — src/cli.rs
 // Interactive CLI prompts: interface selection and protocol selection.
 
-use pcap::Device;
+use pcap::{ConnectionStatus, Device};
 use std::io::{self, Write};
 
 use crate::protocols::ProtocolChoice;
@@ -229,7 +229,11 @@ pub fn select_interface() -> Device {
             if n == "lo" || n == "lo0" { return false; }
             let skip = ["utun", "awdl", "llw", "bridge", "vpn", "docker", "veth", "virbr",
                         "ap1", "anpi", "gif", "stf"];
-            !skip.iter().any(|k| n.contains(k))
+            if skip.iter().any(|k| n.contains(k)) { return false; }
+            // On Windows: skip adapters that have no link and the Npcap loopback adapter
+            if d.flags.connection_status == ConnectionStatus::Disconnected { return false; }
+            if d.desc.as_deref() == Some("Npcap Loopback Adapter") { return false; }
+            true
         })
         .collect();
 
@@ -248,18 +252,26 @@ pub fn select_interface() -> Device {
             .unwrap_or("");
         let ipv4 = d.addresses.iter()
             .filter_map(|a| match a.addr {
-                std::net::IpAddr::V4(ip) => Some(ip.to_string()),
+                std::net::IpAddr::V4(ip) if !ip.is_unspecified() => Some(ip.to_string()),
                 _ => None,
             })
             .collect::<Vec<_>>()
             .join(", ");
-        let info = match (desc.is_empty(), ipv4.is_empty()) {
-            (false, false) => format!("  —  {}  ({})", desc, ipv4),
-            (false, true)  => format!("  —  {}  (no IPv4)", desc),
-            (true,  false) => format!("  —  {}", ipv4),
-            (true,  true)  => String::new(),
-        };
-        println!("  {}: {}{}", i, d.name, info);
+        // On Windows, Npcap names are \Device\NPF_{GUID} — show the description as
+        // the primary label and suppress the GUID from the display entirely.
+        if d.name.starts_with(r"\Device\NPF_") {
+            let label = if desc.is_empty() { d.name.as_str() } else { desc };
+            let ip_part = if ipv4.is_empty() { String::new() } else { format!("  ({})", ipv4) };
+            println!("  {}: {}{}", i, label, ip_part);
+        } else {
+            let info = match (desc.is_empty(), ipv4.is_empty()) {
+                (false, false) => format!("  —  {}  ({})", desc, ipv4),
+                (false, true)  => format!("  —  {}  (no IPv4)", desc),
+                (true,  false) => format!("  —  {}", ipv4),
+                (true,  true)  => String::new(),
+            };
+            println!("  {}: {}{}", i, d.name, info);
+        }
     }
 
     println!("\n👉 Choose an interface by its number [default: 0]:");

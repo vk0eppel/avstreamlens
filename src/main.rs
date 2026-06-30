@@ -201,15 +201,32 @@ fn main() {
         let mut mc_sockets = join_multicast_groups(iface_ip, &expanded_protocols, &mut logger);
         let mut mc_joined: HashSet<Ipv4Addr> = HashSet::new();
 
+        #[cfg(unix)]
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!("❌  Packet capture requires elevated privileges.");
+            eprintln!("    → Re-run with: sudo {}", std::env::args().next().unwrap_or_default());
+            std::process::exit(1);
+        }
+
         let mut cap = Capture::from_device(device.name.as_str())
-            .expect("Unable to find capture device")
+            .unwrap_or_else(|e| {
+                eprintln!("❌  Cannot find capture device '{}': {}", device.name, e);
+                std::process::exit(1);
+            })
             .promisc(true)
             .immediate_mode(true)
             .timeout(1000)
             .open()
-            .expect("Unable to open capture — run as root/sudo (or as Administrator on Windows)");
-        cap.filter(&bpf_filter, true)
-            .expect("BPF filter failure — run as root/sudo");
+            .unwrap_or_else(|e| {
+                eprintln!("❌  Cannot open capture device '{}': {}", device.name, e);
+                eprintln!("    → Run as root/sudo (Linux/macOS) or as Administrator (Windows).");
+                eprintln!("    → On Windows, ensure Npcap is installed: https://npcap.com");
+                std::process::exit(1);
+            });
+        if let Err(e) = cap.filter(&bpf_filter, true) {
+            eprintln!("❌  BPF filter error: {}", e);
+            std::process::exit(1);
+        }
 
         send_mdns_startup_probe(iface_ip, &expanded_protocols, &mut logger);
 

@@ -90,6 +90,11 @@ jobs:
           echo "LIB=$env:LIB;$sdkDir\Lib\x64" >> $env:GITHUB_ENV
 
       - name: Build
+        env:
+          # Statically link libpcap on Linux and macOS so the binary has no
+          # runtime dependency on the system libpcap. Not set for Windows —
+          # Npcap is a kernel driver/DLL and cannot be statically linked.
+          LIBPCAP_STATIC: ${{ runner.os != 'Windows' && '1' || '' }}
         run: cargo build --release --target ${{ matrix.target }}
 
       - name: Package (macOS / Linux)
