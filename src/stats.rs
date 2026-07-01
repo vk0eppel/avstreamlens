@@ -93,6 +93,16 @@ pub struct StreamStats {
     // software source intentionally sending Best Effort (DSCP 0) from misconfigured
     // hardware (wrong non-zero DSCP); used to gate the Dante DSCP violation.
     pub observed_dscp:                  Option<u8>,
+    // PCP (802.1p) violations in the current 5 s window. Reset each window.
+    // AVB: mismatch against MSRP TalkerAdvertise declared priority.
+    // AES67/ST2110: any non-6 value (advisory only).
+    pub pcp_violations:                 u64,
+    // Outermost VLAN tag PCP observed on the first tagged packet. Set once,
+    // never reset. Used in diagnostic messages alongside msrp_declared_pcp.
+    pub observed_pcp:                   Option<u8>,
+    // MSRP TalkerAdvertise priority for AVB streams. Set in handle_avb when a
+    // PCP mismatch is first detected; None for non-AVB streams.
+    pub msrp_declared_pcp:              Option<u8>,
 }
 
 impl StreamStats {
@@ -141,6 +151,9 @@ impl StreamStats {
             transmitter:                    None,
             iat_samples:                    Vec::new(),
             observed_dscp:                  None,
+            pcp_violations:                 0,
+            observed_pcp:                   None,
+            msrp_declared_pcp:              None,
         }
     }
 
@@ -469,6 +482,16 @@ impl StreamStats {
         {
             d.push(StreamDiagnostic::Dead { silent_secs: last_time.elapsed().as_secs_f64() });
         }
+        if self.pcp_violations > 0 {
+            if self.protocol == "AVB" || self.protocol.starts_with("AVB ") {
+                d.push(StreamDiagnostic::PcpMismatch {
+                    observed: self.observed_pcp.unwrap_or(0),
+                    expected: self.msrp_declared_pcp.unwrap_or(3),
+                });
+            } else if self.protocol == "AES67" || self.protocol.starts_with("2110-") {
+                d.push(StreamDiagnostic::PcpAdvisory { observed: self.observed_pcp.unwrap_or(0) });
+            }
+        }
 
         d
     }
@@ -495,6 +518,11 @@ pub enum StreamDiagnostic {
     UnknownStreamType,
     Aes67PtpLockHint,
     DanteClockOrSubscriptionHint,
+    // AVB: observed frame PCP differs from MSRP TalkerAdvertise declared priority.
+    // Frame exits CBS protection. Penalty −15/stream.
+    PcpMismatch { observed: u8, expected: u8 },
+    // AES67/ST2110: frame not marked PCP 6. Advisory only — no score penalty.
+    PcpAdvisory { observed: u8 },
 }
 
 impl StreamDiagnostic {
@@ -512,13 +540,15 @@ impl StreamDiagnostic {
             StreamDiagnostic::SignalGap { .. } => 10.0,
             StreamDiagnostic::DscpViolation { .. } => 5.0,
             StreamDiagnostic::Dead { .. } => 30.0,
+            StreamDiagnostic::PcpMismatch { .. } => 15.0,
             StreamDiagnostic::Reorder { .. }
             | StreamDiagnostic::TtlRouted { .. }
             | StreamDiagnostic::PtMismatch { .. }
             | StreamDiagnostic::NotAnnounced
             | StreamDiagnostic::UnknownStreamType
             | StreamDiagnostic::Aes67PtpLockHint
-            | StreamDiagnostic::DanteClockOrSubscriptionHint => 0.0,
+            | StreamDiagnostic::DanteClockOrSubscriptionHint
+            | StreamDiagnostic::PcpAdvisory { .. } => 0.0,
         }
     }
 
@@ -570,6 +600,12 @@ impl StreamDiagnostic {
             StreamDiagnostic::Dead { silent_secs } => format!(
                 "    💀 No signal for {:.0}s", silent_secs
             ),
+            StreamDiagnostic::PcpMismatch { observed, expected } => format!(
+                "    ⚠  AVTP PCP {} but MSRP declared PCP {} — frame exits CBS protection (Milan Class A requires PCP 3)",
+                observed, expected
+            ),
+            StreamDiagnostic::PcpAdvisory { observed } =>
+                format!("    ⚠  Stream uses PCP {} — PCP 6 recommended for AES67/ST2110 on managed switches", observed),
         };
         Some(s)
     }

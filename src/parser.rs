@@ -93,20 +93,27 @@ pub fn is_likely_dante_audio(src: u16, dst: u16, pt: u8) -> bool {
 /// Peel off any 802.1Q / 802.1ad VLAN tags and return the inner EtherType
 /// together with the slice of bytes that follows it (the L2 payload).
 ///
-/// Handles single and stacked (QinQ) tags. Returns None if the frame is
-/// truncated mid-tag.
-pub fn unwrap_vlan<'a>(eth: &'a EthernetPacket<'a>) -> Option<(u16, &'a [u8])> {
+/// Handles single and stacked (QinQ) tags. Returns `(EtherType, outermost-tag
+/// PCP, payload)`. PCP is `Some` only when at least one VLAN tag was present;
+/// `None` for untagged frames. Returns None if the frame is truncated mid-tag.
+pub fn unwrap_vlan<'a>(eth: &'a EthernetPacket<'a>) -> Option<(u16, Option<u8>, &'a [u8])> {
     let raw = eth.packet();
     if raw.len() < 14 { return None; }
     let mut et   = u16::from_be_bytes([raw[12], raw[13]]);
     let mut off  = 14usize;
+    let mut pcp: Option<u8> = None;
     // 0x8100 = 802.1Q,  0x88A8 = 802.1ad (QinQ),  0x9100 = legacy QinQ
     while et == 0x8100 || et == 0x88A8 || et == 0x9100 {
         if raw.len() < off + 4 { return None; }
+        // Capture the outermost tag's PCP (bits [15:13] of the TCI word).
+        // QinQ inner tags are ignored — outermost tag is what the switch reads.
+        if pcp.is_none() {
+            pcp = Some((raw[off] >> 5) & 0x07);
+        }
         et  = u16::from_be_bytes([raw[off + 2], raw[off + 3]]);
         off += 4;
     }
-    Some((et, &raw[off..]))
+    Some((et, pcp, &raw[off..]))
 }
 
 // ═════════════════════════════════════════════════════════════════
@@ -404,7 +411,7 @@ pub type TcpData = (Ipv4Addr, Ipv4Addr, u16, u16, bool, bool, bool, u32, u32);
 
 /// Parses a TCP packet to extract flow details (IP addresses, ports, and flags).
 pub fn parse_tcp_packet(eth: &EthernetPacket) -> Option<TcpData> {
-    let (et, payload) = unwrap_vlan(eth)?;
+    let (et, _pcp, payload) = unwrap_vlan(eth)?;
     if et != 0x0800 { return None; }
     let ip = Ipv4Packet::new(payload)?;
     if ip.get_next_level_protocol() != pnet_packet::ip::IpNextHeaderProtocols::Tcp { return None; }
@@ -451,7 +458,7 @@ mod tests {
     /// dispatch. Production code calls `detect_protocol_unwrapped` directly,
     /// reusing the unwrap it already performs per packet.
     fn detect_protocol(eth: &EthernetPacket) -> Option<AvProtocol> {
-        let (raw_et, l2_payload) = unwrap_vlan(eth)?;
+        let (raw_et, _pcp, l2_payload) = unwrap_vlan(eth)?;
         detect_protocol_unwrapped(eth, raw_et, l2_payload)
     }
 
@@ -499,32 +506,37 @@ mod tests {
     fn vlan_untagged_passthrough() {
         let frame = eth_frame(&[0x22, 0xF0], &[], &[0x01, 0x02]);
         let eth = EthernetPacket::new(&frame).unwrap();
-        let (et, payload) = unwrap_vlan(&eth).unwrap();
+        let (et, pcp, payload) = unwrap_vlan(&eth).unwrap();
         assert_eq!(et, 0x22F0);
+        assert_eq!(pcp, None, "untagged frames carry no PCP");
         assert_eq!(payload, &[0x01, 0x02]);
     }
 
     #[test]
     fn vlan_single_802_1q_tag_stripped() {
-        // 0x8100 | TCI(2) | inner-ET | payload
-        let frame = eth_frame(&[0x81, 0x00], &[0x00, 0x64, 0x22, 0xF0], &[0xAA, 0xBB]);
+        // 0x8100 | TCI(PCP=3,DEI=0,VID=100) | inner-ET | payload
+        // TCI = 0x60 0x64 → PCP = (0x60 >> 5) & 0x07 = 3
+        let frame = eth_frame(&[0x81, 0x00], &[0x60, 0x64, 0x22, 0xF0], &[0xAA, 0xBB]);
         let eth = EthernetPacket::new(&frame).unwrap();
-        let (et, payload) = unwrap_vlan(&eth).unwrap();
+        let (et, pcp, payload) = unwrap_vlan(&eth).unwrap();
         assert_eq!(et, 0x22F0);
+        assert_eq!(pcp, Some(3), "PCP extracted from outermost tag");
         assert_eq!(payload, &[0xAA, 0xBB]);
     }
 
     #[test]
     fn vlan_qinq_both_tags_stripped() {
-        // 0x88A8(outer) | TCI | 0x8100(inner) | TCI | ET | payload
+        // 0x88A8(outer PCP=5) | TCI | 0x8100(inner PCP=3) | TCI | ET | payload
+        // outer TCI first byte = 0xA0 → PCP = 5; inner TCI = 0x60 → PCP = 3
         let frame = eth_frame(
             &[0x88, 0xA8],
-            &[0x00, 0x0A, 0x81, 0x00, 0x00, 0x64, 0x22, 0xF0],
+            &[0xA0, 0x0A, 0x81, 0x00, 0x60, 0x64, 0x22, 0xF0],
             &[0xCC, 0xDD],
         );
         let eth = EthernetPacket::new(&frame).unwrap();
-        let (et, payload) = unwrap_vlan(&eth).unwrap();
+        let (et, pcp, payload) = unwrap_vlan(&eth).unwrap();
         assert_eq!(et, 0x22F0);
+        assert_eq!(pcp, Some(5), "outermost tag PCP returned, not inner");
         assert_eq!(payload, &[0xCC, 0xDD]);
     }
 

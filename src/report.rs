@@ -96,7 +96,7 @@ use std::collections::{HashMap, HashSet};
 use std::net::Ipv4Addr;
 use std::time::Duration;
 
-use crate::stats::{AvdeccEntity, ConmonDevice, StreamStats, TcpStreamStats, PtpStats, NetworkHealth, StreamQuality, AvtpStreamStats};
+use crate::stats::{AvdeccEntity, ConmonDevice, StreamDiagnostic, StreamStats, TcpStreamStats, PtpStats, NetworkHealth, StreamQuality, AvtpStreamStats};
 use crate::parser::{fmt_eui64, media_type_summary, sr_class_str};
 use crate::protocols::{STREAM_TIMEOUT_SECS, MsrpDeclaration, MsrpDeclType, PTP_VERSION_V1, TransmitterConfidence, TransmitterVerdict, avtp_subtype_name, msrp_failure_reason};
 use crate::capture::{Alert, emit as emit_alerts, MissingClock, MissingClockKind};
@@ -142,6 +142,11 @@ pub struct ReportSnapshot<'a> {
     pub conmon_bridge_alerts:   &'a [Alert],
     pub follower_census_alerts: &'a [Alert],
     pub ptp_sync_alerts:        &'a [Alert],
+    // Set when PTP clock loss and stream packet loss are correlated in the same
+    // window. Suppresses the individual "no clock" and per-stream loss alerts
+    // so the combined dropout alert (already emitted by emit_periodic_alerts)
+    // dominates.
+    pub clock_dropout_correlated: bool,
 }
 
 /// Session-lifetime report config — distinct from the per-Window `ReportSnapshot`.
@@ -376,6 +381,7 @@ fn render_clock_sources(
     ptp_domains: &HashMap<(u8, u8), PtpStats>,
     missing_ptp: &[MissingClock],
     dante_names: &HashMap<Ipv4Addr, String>,
+    clock_dropout_correlated: bool,
 ) -> Option<Vec<RenderedLine>> {
     if ptp_domains.is_empty() && missing_ptp.is_empty() {
         return None;
@@ -484,9 +490,11 @@ fn render_clock_sources(
         }
     }
 
-    // Missing clock alerts
-    for mc in missing_ptp {
-        lines.push(RenderedLine::colored("31", format_missing_clock(mc)));
+    // Missing clock alerts — suppressed when the combined clock-dropout alert dominates
+    if !clock_dropout_correlated {
+        for mc in missing_ptp {
+            lines.push(RenderedLine::colored("31", format_missing_clock(mc)));
+        }
     }
 
     Some(lines)
@@ -495,6 +503,7 @@ fn render_clock_sources(
 /// Render the Streams section: the unified RTP/Dante/NDI list plus the AVB
 /// per-stream entries (AVTP stream IDs with MSRP/VLAN reservation state inline).
 /// Always has content (the header is shown unconditionally, same as today).
+#[allow(clippy::too_many_arguments)]
 fn render_streams(
     streams: &HashMap<String, StreamStats>,
     tcp_streams: &HashMap<String, TcpStreamStats>,
@@ -503,6 +512,7 @@ fn render_streams(
     avtp_streams: &HashMap<[u8; 8], AvtpStreamStats>,
     msrp_state: &HashMap<[u8; 8], MsrpDeclaration>,
     mvrp_vlans: &HashSet<u16>,
+    clock_dropout_correlated: bool,
 ) -> Vec<RenderedLine> {
     let mut lines = Vec::new();
 
@@ -589,6 +599,17 @@ fn render_streams(
         }
 
         for diag in s.diagnostics() {
+            // Suppress PacketLoss for clock-dependent protocols when the combined
+            // clock-dropout alert already fired — avoids double-reporting.
+            let clock_proto = s.protocol == "AES67"
+                || s.protocol == "Dante"
+                || s.protocol.starts_with("2110-");
+            if clock_dropout_correlated
+                && clock_proto
+                && matches!(diag, StreamDiagnostic::PacketLoss { .. })
+            {
+                continue;
+            }
             let Some(line) = diag.message() else { continue };
             let color = if diag.is_critical() { "31" } else { "33" };
             lines.push(RenderedLine::colored(color, line));
@@ -780,6 +801,7 @@ pub fn print_report(snap: &ReportSnapshot, session: &mut ReportSession, logger: 
         dante_conmon, dante_unverified, ndi_sources, ndi_names, avdecc_entities,
         pause_frames, pfc_frames, pcap_stats, packets_dispatched,
         ip_config_alerts, conmon_bridge_alerts, follower_census_alerts, ptp_sync_alerts,
+        clock_dropout_correlated,
     } = *snap;
     let quiet = session.quiet;
     let no_flows_diagnostic_shown = &mut session.no_flows_diagnostic_shown;
@@ -895,7 +917,7 @@ pub fn print_report(snap: &ReportSnapshot, session: &mut ReportSession, logger: 
 
     if has_clock_content {
         section_header(logger, "Clock Sources:", "🕐 Clock Sources:");
-        if let Some(clock_lines) = render_clock_sources(ptp_domains, missing_ptp, dante_names) {
+        if let Some(clock_lines) = render_clock_sources(ptp_domains, missing_ptp, dante_names, clock_dropout_correlated) {
             emit_lines(&clock_lines, logger);
         }
 
@@ -908,6 +930,7 @@ pub fn print_report(snap: &ReportSnapshot, session: &mut ReportSession, logger: 
     section_header(logger, "Streams:", "📡 Streams:");
     let stream_lines = render_streams(
         streams, tcp_streams, dante_sources, dante_names, avtp_streams, msrp_state, mvrp_vlans,
+        clock_dropout_correlated,
     );
     emit_lines(&stream_lines, logger);
 

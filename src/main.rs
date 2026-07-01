@@ -311,7 +311,7 @@ fn run_loop<T: Activated>(
 
         let eth = match EthernetPacket::new(packet.data) { Some(e) => e, _ => continue };
         let now = Instant::now();
-        let (l2_et, l2_payload) = unwrap_vlan(&eth).unwrap_or((0, &[][..]));
+        let (l2_et, l2_pcp, l2_payload) = unwrap_vlan(&eth).unwrap_or((0, None, &[][..]));
         let frame_bytes = eth.packet().len() as u64;
 
         state.packets_dispatched += 1;
@@ -320,7 +320,7 @@ fn run_loop<T: Activated>(
         if let Some(proto) = detect_protocol_unwrapped(&eth, l2_et, l2_payload)
             && proto.is_selected(expanded_protocols)
         {
-            capture::dispatch(state, proto, l2_payload, frame_bytes, now, logger);
+            capture::dispatch(state, proto, l2_payload, l2_pcp, frame_bytes, now, logger);
         }
 
         // ── Dynamic IGMP joins (live only) ───────────────────────────────────
@@ -385,7 +385,13 @@ fn run_loop<T: Activated>(
 /// The four Discovered/Clock Sources diagnostics are computed in do_report and
 /// rendered inline in print_report instead of emitted here as free-standing output.
 fn emit_periodic_alerts(state: &mut CaptureState, is_offline: bool, logger: &mut crate::report::Logger) {
-    capture::emit(&state.ptp.check_ptp_timeouts(),    logger);
+    let clock_alerts = state.ptp.check_ptp_timeouts();
+    if let Some(combined) = state.check_clock_dropout_correlation() {
+        capture::emit(&[combined], logger);
+        state.clock_dropout_correlated = true;
+    } else {
+        capture::emit(&clock_alerts, logger);
+    }
     capture::emit(&state.check_stream_count_anomaly(), logger);
     capture::emit(&state.check_igmp_query_interval(),      logger);
     let has_active_multicast = state.has_active_multicast();
@@ -449,6 +455,7 @@ fn do_report(
         conmon_bridge_alerts: &conmon_bridge_alerts,
         follower_census_alerts: &follower_census_alerts,
         ptp_sync_alerts: &ptp_sync_alerts,
+        clock_dropout_correlated: state.clock_dropout_correlated,
     };
     print_report(&snap, session, logger);
     state.reset_window();

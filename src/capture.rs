@@ -21,7 +21,7 @@ use crate::parser::{is_aes67_multicast, is_st2110_multicast, parse_rtp};
 use crate::protocols::{
     AvProtocol, AvdeccAdp, DanteKind, FlowControlKind, IgmpType, MsrpDeclType, MsrpDeclaration,
     NdiKind, ProtocolChoice, PtpInfo, SdpMedia, SdpSession, St2110Type, TransmitterClass, DEFAULT_CLOCK_HZ,
-    PTP_VERSION_V2, STREAM_TIMEOUT_SECS, avtp_subtype_name, classify_transmitter, msrp_failure_reason,
+    PTP_VERSION_V1, PTP_VERSION_V2, STREAM_TIMEOUT_SECS, avtp_subtype_name, classify_transmitter, msrp_failure_reason,
 };
 use crate::report::Logger;
 use crate::stats::{
@@ -547,6 +547,10 @@ pub struct CaptureState {
     // IPv4 addresses of the capture interface itself — excluded from device
     // discovery so the tool doesn't report itself as a Dante/NDI device.
     pub local_ips: HashSet<Ipv4Addr>,
+    // Set when both a PTP clock is lost AND a stream in the affected protocol
+    // family has packet loss in the same 5 s window. Suppresses the individual
+    // "no clock" and per-stream loss alerts so the combined dropout alert dominates.
+    pub clock_dropout_correlated: bool,
 }
 
 impl Default for CaptureState {
@@ -576,6 +580,7 @@ impl CaptureState {
             multicast_bytes_this_window: 0,
             stream_count_history: Vec::new(),
             local_ips:           HashSet::new(),
+            clock_dropout_correlated: false,
         }
     }
 
@@ -592,6 +597,7 @@ impl CaptureState {
             s.max_iat_ms      = 0.0;
             s.pt_mismatches   = 0;
             s.dscp_violations = 0;
+            s.pcp_violations  = 0;
             s.ssrc_changes    = 0;
             s.lost_this_window               = 0;
             s.ts_discontinuities_this_window = 0;
@@ -623,6 +629,7 @@ impl CaptureState {
         self.igmp.reset_window();
         self.network_health.multiple_queriers_this_window = false;
         self.multicast_bytes_this_window = 0;
+        self.clock_dropout_correlated = false;
     }
 
     // ── Handlers ────────────────────────────────────────────────────────────
@@ -770,7 +777,7 @@ impl CaptureState {
     }
 
     /// AES67 RTP audio.
-    pub fn handle_aes67(&mut self, dst: Ipv4Addr, dst_port: u16, payload_type: u8, l2_payload: &[u8]) {
+    pub fn handle_aes67(&mut self, dst: Ipv4Addr, dst_port: u16, payload_type: u8, l2_payload: &[u8], pcp: Option<u8>) {
         let key = format!("AES67 {}:{}", dst, dst_port);
         let sdp_match = self.find_sdp_media(dst_port).map(|(name, m)| (name.to_string(), m.clone()));
         let stats = self.streams.entry(key).or_insert_with(|| {
@@ -788,6 +795,11 @@ impl CaptureState {
             // AES67 requires DSCP EF (46) per spec
             if ip.get_dscp() != 46 { stats.dscp_violations += 1; }
             if ip.get_ecn() == 3 { self.network_health.ecn_congestion_marks += 1; }
+            // PCP=6 is the IEEE 802.1p priority recommended for AES67 on managed switches
+            if let Some(p) = pcp && p != 6 {
+                stats.pcp_violations += 1;
+                stats.observed_pcp.get_or_insert(p);
+            }
             if let Some((seq, ts, ssrc)) = parse_rtp(udp.payload()) {
                 if stats.expected_pt.is_some_and(|exp| payload_type != exp) {
                     stats.pt_mismatches += 1;
@@ -798,7 +810,7 @@ impl CaptureState {
     }
 
     /// ST 2110 video/audio/ancillary.
-    pub fn handle_st2110(&mut self, dst: Ipv4Addr, dst_port: u16, stream_type: St2110Type, l2_payload: &[u8]) {
+    pub fn handle_st2110(&mut self, dst: Ipv4Addr, dst_port: u16, stream_type: St2110Type, l2_payload: &[u8], pcp: Option<u8>) {
         let label = match stream_type {
             St2110Type::Video   => "2110-20",
             St2110Type::Audio   => "2110-30",
@@ -836,6 +848,11 @@ impl CaptureState {
             };
             if !dscp_ok { stats.dscp_violations += 1; }
             if ip.get_ecn() == 3 { self.network_health.ecn_congestion_marks += 1; }
+            // PCP=6 is the IEEE 802.1p priority recommended for ST2110 on managed switches
+            if let Some(p) = pcp && p != 6 {
+                stats.pcp_violations += 1;
+                stats.observed_pcp.get_or_insert(p);
+            }
             if let Some((seq, ts, ssrc)) = parse_rtp(udp.payload()) {
                 let rtp_pt = udp.payload()[1] & 0x7F;
                 if stats.expected_pt.is_some_and(|exp| rtp_pt != exp) {
@@ -1032,7 +1049,7 @@ impl CaptureState {
     }
 
     /// AVB AVTP frame — updates the per-subtype aggregate stream and per-stream_id entry.
-    pub fn handle_avb(&mut self, subtype: u8, stream_id: Option<[u8; 8]>, frame_bytes: u64, avtp_seq: Option<u8>, now: Instant) {
+    pub fn handle_avb(&mut self, subtype: u8, stream_id: Option<[u8; 8]>, frame_bytes: u64, avtp_seq: Option<u8>, pcp: Option<u8>, now: Instant) {
         // sv=0 AVTP control/discovery frames (AVDECC ADP/ACMP, MAAP) carry no stream
         // id — they are not media streams. Skip them so they don't inflate the AVB
         // stream count, create a phantom dead-stream entry, or diverge from the
@@ -1062,6 +1079,21 @@ impl CaptureState {
         entry.last_seen = now;
         entry.update_bitrate(frame_bytes, now);
         if let Some(seq) = avtp_seq { entry.update_seq(seq); }
+
+        // PCP mismatch: compare observed outermost VLAN tag PCP against the
+        // priority declared in the MSRP TalkerAdvertise for this stream_id.
+        // Only fires when both values are known and they differ; untagged frames
+        // (pcp = None) produce no alert.
+        let key = format!("AVB {}", avtp_subtype_name(subtype));
+        if let Some(stream_stats) = self.streams.get_mut(&key)
+            && let Some(observed) = pcp
+            && let Some(declared) = self.avb.msrp_state.get(&sid).and_then(|d| d.priority)
+            && observed != declared
+        {
+            stream_stats.pcp_violations += 1;
+            stream_stats.observed_pcp.get_or_insert(observed);
+            stream_stats.msrp_declared_pcp = Some(declared);
+        }
     }
 
     /// MSRP declarations — records all, alerts only on TalkerFailed.
@@ -1343,6 +1375,44 @@ impl CaptureState {
         missing
     }
 
+    /// When a PTP clock is confirmed lost AND at least one stream in the affected
+    /// protocol family has packet loss in the same 5 s window, return a single
+    /// combined alert. The caller suppresses the individual clock-lost and
+    /// per-stream loss alerts so this combined alert dominates.
+    ///
+    /// Call AFTER `ptp.check_ptp_timeouts()` so `protocol_clock_lost` reflects
+    /// the current window's state.
+    pub fn check_clock_dropout_correlation(&self) -> Option<Alert> {
+        let ptpv1_lost = self.ptp.domains.values().any(|s|
+            s.protocol_clock_lost
+            && s.version == PTP_VERSION_V1
+            && s.protocol_kind.as_deref() != Some("AVB"));
+        let ptpv2_lost = self.ptp.domains.values().any(|s|
+            s.protocol_clock_lost
+            && s.version == PTP_VERSION_V2
+            && s.protocol_kind.as_deref() != Some("AVB"));
+
+        if !ptpv1_lost && !ptpv2_lost {
+            return None;
+        }
+
+        let stream_loss = self.streams.values().any(|s| {
+            s.lost_this_window > 0 && (
+                (ptpv1_lost && s.protocol == "Dante")
+                || (ptpv2_lost && (s.protocol == "AES67" || s.protocol.starts_with("2110-")))
+            )
+        });
+
+        if stream_loss {
+            Some(Alert::error(
+                "❌ Clock sync failure — audio dropouts likely (PTP lost + stream loss detected)"
+                    .to_string(),
+            ))
+        } else {
+            None
+        }
+    }
+
     pub fn aggregate_ndi_bitrate(&mut self) {
         for stream in self.streams.values_mut() {
             if stream.protocol == "NDI"
@@ -1389,6 +1459,7 @@ pub fn dispatch(
     state: &mut CaptureState,
     proto: AvProtocol,
     l2_payload: &[u8],
+    pcp: Option<u8>,
     frame_bytes: u64,
     now: Instant,
     logger: &mut Logger,
@@ -1400,11 +1471,11 @@ pub fn dispatch(
         }
         AvProtocol::Ptp { info } => state.handle_ptp(info),
         AvProtocol::Aes67 { dst, dst_port, payload_type, .. } => {
-            state.handle_aes67(dst, dst_port, payload_type, l2_payload);
+            state.handle_aes67(dst, dst_port, payload_type, l2_payload, pcp);
             vec![]
         }
         AvProtocol::St2110 { dst, dst_port, stream_type, .. } => {
-            state.handle_st2110(dst, dst_port, stream_type, l2_payload);
+            state.handle_st2110(dst, dst_port, stream_type, l2_payload, pcp);
             vec![]
         }
         AvProtocol::Dante { kind, src, dst, dst_port } => {
@@ -1415,7 +1486,7 @@ pub fn dispatch(
         }
         AvProtocol::AvdeccAdp(adp) => state.handle_avdecc_adp(adp, now),
         AvProtocol::Avb { subtype, stream_id, seq } => {
-            state.handle_avb(subtype, stream_id, frame_bytes, seq, now);
+            state.handle_avb(subtype, stream_id, frame_bytes, seq, pcp, now);
             vec![]
         }
         AvProtocol::Msrp { declarations } => state.handle_msrp(declarations),
@@ -1513,7 +1584,7 @@ mod tests {
         let mut state = CaptureState::new();
         state.sdp_cache.insert("1".to_string(), sdp_for_port(5004, 96, 48_000.0));
         let pkt = ip_udp_rtp(46 << 2, 5004, 96, 0, 0, 0xAAAA);
-        state.handle_aes67(Ipv4Addr::new(239, 69, 0, 1), 5004, 96, &pkt);
+        state.handle_aes67(Ipv4Addr::new(239, 69, 0, 1), 5004, 96, &pkt, None);
         let s = state.streams.get("AES67 239.69.0.1:5004").expect("stream created");
         assert_eq!(s.expected_pt, Some(96));
         assert!(s.clock_hz_confirmed, "SAP-confirmed clock should flip the flag");
@@ -1539,7 +1610,7 @@ mod tests {
 
         // Step 1: stream observed before any SAP arrives (no sdp_cache entry yet).
         let pkt = ip_udp_rtp(46 << 2, 5004, 96, 0, 0, 0xAAAA);
-        state.handle_aes67(Ipv4Addr::new(239, 69, 0, 1), 5004, 96, &pkt);
+        state.handle_aes67(Ipv4Addr::new(239, 69, 0, 1), 5004, 96, &pkt, None);
         assert_eq!(state.streams["AES67 239.69.0.1:5004"].sdp_name, None);
 
         // Step 2: first SAP — sets name AND technical fields.
@@ -1582,7 +1653,7 @@ mod tests {
     fn aes67_dscp_violation_incremented_when_not_ef() {
         let mut state = CaptureState::new();
         let pkt = ip_udp_rtp(0, 5004, 96, 0, 0, 0xAAAA); // DSCP=0
-        state.handle_aes67(Ipv4Addr::new(239, 69, 0, 1), 5004, 96, &pkt);
+        state.handle_aes67(Ipv4Addr::new(239, 69, 0, 1), 5004, 96, &pkt, None);
         let s = &state.streams["AES67 239.69.0.1:5004"];
         assert_eq!(s.dscp_violations, 1);
     }
@@ -1591,7 +1662,7 @@ mod tests {
     fn aes67_dscp_ef_does_not_violate() {
         let mut state = CaptureState::new();
         let pkt = ip_udp_rtp(46 << 2, 5004, 96, 0, 0, 0xAAAA);
-        state.handle_aes67(Ipv4Addr::new(239, 69, 0, 1), 5004, 96, &pkt);
+        state.handle_aes67(Ipv4Addr::new(239, 69, 0, 1), 5004, 96, &pkt, None);
         let s = &state.streams["AES67 239.69.0.1:5004"];
         assert_eq!(s.dscp_violations, 0);
     }
@@ -1602,7 +1673,7 @@ mod tests {
         state.sdp_cache.insert("1".to_string(), sdp_for_port(5004, 10, 48_000.0));
         // First packet establishes the stream with expected_pt=10
         let pkt0 = ip_udp_rtp(46 << 2, 5004, 11, 0, 0, 0xAAAA); // arrives with PT=11
-        state.handle_aes67(Ipv4Addr::new(239, 69, 0, 1), 5004, 11, &pkt0);
+        state.handle_aes67(Ipv4Addr::new(239, 69, 0, 1), 5004, 11, &pkt0, None);
         let s = &state.streams["AES67 239.69.0.1:5004"];
         assert_eq!(s.pt_mismatches, 1);
         assert_eq!(s.expected_pt, Some(10));
@@ -1612,7 +1683,7 @@ mod tests {
     fn aes67_ecn_ce_increments_network_health() {
         let mut state = CaptureState::new();
         let pkt = ip_udp_rtp((46 << 2) | 0b11, 5004, 96, 0, 0, 0xAAAA); // ECN=3 (CE)
-        state.handle_aes67(Ipv4Addr::new(239, 69, 0, 1), 5004, 96, &pkt);
+        state.handle_aes67(Ipv4Addr::new(239, 69, 0, 1), 5004, 96, &pkt, None);
         assert_eq!(state.network_health.ecn_congestion_marks, 1);
     }
 
@@ -1623,7 +1694,7 @@ mod tests {
         let mut state = CaptureState::new();
         // CS5 = 40
         let pkt = ip_udp_rtp(40 << 2, 5004, 96, 0, 0, 0xAAAA);
-        state.handle_st2110(Ipv4Addr::new(239, 1, 2, 3), 5004, St2110Type::Video, &pkt);
+        state.handle_st2110(Ipv4Addr::new(239, 1, 2, 3), 5004, St2110Type::Video, &pkt, None);
         let s = state.streams.values().find(|s| s.protocol == "2110-20").expect("video stream");
         assert_eq!(s.dscp_violations, 0, "CS5 is valid for ST2110-20 video");
     }
@@ -1632,7 +1703,7 @@ mod tests {
     fn st2110_audio_dscp_cs5_rejected() {
         let mut state = CaptureState::new();
         let pkt = ip_udp_rtp(40 << 2, 5004, 96, 0, 0, 0xAAAA);
-        state.handle_st2110(Ipv4Addr::new(239, 1, 2, 3), 5004, St2110Type::Audio, &pkt);
+        state.handle_st2110(Ipv4Addr::new(239, 1, 2, 3), 5004, St2110Type::Audio, &pkt, None);
         let s = state.streams.values().find(|s| s.protocol == "2110-30").expect("audio stream");
         assert_eq!(s.dscp_violations, 1, "audio requires EF only");
     }
@@ -1641,7 +1712,7 @@ mod tests {
     fn st2110_video_clock_confirmed_without_sdp() {
         let mut state = CaptureState::new();
         let pkt = ip_udp_rtp(46 << 2, 5004, 96, 0, 0, 0xAAAA);
-        state.handle_st2110(Ipv4Addr::new(239, 1, 2, 3), 5004, St2110Type::Video, &pkt);
+        state.handle_st2110(Ipv4Addr::new(239, 1, 2, 3), 5004, St2110Type::Video, &pkt, None);
         let s = state.streams.values().find(|s| s.protocol == "2110-20").unwrap();
         assert!(s.clock_hz_confirmed, "video uses 90 kHz by spec, no SDP needed");
     }
@@ -1654,7 +1725,7 @@ mod tests {
         let mut state = CaptureState::new();
         state.sdp_cache.insert("1".to_string(), sdp_for_port(5004, 96, 48_000.0));
         let pkt = ip_udp_rtp(46 << 2, 5004, 96, 0, 0, 0xAAAA);
-        state.handle_st2110(Ipv4Addr::new(239, 1, 2, 3), 5004, St2110Type::Audio, &pkt);
+        state.handle_st2110(Ipv4Addr::new(239, 1, 2, 3), 5004, St2110Type::Audio, &pkt, None);
         let s = state.streams.values().find(|s| s.protocol == "2110-30").unwrap();
         assert_eq!(s.channels, 2);
         assert_eq!(s.ptime_ms, 1.0);
@@ -2634,7 +2705,7 @@ mod tests {
     /// Drop an AES67 stream entry into state so the "observed" gate fires.
     fn seed_aes67_stream(state: &mut CaptureState) {
         let pkt = ip_udp_rtp(46 << 2, 5004, 96, 0, 0, 0xAAAA);
-        state.handle_aes67(Ipv4Addr::new(239, 69, 0, 1), 5004, 96, &pkt);
+        state.handle_aes67(Ipv4Addr::new(239, 69, 0, 1), 5004, 96, &pkt, None);
     }
 
     #[test]
@@ -2696,7 +2767,7 @@ mod tests {
     fn ptp_fails_for_avb_streams_without_gptp() {
         let mut state = CaptureState::new();
         // Seed an AVTP stream so the "observed" gate fires.
-        state.handle_avb(0x00, Some([1,2,3,4,5,6,7,8]), 100, Some(0), Instant::now());
+        state.handle_avb(0x00, Some([1,2,3,4,5,6,7,8]), 100, Some(0), None, Instant::now());
         // UDP PTPv2 is present but L2 gPTP (protocol_kind="AVB") is not.
         state.ptp.domains.insert((0, PTP_VERSION_V2), valid_ptp_stats(PTP_VERSION_V2, "PTPv2"));
         assert!(!state.missing_ptp_clocks(&[ProtocolChoice::AVB]).is_empty());
@@ -2705,7 +2776,7 @@ mod tests {
     #[test]
     fn ptp_ok_for_avb_with_l2_gptp() {
         let mut state = CaptureState::new();
-        state.handle_avb(0x00, Some([1,2,3,4,5,6,7,8]), 100, Some(0), Instant::now());
+        state.handle_avb(0x00, Some([1,2,3,4,5,6,7,8]), 100, Some(0), None, Instant::now());
         state.ptp.domains.insert((0, PTP_VERSION_V2), valid_ptp_stats(PTP_VERSION_V2, "AVB"));
         assert!(state.missing_ptp_clocks(&[ProtocolChoice::AVB]).is_empty());
     }
@@ -2738,7 +2809,7 @@ mod tests {
         seed_aes67_stream(&mut state);
         // Seed an ST2110 stream too.
         let pkt = ip_udp_rtp(46 << 2, 5006, 96, 0, 0, 0xBBBB);
-        state.handle_st2110(Ipv4Addr::new(239, 1, 2, 3), 5006, St2110Type::Audio, &pkt);
+        state.handle_st2110(Ipv4Addr::new(239, 1, 2, 3), 5006, St2110Type::Audio, &pkt, None);
         let missing = state.missing_ptp_clocks(&[ProtocolChoice::AES67, ProtocolChoice::ST2110]);
         assert_eq!(missing.len(), 1);
         assert_eq!(missing[0].kind, MissingClockKind::Ptpv2);
@@ -2771,7 +2842,7 @@ mod tests {
     #[test]
     fn missing_clock_for_avb_identifies_gptp() {
         let mut state = CaptureState::new();
-        state.handle_avb(0x00, Some([1,2,3,4,5,6,7,8]), 100, Some(0), Instant::now());
+        state.handle_avb(0x00, Some([1,2,3,4,5,6,7,8]), 100, Some(0), None, Instant::now());
         // UDP PTPv2 present but no L2 gPTP — AVB still affected.
         state.ptp.domains.insert((0, PTP_VERSION_V2), valid_ptp_stats(PTP_VERSION_V2, "PTPv2"));
         let missing = state.missing_ptp_clocks(&[ProtocolChoice::AVB]);
@@ -2788,7 +2859,7 @@ mod tests {
         // AVB count or create a phantom streams entry — both maps stay empty so the
         // overview count, the Streams list, and the gPTP gate all agree.
         let mut state = CaptureState::new();
-        state.handle_avb(0x7e, None, 100, None, Instant::now()); // 0x7e = MAAP
+        state.handle_avb(0x7e, None, 100, None, None, Instant::now()); // 0x7e = MAAP
         assert!(state.avb.avtp_streams.is_empty());
         assert!(!state.streams.keys().any(|k| k.starts_with("AVB")));
     }
@@ -2796,7 +2867,7 @@ mod tests {
     #[test]
     fn avb_media_frame_with_stream_id_creates_stream() {
         let mut state = CaptureState::new();
-        state.handle_avb(0x00, Some([1, 2, 3, 4, 5, 6, 7, 8]), 100, Some(0), Instant::now());
+        state.handle_avb(0x00, Some([1, 2, 3, 4, 5, 6, 7, 8]), 100, Some(0), None, Instant::now());
         assert_eq!(state.avb.avtp_streams.len(), 1);
         assert!(state.streams.keys().any(|k| k.starts_with("AVB")));
     }
@@ -3159,6 +3230,177 @@ mod tests {
         state.handle_dante(DanteKind::AudioStream, src, dst, 5100, &pkt60, Instant::now());
         let key = "Dante 192.168.1.50 → 192.168.1.60:5100";
         assert_eq!(state.streams[key].min_ttl, Some(60), "should track minimum over all packets");
+    }
+
+    // ── check_clock_dropout_correlation ────────────────────────────────────────
+
+    fn lost_ptpv1_state() -> PtpState {
+        let mut ps = PtpState::new();
+        let mut stats = PtpStats::new(0, PTP_VERSION_V1);
+        stats.protocol_clock_lost = true;
+        stats.protocol_kind = Some("PTPv1".to_string());
+        ps.domains.insert((0, PTP_VERSION_V1), stats);
+        ps
+    }
+
+    fn lost_ptpv2_state() -> PtpState {
+        let mut ps = PtpState::new();
+        let mut stats = PtpStats::new(0, PTP_VERSION_V2);
+        stats.protocol_clock_lost = true;
+        stats.protocol_kind = Some("PTPv2".to_string());
+        ps.domains.insert((0, PTP_VERSION_V2), stats);
+        ps
+    }
+
+    fn dante_stream_with_loss() -> StreamStats {
+        let mut s = StreamStats::new("Dante", crate::protocols::DEFAULT_CLOCK_HZ);
+        s.lost_this_window = 1;
+        s
+    }
+
+    fn aes67_stream_with_loss() -> StreamStats {
+        let mut s = StreamStats::new("AES67", 48_000.0);
+        s.lost_this_window = 1;
+        s
+    }
+
+    #[test]
+    fn clock_dropout_combined_fires_when_ptpv1_lost_and_dante_has_loss() {
+        let mut state = CaptureState::new();
+        state.ptp = lost_ptpv1_state();
+        state.streams.insert("Dante 1.2.3.4 → 5.6.7.8:5000".to_string(), dante_stream_with_loss());
+        assert!(state.check_clock_dropout_correlation().is_some());
+    }
+
+    #[test]
+    fn clock_dropout_combined_fires_when_ptpv2_lost_and_aes67_has_loss() {
+        let mut state = CaptureState::new();
+        state.ptp = lost_ptpv2_state();
+        state.streams.insert("AES67 239.69.0.1:5004".to_string(), aes67_stream_with_loss());
+        assert!(state.check_clock_dropout_correlation().is_some());
+    }
+
+    #[test]
+    fn clock_dropout_none_when_ptpv1_lost_but_no_stream_loss() {
+        let mut state = CaptureState::new();
+        state.ptp = lost_ptpv1_state();
+        let mut s = StreamStats::new("Dante", crate::protocols::DEFAULT_CLOCK_HZ);
+        s.lost_this_window = 0;
+        state.streams.insert("Dante 1.2.3.4 → 5.6.7.8:5000".to_string(), s);
+        assert!(state.check_clock_dropout_correlation().is_none());
+    }
+
+    #[test]
+    fn clock_dropout_none_when_stream_loss_but_clock_healthy() {
+        let mut state = CaptureState::new();
+        let mut stats = PtpStats::new(0, PTP_VERSION_V1);
+        stats.clock_valid = true;
+        stats.protocol_clock_lost = false;
+        state.ptp.domains.insert((0, PTP_VERSION_V1), stats);
+        state.streams.insert("Dante 1.2.3.4 → 5.6.7.8:5000".to_string(), dante_stream_with_loss());
+        assert!(state.check_clock_dropout_correlation().is_none());
+    }
+
+    #[test]
+    fn clock_dropout_none_when_wrong_protocol_family_has_loss() {
+        // PTPv2 lost but only a Dante stream has loss — no correlation
+        let mut state = CaptureState::new();
+        state.ptp = lost_ptpv2_state();
+        state.streams.insert("Dante 1.2.3.4 → 5.6.7.8:5000".to_string(), dante_stream_with_loss());
+        assert!(state.check_clock_dropout_correlation().is_none());
+    }
+
+    // ── PCP mismatch (Issue #26 — AVB) / advisory (Issue #27 — AES67/ST2110) ──
+
+    fn avb_stream_with_msrp(priority: u8) -> CaptureState {
+        let mut state = CaptureState::new();
+        let sid = [1u8, 2, 3, 4, 5, 6, 7, 8];
+        state.avb.msrp_state.insert(sid, crate::protocols::MsrpDeclaration {
+            stream_id: sid,
+            decl_type: crate::protocols::MsrpDeclType::TalkerAdvertise,
+            dest_mac: None,
+            vlan_id: Some(2),
+            max_frame_size: None,
+            max_interval_frames: None,
+            priority: Some(priority),
+            failure_code: None,
+            listener_state: None,
+        });
+        state
+    }
+
+    #[test]
+    fn pcp_mismatch_fires_when_pcp_differs_from_msrp() {
+        let mut state = avb_stream_with_msrp(3);
+        // AVTP frame arriving with PCP=2 (wrong — MSRP declared 3)
+        state.handle_avb(0x00, Some([1,2,3,4,5,6,7,8]), 100, Some(0), Some(2), Instant::now());
+        let s = state.streams.values().find(|s| s.protocol == "AVB").expect("stream");
+        assert_eq!(s.pcp_violations, 1);
+        assert_eq!(s.observed_pcp, Some(2));
+        assert_eq!(s.msrp_declared_pcp, Some(3));
+    }
+
+    #[test]
+    fn pcp_no_mismatch_when_pcp_matches_msrp() {
+        let mut state = avb_stream_with_msrp(3);
+        state.handle_avb(0x00, Some([1,2,3,4,5,6,7,8]), 100, Some(0), Some(3), Instant::now());
+        let s = state.streams.values().find(|s| s.protocol == "AVB").expect("stream");
+        assert_eq!(s.pcp_violations, 0);
+    }
+
+    #[test]
+    fn pcp_no_alert_without_vlan_tag() {
+        let mut state = avb_stream_with_msrp(3);
+        state.handle_avb(0x00, Some([1,2,3,4,5,6,7,8]), 100, Some(0), None, Instant::now());
+        let s = state.streams.values().find(|s| s.protocol == "AVB").expect("stream");
+        assert_eq!(s.pcp_violations, 0);
+    }
+
+    #[test]
+    fn pcp_no_alert_without_talker_advertise() {
+        let mut state = CaptureState::new();
+        // No MSRP entry for this stream_id
+        state.handle_avb(0x00, Some([1,2,3,4,5,6,7,8]), 100, Some(0), Some(2), Instant::now());
+        let s = state.streams.values().find(|s| s.protocol == "AVB").expect("stream");
+        assert_eq!(s.pcp_violations, 0);
+    }
+
+    #[test]
+    fn pcp_advisory_fires_for_aes67_with_wrong_pcp() {
+        let mut state = CaptureState::new();
+        let pkt = ip_udp_rtp(46 << 2, 5004, 96, 0, 0, 0xAAAA);
+        state.handle_aes67(Ipv4Addr::new(239, 69, 0, 1), 5004, 96, &pkt, Some(0));
+        let s = &state.streams["AES67 239.69.0.1:5004"];
+        assert_eq!(s.pcp_violations, 1);
+        assert_eq!(s.observed_pcp, Some(0));
+    }
+
+    #[test]
+    fn pcp_no_advisory_for_aes67_with_pcp6() {
+        let mut state = CaptureState::new();
+        let pkt = ip_udp_rtp(46 << 2, 5004, 96, 0, 0, 0xAAAA);
+        state.handle_aes67(Ipv4Addr::new(239, 69, 0, 1), 5004, 96, &pkt, Some(6));
+        let s = &state.streams["AES67 239.69.0.1:5004"];
+        assert_eq!(s.pcp_violations, 0);
+    }
+
+    #[test]
+    fn pcp_advisory_fires_for_st2110_with_wrong_pcp() {
+        let mut state = CaptureState::new();
+        let pkt = ip_udp_rtp(46 << 2, 5004, 96, 0, 0, 0xAAAA);
+        state.handle_st2110(Ipv4Addr::new(239, 1, 2, 3), 5004, St2110Type::Audio, &pkt, Some(3));
+        let s = state.streams.values().find(|s| s.protocol == "2110-30").expect("stream");
+        assert_eq!(s.pcp_violations, 1);
+        assert_eq!(s.observed_pcp, Some(3));
+    }
+
+    #[test]
+    fn pcp_no_advisory_for_untagged_aes67() {
+        let mut state = CaptureState::new();
+        let pkt = ip_udp_rtp(46 << 2, 5004, 96, 0, 0, 0xAAAA);
+        state.handle_aes67(Ipv4Addr::new(239, 69, 0, 1), 5004, 96, &pkt, None);
+        let s = &state.streams["AES67 239.69.0.1:5004"];
+        assert_eq!(s.pcp_violations, 0);
     }
 }
 
