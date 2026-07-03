@@ -730,9 +730,11 @@ mod tests {
     #[test]
     fn fpga_keepalive_port_classified_as_control_plane_hardware() {
         use crate::protocols::TransmitterClass;
+        // FPGA keepalive fingerprints on the DESTINATION port (61440–61951 overlaps
+        // the ephemeral source-port range, so a src port there must not match).
         let frame = eth_ip_udp(
             Ipv4Addr::new(192, 168, 1, 74), Ipv4Addr::new(192, 168, 1, 75),
-            61500, 50000, &[0u8; 16],
+            50000, 61500, &[0u8; 16],
         );
         let eth = EthernetPacket::new(&frame).unwrap();
         assert!(matches!(detect_protocol(&eth),

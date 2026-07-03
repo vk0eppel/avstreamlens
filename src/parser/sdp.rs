@@ -15,6 +15,12 @@ pub fn parse_sap_packet(payload: &[u8]) -> Option<SdpSession> {
     let version   = (payload[0] >> 5) & 0b111;
     if version != 1 { return None; }
 
+    // T bit (byte 0, bit 2): 0 = session announcement, 1 = session deletion.
+    // A deletion carries the SDP of a session that is going away — parsing it as an
+    // announcement would re-cache / re-apply that session's media, so ignore it.
+    let is_deletion = (payload[0] >> 2) & 0b1 == 1;
+    if is_deletion { return None; }
+
     let addr_type = (payload[0] >> 4) & 0b1;    // 0=IPv4, 1=IPv6
     let auth_len  = payload[1] as usize;
     let addr_len  = if addr_type == 0 { 4 } else { 16 };
@@ -218,5 +224,33 @@ mod tests {
     #[test]
     fn ts_refclk_localmac_returns_none() {
         assert!(parse_ts_refclk("localmac=00-1a-e5-ff-fe-12-34-56").is_none());
+    }
+
+    // ── SAP envelope: announcement vs deletion (T bit) ───────────────────────
+
+    fn sap_packet(t_bit: bool, sdp: &str) -> Vec<u8> {
+        // Byte 0: V=1 (bits 7-5), T (bit 2) = 1 for a session deletion.
+        let flags = 0x20 | if t_bit { 0x04 } else { 0x00 };
+        let mut pkt = vec![flags, 0x00, 0x00, 0x00, 1, 2, 3, 4]; // flags, auth_len=0, hash, src IPv4
+        pkt.extend_from_slice(sdp.as_bytes());
+        pkt
+    }
+
+    #[test]
+    fn sap_deletion_message_returns_none() {
+        // A SAP packet with the T bit set is a session *deletion*, not an
+        // announcement. Parsing it as an announcement would re-cache / re-apply the
+        // SDP for a session that is going away, so it must return None.
+        let sdp = "v=0\r\no=- 1 1 IN IP4 1.2.3.4\r\ns=X\r\nm=audio 5004 RTP/AVP 96\r\n";
+        assert!(parse_sap_packet(&sap_packet(true, sdp)).is_none(),
+            "SAP deletion (T=1) must not parse as an announcement");
+    }
+
+    #[test]
+    fn sap_announcement_message_parses() {
+        let sdp = "v=0\r\no=- 1 1 IN IP4 1.2.3.4\r\ns=X\r\nm=audio 5004 RTP/AVP 96\r\n";
+        let s = parse_sap_packet(&sap_packet(false, sdp)).expect("announcement should parse");
+        assert_eq!(s.media.len(), 1);
+        assert_eq!(s.media[0].port, 5004);
     }
 }

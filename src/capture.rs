@@ -146,6 +146,31 @@ impl DanteState {
             .collect()
     }
 
+    /// Upper bound on tracked Dante source IPs. These maps are keyed by (spoofable)
+    /// source IP and would otherwise grow without bound under an mDNS/ConMon flood,
+    /// exhausting memory in a root process. Far above any real deployment's device
+    /// count — purely a DoS backstop.
+    pub const MAX_SOURCES: usize = 4096;
+
+    /// Record a discovered source IP (and optional device name), keeping the
+    /// per-source maps bounded. When at capacity and the IP is new, one existing
+    /// entry is evicted first (source, name, and transmitter-class together) so a
+    /// flood of spoofed source IPs cannot grow the maps without limit. Returns
+    /// whether the IP was newly discovered (drives the discovery alert).
+    pub fn record_source(&mut self, ip: Ipv4Addr, name: Option<&str>) -> bool {
+        let is_new = !self.sources.contains(&ip);
+        if is_new && self.sources.len() >= Self::MAX_SOURCES
+            && let Some(&victim) = self.sources.iter().find(|v| **v != ip)
+        {
+            self.sources.remove(&victim);
+            self.names.remove(&victim);
+            self.transmitter_class.remove(&victim);
+        }
+        self.sources.insert(ip);
+        if let Some(n) = name { self.names.insert(ip, n.to_string()); }
+        is_new
+    }
+
     /// Record a Transmitter Class learned from control-plane traffic.
     /// DVS/Via are more specific than Hardware and overwrite it; Hardware never
     /// downgrades an existing DVS/Via verdict.
@@ -282,6 +307,25 @@ pub struct NdiState {
 impl NdiState {
     pub fn new() -> Self {
         Self { sources: HashSet::new(), names: HashMap::new() }
+    }
+
+    /// Upper bound on tracked NDI source IPs — see `DanteState::MAX_SOURCES`.
+    pub const MAX_SOURCES: usize = 4096;
+
+    /// Record a discovered NDI source IP (and optional name), keeping the maps
+    /// bounded against a spoofed-source-IP flood. Evicts one existing entry when at
+    /// capacity and the IP is new. Returns whether the IP was newly discovered.
+    pub fn record_source(&mut self, ip: Ipv4Addr, name: Option<&str>) -> bool {
+        let is_new = !self.sources.contains(&ip);
+        if is_new && self.sources.len() >= Self::MAX_SOURCES
+            && let Some(&victim) = self.sources.iter().find(|v| **v != ip)
+        {
+            self.sources.remove(&victim);
+            self.names.remove(&victim);
+        }
+        self.sources.insert(ip);
+        if let Some(n) = name { self.names.insert(ip, n.to_string()); }
+        is_new
     }
 }
 
@@ -558,6 +602,12 @@ impl Default for CaptureState {
 }
 
 impl CaptureState {
+    /// Upper bound on cached SDP sessions. `sdp_cache` is keyed by the SAP-supplied
+    /// session ID string (attacker-controlled) and is not otherwise pruned, so this
+    /// caps it against a flood of unique-ID announcements. Well above any real
+    /// deployment's session count.
+    pub const MAX_SDP_SESSIONS: usize = 1024;
+
     pub fn new() -> Self {
         Self {
             streams: HashMap::new(),
@@ -592,6 +642,9 @@ impl CaptureState {
         self.pfc_frames_this_window   = 0;
         self.packets_dispatched = 0;
         self.network_health.ecn_congestion_marks = 0;
+        // Window-scoped like ECN: a retransmission burst docks the score for this
+        // window only, then recovers. Leaving it cumulative permanently docked.
+        self.network_health.tcp_retransmissions = 0;
         for s in self.streams.values_mut() {
             s.gap_events      = 0;
             s.max_iat_ms      = 0.0;
@@ -638,25 +691,47 @@ impl CaptureState {
     /// whose port matches an announced media — see `StreamStats::apply_sdp`
     /// for the field-transfer rules.
     pub fn handle_sap(&mut self, sdp: SdpSession) {
+        // Enrich EVERY stream this announcement matches — not just the first. When
+        // the media carries a connection IP, require the stream's destination group
+        // to match it, so two streams sharing a port (different multicast groups)
+        // each get their own session's SDP rather than whichever the map yields
+        // first. Port-only fallback when no connection IP is present.
         for m in &sdp.media {
+            let conn_ip = m.connection_ip();
             for stats in self.streams.values_mut() {
-                if stats.dst_port == m.port {
+                if stats.dst_port == m.port
+                    && conn_ip.is_none_or(|ip| stats.dst_ip == Some(ip))
+                {
                     stats.apply_sdp(m, &sdp.session_name);
-                    break;
                 }
             }
         }
         // Queue any multicast stream addresses for dynamic IGMP joining.
-        // SDP connection field is "IN IP4 <addr>[/ttl]"; extract the IP.
         for m in &sdp.media {
-            let conn = m.connection.trim();
-            if let Some(addr_part) = conn.strip_prefix("IN IP4 ") {
-                let ip_str = addr_part.split('/').next().unwrap_or("").trim();
-                if let Ok(ip) = ip_str.parse::<Ipv4Addr>()
-                    && ip.octets()[0] == 239 && !self.joined_multicast.contains(&ip) {
-                    self.pending_join_groups.push(ip);
-                }
+            if let Some(ip) = m.connection_ip()
+                && ip.octets()[0] == 239 && !self.joined_multicast.contains(&ip) {
+                self.pending_join_groups.push(ip);
             }
+        }
+        self.cache_sdp(sdp);
+    }
+
+    /// Insert an SDP session into `sdp_cache`, keeping it bounded against a flood of
+    /// SAP announcements with unique (attacker-controlled) session IDs. When at
+    /// capacity and the session is new, evict a **stale** session first — one whose
+    /// media ports have no active stream — falling back to an arbitrary entry if all
+    /// cached sessions are still live.
+    fn cache_sdp(&mut self, sdp: SdpSession) {
+        if !self.sdp_cache.contains_key(&sdp.session_id)
+            && self.sdp_cache.len() >= Self::MAX_SDP_SESSIONS
+        {
+            let streams = &self.streams;
+            let victim = self.sdp_cache.iter()
+                .find(|(_, s)| !s.media.iter().any(|m|
+                    streams.values().any(|st| st.dst_port == m.port && st.packets > 0)))
+                .map(|(k, _)| k.clone())
+                .or_else(|| self.sdp_cache.keys().next().cloned());
+            if let Some(k) = victim { self.sdp_cache.remove(&k); }
         }
         self.sdp_cache.insert(sdp.session_id.clone(), sdp);
     }
@@ -771,15 +846,17 @@ impl CaptureState {
     /// destination port, paired with its session name. Used at stream creation
     /// to enrich a stream whose SDP was already announced before the first
     /// packet arrived — see `StreamStats::apply_sdp` for what gets transferred.
-    fn find_sdp_media(&self, port: u16) -> Option<(&str, &SdpMedia)> {
+    fn find_sdp_media(&self, dst: Ipv4Addr, port: u16) -> Option<(&str, &SdpMedia)> {
         self.sdp_cache.values()
-            .find_map(|s| s.media.iter().find(|m| m.port == port).map(|m| (s.session_name.as_str(), m)))
+            .find_map(|s| s.media.iter()
+                .find(|m| m.port == port && m.connection_ip().is_none_or(|ip| ip == dst))
+                .map(|m| (s.session_name.as_str(), m)))
     }
 
     /// AES67 RTP audio.
     pub fn handle_aes67(&mut self, dst: Ipv4Addr, dst_port: u16, payload_type: u8, l2_payload: &[u8], pcp: Option<u8>) {
         let key = format!("AES67 {}:{}", dst, dst_port);
-        let sdp_match = self.find_sdp_media(dst_port).map(|(name, m)| (name.to_string(), m.clone()));
+        let sdp_match = self.find_sdp_media(dst, dst_port).map(|(name, m)| (name.to_string(), m.clone()));
         let stats = self.streams.entry(key).or_insert_with(|| {
             let mut s = StreamStats::new_with_info("AES67", DEFAULT_CLOCK_HZ, is_aes67_multicast(dst), dst, dst_port);
             s.media_type = "audio".to_string();
@@ -819,7 +896,7 @@ impl CaptureState {
         };
         let key = format!("ST {} {}:{}", label, dst, dst_port);
         let default_clock = if matches!(stream_type, St2110Type::Video) { 90_000.0 } else { DEFAULT_CLOCK_HZ };
-        let sdp_match = self.find_sdp_media(dst_port).map(|(name, m)| (name.to_string(), m.clone()));
+        let sdp_match = self.find_sdp_media(dst, dst_port).map(|(name, m)| (name.to_string(), m.clone()));
         let stats = self.streams.entry(key).or_insert_with(|| {
             let mut s = StreamStats::new_with_info(label, default_clock, is_st2110_multicast(dst), dst, dst_port);
             s.media_type = match stream_type {
@@ -868,10 +945,8 @@ impl CaptureState {
         match kind {
             DanteKind::Discovery { device_name } => {
                 if self.local_ips.contains(&src) { return vec![]; }
-                let is_new = !self.dante.sources.contains(&src);
-                self.dante.sources.insert(src);
+                let is_new = self.dante.record_source(src, device_name.as_deref());
                 if let Some(ref name) = device_name {
-                    self.dante.names.insert(src, name.clone());
                     // Retroactive naming: a stream observed before this device's
                     // mDNS announcement was created nameless — backfill it now.
                     // Name is written once (same rule as SAP session names) so
@@ -904,7 +979,7 @@ impl CaptureState {
                 if channels.is_some() { entry.channels = channels; }
                 // ConMon proves a live Dante device even before (or without) mDNS —
                 // count it as a discovered source so the device list includes it.
-                self.dante.sources.insert(src);
+                self.dante.record_source(src, None);
                 // The "Audinate" ConMon signature is a positive Hardware tell.
                 self.dante.record_tx_class(src, TransmitterClass::Hardware);
                 vec![]
@@ -913,7 +988,7 @@ impl CaptureState {
                 // Product-specific control-plane traffic positively identifies the
                 // source's Transmitter Class. Proves a Dante device, like ConMon.
                 if !self.local_ips.contains(&src) {
-                    self.dante.sources.insert(src);
+                    self.dante.record_source(src, None);
                     self.dante.record_tx_class(src, class);
                 }
                 vec![]
@@ -981,10 +1056,7 @@ impl CaptureState {
     /// NDI mDNS discovery — registers the source IP and emits a discovery line.
     pub fn handle_ndi_discovery(&mut self, src: Ipv4Addr, source_name: Option<String>) -> Vec<Alert> {
         if self.local_ips.contains(&src) { return vec![]; }
-        self.ndi.sources.insert(src);
-        if let Some(ref name) = source_name {
-            self.ndi.names.insert(src, name.clone());
-        }
+        self.ndi.record_source(src, source_name.as_deref());
         let label = source_name.as_deref().unwrap_or("unknown source");
         vec![Alert::info(format!("🔍 NDI source: {}  \"{}\"", src, label))]
     }
@@ -1595,6 +1667,36 @@ mod tests {
         assert_eq!(s.ptime_ms, 1.0);
         assert_eq!(s.channels, 2);
         assert_eq!(s.sdp_name.as_deref(), Some("Test Mix"));
+    }
+
+    #[test]
+    fn sap_enriches_each_stream_by_its_connection_group_not_just_the_first() {
+        // Two AES67 streams share dst port 5004 but belong to different multicast
+        // groups, each announced by its own SAP session. Every stream must receive
+        // its OWN session's SDP; the old code enriched only the first stream that
+        // matched the port (then `break`) and left the rest nameless.
+        let mut state = CaptureState::new();
+        let group_a = Ipv4Addr::new(239, 69, 0, 1);
+        let group_b = Ipv4Addr::new(239, 69, 0, 2);
+        state.streams.insert("AES67 a".into(),
+            StreamStats::new_with_info("AES67", 48_000.0, true, group_a, 5004));
+        state.streams.insert("AES67 b".into(),
+            StreamStats::new_with_info("AES67", 48_000.0, true, group_b, 5004));
+
+        let mut sa = sdp_for_port(5004, 96, 48_000.0);
+        sa.session_id = "A".into();
+        sa.session_name = "Group A Mix".into();
+        sa.media[0].connection = "IN IP4 239.69.0.1".into();
+        state.handle_sap(sa);
+
+        let mut sb = sdp_for_port(5004, 96, 48_000.0);
+        sb.session_id = "B".into();
+        sb.session_name = "Group B Mix".into();
+        sb.media[0].connection = "IN IP4 239.69.0.2".into();
+        state.handle_sap(sb);
+
+        assert_eq!(state.streams["AES67 a"].sdp_name.as_deref(), Some("Group A Mix"));
+        assert_eq!(state.streams["AES67 b"].sdp_name.as_deref(), Some("Group B Mix"));
     }
 
     /// SAP re-announcement with changed technical fields (e.g. payload type) must
@@ -2642,7 +2744,69 @@ mod tests {
         assert_eq!(state.network_health.tcp_retransmissions, 1);
     }
 
+    #[test]
+    fn tcp_retransmission_penalty_is_window_scoped() {
+        // A retransmission burst docks the score this window, but the next clean
+        // window must recover it — same rule as ECN marks. Previously the counter
+        // feeding this penalty was cumulative and never reset, so one burst
+        // permanently docked the score for the rest of the run.
+        let mut state = CaptureState::new();
+        state.network_health.tcp_retransmissions = 20;
+
+        state.network_health.calculate_score(
+            &state.streams, &state.tcp_streams, &state.ptp.domains,
+            &state.avb.msrp_state, &state.eee_ports);
+        assert!(state.network_health.network_score < 100.0,
+            "retransmissions should dock the score this window");
+
+        state.reset_window();
+        state.network_health.calculate_score(
+            &state.streams, &state.tcp_streams, &state.ptp.domains,
+            &state.avb.msrp_state, &state.eee_ports);
+        assert_eq!(state.network_health.network_score, 100.0,
+            "score must recover after a clean window");
+    }
+
     // ── IGMP ─────────────────────────────────────────────────────────────────
+
+    // ── State-map bounds (memory-exhaustion DoS hardening) ───────────────────
+
+    #[test]
+    fn dante_sources_bounded_under_spoofed_ip_flood() {
+        let mut d = DanteState::new();
+        let cap = DanteState::MAX_SOURCES;
+        for i in 0..(cap as u32 + 50) {
+            d.record_source(Ipv4Addr::from(i), Some("nm"));
+        }
+        assert!(d.sources.len() <= cap, "sources bounded, got {}", d.sources.len());
+        assert!(d.names.len() <= cap, "names bounded, got {}", d.names.len());
+        let newest = Ipv4Addr::from(cap as u32 + 49);
+        assert!(d.sources.contains(&newest), "newest entry must be retained");
+    }
+
+    #[test]
+    fn ndi_sources_bounded_under_spoofed_ip_flood() {
+        let mut n = NdiState::new();
+        let cap = NdiState::MAX_SOURCES;
+        for i in 0..(cap as u32 + 50) {
+            n.record_source(Ipv4Addr::from(i), Some("nm"));
+        }
+        assert!(n.sources.len() <= cap, "sources bounded, got {}", n.sources.len());
+        assert!(n.names.len() <= cap);
+        assert!(n.sources.contains(&Ipv4Addr::from(cap as u32 + 49)));
+    }
+
+    #[test]
+    fn sdp_cache_bounded_under_session_id_flood() {
+        let mut state = CaptureState::new();
+        let cap = CaptureState::MAX_SDP_SESSIONS;
+        for i in 0..(cap + 50) {
+            let mut sdp = sdp_for_port(5004, 96, 48_000.0);
+            sdp.session_id = format!("sess-{i}");
+            state.handle_sap(sdp);
+        }
+        assert!(state.sdp_cache.len() <= cap, "sdp_cache bounded, got {}", state.sdp_cache.len());
+    }
 
     #[test]
     fn igmp_join_deduplicated() {
@@ -2980,7 +3144,6 @@ mod tests {
             port_id: None,
             sequence_id: 0,
             log_sync_interval: 0,
-            log_min_pdelay_req_interval: 0,
             protocol_kind: Some("PTPv2".to_string()),
             src_ip: None,
             stratum: None,
@@ -3001,7 +3164,6 @@ mod tests {
             port_id: None,
             sequence_id: 0,
             log_sync_interval: 0,
-            log_min_pdelay_req_interval: 0,
             protocol_kind: Some("AVB".to_string()),
             src_ip: None,
             stratum: None,
@@ -3117,7 +3279,6 @@ mod tests {
             port_id:                     Some(1),
             sequence_id:                 1,
             log_sync_interval:           0,
-            log_min_pdelay_req_interval: 0,
             protocol_kind:               Some("PTPv1".to_string()),
             src_ip:                      Some(src),
             stratum:                     Some(stratum),
