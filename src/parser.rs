@@ -563,6 +563,22 @@ mod tests {
         }
     }
 
+    #[test]
+    fn avdecc_adp_frame_not_classified_as_generic_avb() {
+        // detect_protocol_unwrapped checks payload[0] == 0xFA (AVDECC ADP, cd=1
+        // subtype=0x7A) before falling into the generic sv-bit AVTP path — pins
+        // that ordering so a future edit can't let ADP frames fall through and
+        // become phantom Avb streams with no stream_id.
+        let mut adp = vec![0xFAu8, 0x00]; // byte0 = 0xFA, message_type = AVAILABLE
+        adp.extend_from_slice(&[0u8; 62]); // pad past parse_adp's 49-byte minimum
+        let frame = eth_frame(&[0x22, 0xF0], &[], &adp);
+        let eth = EthernetPacket::new(&frame).unwrap();
+        assert!(
+            matches!(detect_protocol(&eth), Some(AvProtocol::AvdeccAdp(_))),
+            "byte0=0xFA must be classified as AvdeccAdp, never generic AvProtocol::Avb"
+        );
+    }
+
     // ── is_likely_dante_audio ────────────────────────────────────────────────
 
     #[test]
@@ -630,6 +646,22 @@ mod tests {
         assert!(matches!(detect_protocol(&eth),
             Some(AvProtocol::Dante { kind: DanteKind::AudioStream, .. })),
             "multicast Dante must not be misclassified as ST2110");
+    }
+
+    #[test]
+    fn dante_port_heuristic_wins_over_aes67_multicast_address() {
+        // is_likely_dante_audio (parser.rs) checks only ports, never dst_ip — it
+        // runs before the is_aes67_multicast check in detect_protocol_unwrapped.
+        // A stream addressed to AES67's own 239.69.0.0/16 block, but using both
+        // ports in Dante's strict 5000-6000-even range, is classified Dante, not
+        // AES67. This pins that current, easy-to-miss ordering fact rather than
+        // changing it — unlike the Dante/ST2110 zone documented in ADR-0001, this
+        // collision has no device-discovery tie-breaker today.
+        let frame = eth_ip_udp_rtp(Ipv4Addr::new(239, 69, 0, 1), 5002, 5004, 96);
+        let eth = EthernetPacket::new(&frame).unwrap();
+        assert!(matches!(detect_protocol(&eth),
+            Some(AvProtocol::Dante { kind: DanteKind::AudioStream, .. })),
+            "Dante's port-only heuristic takes priority over the AES67 IP block");
     }
 
     #[test]

@@ -21,7 +21,7 @@ use crate::parser::{is_aes67_multicast, is_st2110_multicast, parse_rtp};
 use crate::protocols::{
     AvProtocol, AvdeccAdp, DanteKind, FlowControlKind, IgmpType, MsrpDeclType, MsrpDeclaration,
     NdiKind, ProtocolChoice, PtpInfo, SdpMedia, SdpSession, St2110Type, TransmitterClass, DEFAULT_CLOCK_HZ,
-    PTP_VERSION_V1, PTP_VERSION_V2, STREAM_TIMEOUT_SECS, avtp_subtype_name, classify_transmitter, msrp_failure_reason,
+    PTP_VERSION_V1, PTP_VERSION_V2, STREAM_TIMEOUT_SECS, classify_transmitter, msrp_failure_reason,
 };
 use crate::report::Logger;
 use crate::stats::{
@@ -687,6 +687,17 @@ impl CaptureState {
 
     // ── Handlers ────────────────────────────────────────────────────────────
 
+    /// Queue `group` for dynamic IGMP join if it's a candidate stream multicast
+    /// address (239.x.x.x) not already joined. The single seam for this guard —
+    /// previously hand-copied in `handle_sap` and `handle_igmp`'s
+    /// `MembershipReportV3` arm, which risked the two diverging on what counts
+    /// as a joinable group.
+    pub fn queue_multicast_join(&mut self, group: Ipv4Addr) {
+        if group.octets()[0] == 239 && !self.joined_multicast.contains(&group) {
+            self.pending_join_groups.push(group);
+        }
+    }
+
     /// SAP/SDP: cache the SDP and retroactively enrich any existing stream
     /// whose port matches an announced media — see `StreamStats::apply_sdp`
     /// for the field-transfer rules.
@@ -708,9 +719,8 @@ impl CaptureState {
         }
         // Queue any multicast stream addresses for dynamic IGMP joining.
         for m in &sdp.media {
-            if let Some(ip) = m.connection_ip()
-                && ip.octets()[0] == 239 && !self.joined_multicast.contains(&ip) {
-                self.pending_join_groups.push(ip);
+            if let Some(ip) = m.connection_ip() {
+                self.queue_multicast_join(ip);
             }
         }
         self.cache_sdp(sdp);
@@ -872,11 +882,7 @@ impl CaptureState {
             // AES67 requires DSCP EF (46) per spec
             if ip.get_dscp() != 46 { stats.dscp_violations += 1; }
             if ip.get_ecn() == 3 { self.network_health.ecn_congestion_marks += 1; }
-            // PCP=6 is the IEEE 802.1p priority recommended for AES67 on managed switches
-            if let Some(p) = pcp && p != 6 {
-                stats.pcp_violations += 1;
-                stats.observed_pcp.get_or_insert(p);
-            }
+            stats.apply_pcp_advisory(pcp);
             if let Some((seq, ts, ssrc)) = parse_rtp(udp.payload()) {
                 if stats.expected_pt.is_some_and(|exp| payload_type != exp) {
                     stats.pt_mismatches += 1;
@@ -925,11 +931,7 @@ impl CaptureState {
             };
             if !dscp_ok { stats.dscp_violations += 1; }
             if ip.get_ecn() == 3 { self.network_health.ecn_congestion_marks += 1; }
-            // PCP=6 is the IEEE 802.1p priority recommended for ST2110 on managed switches
-            if let Some(p) = pcp && p != 6 {
-                stats.pcp_violations += 1;
-                stats.observed_pcp.get_or_insert(p);
-            }
+            stats.apply_pcp_advisory(pcp);
             if let Some((seq, ts, ssrc)) = parse_rtp(udp.payload()) {
                 let rtp_pt = udp.payload()[1] & 0x7F;
                 if stats.expected_pt.is_some_and(|exp| rtp_pt != exp) {
@@ -1129,22 +1131,6 @@ impl CaptureState {
         // (Their bytes still count toward bandwidth via bytes_this_window in main.rs.)
         let Some(sid) = stream_id else { return; };
 
-        let label = avtp_subtype_name(subtype);
-        let stats = self.streams.entry(format!("AVB {}", label))
-            .or_insert_with(|| StreamStats::new("AVB", 0.0));
-        stats.packets += 1;
-        stats.last_packet_time = Some(now);
-        // Aggregate bitrate from Ethernet frame size
-        stats.bytes_total += frame_bytes;
-        let elapsed = stats.last_bitrate_check.elapsed();
-        if elapsed > Duration::from_secs(1) {
-            let delta = stats.bytes_total.saturating_sub(stats.bytes_at_check);
-            stats.bitrate_bps = (delta as f64 * 8.0 / elapsed.as_secs_f64()) as u64;
-            stats.bytes_at_check = stats.bytes_total;
-            stats.packets_at_check = stats.packets;
-            stats.last_bitrate_check = now;
-        }
-
         let entry = self.avb.avtp_streams.entry(sid)
             .or_insert_with(|| AvtpStreamStats::new(sid, subtype));
         entry.packets += 1;
@@ -1155,16 +1141,16 @@ impl CaptureState {
         // PCP mismatch: compare observed outermost VLAN tag PCP against the
         // priority declared in the MSRP TalkerAdvertise for this stream_id.
         // Only fires when both values are known and they differ; untagged frames
-        // (pcp = None) produce no alert.
-        let key = format!("AVB {}", avtp_subtype_name(subtype));
-        if let Some(stream_stats) = self.streams.get_mut(&key)
-            && let Some(observed) = pcp
+        // (pcp = None) produce no alert. Tracked per stream_id on AvtpStreamStats
+        // itself — never on a subtype-label-keyed aggregate, so two distinct
+        // stream_ids sharing a subtype can't corrupt each other's PCP state.
+        if let Some(observed) = pcp
             && let Some(declared) = self.avb.msrp_state.get(&sid).and_then(|d| d.priority)
             && observed != declared
         {
-            stream_stats.pcp_violations += 1;
-            stream_stats.observed_pcp.get_or_insert(observed);
-            stream_stats.msrp_declared_pcp = Some(declared);
+            entry.pcp_violations += 1;
+            entry.observed_pcp.get_or_insert(observed);
+            entry.msrp_declared_pcp = Some(declared);
         }
     }
 
@@ -1236,9 +1222,7 @@ impl CaptureState {
                 // Queue new 239.x.x.x groups for dynamic joining so IGMP-snooping
                 // switches deliver those streams to our capture port.
                 for group in groups {
-                    if group.octets()[0] == 239 && !self.joined_multicast.contains(&group) {
-                        self.pending_join_groups.push(group);
-                    }
+                    self.queue_multicast_join(group);
                 }
                 self.igmp.v3_report_seen_this_window = true;
                 // No console output — infrastructure detail, not user-visible.
@@ -1415,8 +1399,7 @@ impl CaptureState {
         let st2110_active = expanded.iter().any(|c| matches!(c, ProtocolChoice::ST2110))
             && self.streams.values().any(|s| s.protocol.starts_with("2110-"));
         let has_ptpv2 = self.ptp.domains.values().any(|s|
-            s.clock_valid && s.version == PTP_VERSION_V2
-            && s.protocol_kind.as_deref() != Some("AVB"));
+            s.clock_valid && s.version == PTP_VERSION_V2 && s.is_ip_ptp_domain());
         if (aes67_active || st2110_active) && !has_ptpv2 {
             let mut affected = Vec::new();
             if aes67_active  { affected.push("AES67"); }
@@ -1429,8 +1412,7 @@ impl CaptureState {
             && self.streams.values().any(|s| s.protocol == "Dante");
         // Dante needs PTPv1/PTPv2 on the IP network — an L2 gPTP (AVB) clock does
         // not satisfy it, so exclude AVB domains just like the PTPv2 check above.
-        let has_ptp = self.ptp.domains.values().any(|s|
-            s.clock_valid && s.protocol_kind.as_deref() != Some("AVB"));
+        let has_ptp = self.ptp.domains.values().any(|s| s.clock_valid && s.is_ip_ptp_domain());
         if dante_active && !has_ptp {
             missing.push(MissingClock { kind: MissingClockKind::Ptp, affected: vec!["Dante"] });
         }
@@ -1438,8 +1420,7 @@ impl CaptureState {
         // ── L2 gPTP (AVB) ────────────────────────────────────────────────────
         let avb_active = expanded.iter().any(|c| matches!(c, ProtocolChoice::AVB))
             && !self.avb.avtp_streams.is_empty();
-        let has_gptp = self.ptp.domains.values().any(|s|
-            s.clock_valid && s.protocol_kind.as_deref() == Some("AVB"));
+        let has_gptp = self.ptp.domains.values().any(|s| s.clock_valid && s.is_gptp_domain());
         if avb_active && !has_gptp {
             missing.push(MissingClock { kind: MissingClockKind::Gptp, affected: vec!["AVB"] });
         }
@@ -1456,13 +1437,9 @@ impl CaptureState {
     /// the current window's state.
     pub fn check_clock_dropout_correlation(&self) -> Option<Alert> {
         let ptpv1_lost = self.ptp.domains.values().any(|s|
-            s.protocol_clock_lost
-            && s.version == PTP_VERSION_V1
-            && s.protocol_kind.as_deref() != Some("AVB"));
+            s.protocol_clock_lost && s.version == PTP_VERSION_V1 && s.is_ip_ptp_domain());
         let ptpv2_lost = self.ptp.domains.values().any(|s|
-            s.protocol_clock_lost
-            && s.version == PTP_VERSION_V2
-            && s.protocol_kind.as_deref() != Some("AVB"));
+            s.protocol_clock_lost && s.version == PTP_VERSION_V2 && s.is_ip_ptp_domain());
 
         if !ptpv1_lost && !ptpv2_lost {
             return None;
@@ -1697,6 +1674,44 @@ mod tests {
 
         assert_eq!(state.streams["AES67 a"].sdp_name.as_deref(), Some("Group A Mix"));
         assert_eq!(state.streams["AES67 b"].sdp_name.as_deref(), Some("Group B Mix"));
+    }
+
+    // ── queue_multicast_join — single seam for the dynamic-IGMP-join guard ────
+    // Previously hand-copied identically in handle_sap and handle_igmp's
+    // MembershipReportV3 arm; see CLAUDE.md's documented DSCP/PCP divergence bugs
+    // for why a duplicated guard like this is worth naming instead of repeating.
+
+    #[test]
+    fn queue_multicast_join_queues_new_239_group() {
+        let mut state = CaptureState::new();
+        let group = Ipv4Addr::new(239, 1, 2, 3);
+        state.queue_multicast_join(group);
+        assert_eq!(state.pending_join_groups, vec![group]);
+    }
+
+    #[test]
+    fn queue_multicast_join_skips_already_joined_group() {
+        let mut state = CaptureState::new();
+        let group = Ipv4Addr::new(239, 1, 2, 3);
+        state.joined_multicast.insert(group);
+        state.queue_multicast_join(group);
+        assert!(state.pending_join_groups.is_empty());
+    }
+
+    #[test]
+    fn queue_multicast_join_skips_non_239_group() {
+        let mut state = CaptureState::new();
+        state.queue_multicast_join(Ipv4Addr::new(224, 0, 0, 1));
+        assert!(state.pending_join_groups.is_empty());
+    }
+
+    #[test]
+    fn handle_sap_queues_multicast_connection_ip_via_queue_multicast_join() {
+        let mut state = CaptureState::new();
+        let mut sdp = sdp_for_port(5004, 96, 48_000.0);
+        sdp.media[0].connection = "IN IP4 239.69.0.1".into();
+        state.handle_sap(sdp);
+        assert_eq!(state.pending_join_groups, vec![Ipv4Addr::new(239, 69, 0, 1)]);
     }
 
     /// SAP re-announcement with changed technical fields (e.g. payload type) must
@@ -2679,6 +2694,62 @@ mod tests {
         assert_eq!(state.ndi.names.get(&src).map(|s| s.as_str()), Some("Studio Cam"));
     }
 
+    // ── aggregate_ndi_bitrate — flagged by TODO.md as an open risk area ──────
+    // ("verify it doesn't double-count" across multiple tcp_streams per source).
+
+    #[test]
+    fn aggregate_ndi_bitrate_sums_multiple_tcp_streams_for_one_source() {
+        let mut state = CaptureState::new();
+        let ndi_ip = Ipv4Addr::new(192, 168, 1, 60);
+        let other_host = Ipv4Addr::new(192, 168, 1, 5);
+        state.streams.insert("NDI a".into(),
+            StreamStats::new_with_info("NDI", 0.0, false, ndi_ip, 0));
+
+        let mut t1 = crate::stats::TcpStreamStats::new(ndi_ip, other_host);
+        t1.bitrate_bps = 1_000_000;
+        state.tcp_streams.insert("t1".into(), t1);
+
+        let mut t2 = crate::stats::TcpStreamStats::new(other_host, ndi_ip);
+        t2.bitrate_bps = 2_500_000;
+        state.tcp_streams.insert("t2".into(), t2);
+
+        state.aggregate_ndi_bitrate();
+
+        assert_eq!(state.streams["NDI a"].bitrate_bps, 3_500_000,
+            "must sum every tcp_streams entry touching the NDI source, not just one");
+    }
+
+    #[test]
+    fn aggregate_ndi_bitrate_ignores_tcp_streams_for_other_ips() {
+        let mut state = CaptureState::new();
+        let ndi_ip = Ipv4Addr::new(192, 168, 1, 60);
+        let unrelated_a = Ipv4Addr::new(192, 168, 1, 5);
+        let unrelated_b = Ipv4Addr::new(192, 168, 1, 6);
+        state.streams.insert("NDI a".into(),
+            StreamStats::new_with_info("NDI", 0.0, false, ndi_ip, 0));
+
+        let mut unrelated = crate::stats::TcpStreamStats::new(unrelated_a, unrelated_b);
+        unrelated.bitrate_bps = 9_999_999;
+        state.tcp_streams.insert("unrelated".into(), unrelated);
+
+        state.aggregate_ndi_bitrate();
+
+        assert_eq!(state.streams["NDI a"].bitrate_bps, 0,
+            "a tcp_streams entry not touching the NDI source IP must not contribute");
+    }
+
+    #[test]
+    fn aggregate_ndi_bitrate_is_a_noop_with_no_matching_tcp_streams() {
+        let mut state = CaptureState::new();
+        let ndi_ip = Ipv4Addr::new(192, 168, 1, 60);
+        state.streams.insert("NDI a".into(),
+            StreamStats::new_with_info("NDI", 0.0, false, ndi_ip, 0));
+
+        state.aggregate_ndi_bitrate();
+
+        assert_eq!(state.streams["NDI a"].bitrate_bps, 0);
+    }
+
     fn tcp_segment(src: Ipv4Addr, dst: Ipv4Addr, src_port: u16, dst_port: u16, seq: u32) -> crate::protocols::TcpSegment {
         crate::protocols::TcpSegment {
             src, dst, src_port, dst_port, seq, ack: 0,
@@ -2755,14 +2826,14 @@ mod tests {
 
         state.network_health.calculate_score(
             &state.streams, &state.tcp_streams, &state.ptp.domains,
-            &state.avb.msrp_state, &state.eee_ports);
+            &state.avb.msrp_state, &state.eee_ports, &state.avb.avtp_streams);
         assert!(state.network_health.network_score < 100.0,
             "retransmissions should dock the score this window");
 
         state.reset_window();
         state.network_health.calculate_score(
             &state.streams, &state.tcp_streams, &state.ptp.domains,
-            &state.avb.msrp_state, &state.eee_ports);
+            &state.avb.msrp_state, &state.eee_ports, &state.avb.avtp_streams);
         assert_eq!(state.network_health.network_score, 100.0,
             "score must recover after a clean window");
     }
@@ -3020,12 +3091,12 @@ mod tests {
     #[test]
     fn avb_control_frame_without_stream_id_creates_no_stream() {
         // An sv=0 AVTP control/discovery frame (no stream id) must not inflate the
-        // AVB count or create a phantom streams entry — both maps stay empty so the
-        // overview count, the Streams list, and the gPTP gate all agree.
+        // AVB count — avtp_streams stays empty so the overview count, the Streams
+        // list, and the gPTP gate all agree. AVB media never touches the generic
+        // `streams` map at all (see avb_media_never_creates_generic_stream_entry).
         let mut state = CaptureState::new();
         state.handle_avb(0x7e, None, 100, None, None, Instant::now()); // 0x7e = MAAP
         assert!(state.avb.avtp_streams.is_empty());
-        assert!(!state.streams.keys().any(|k| k.starts_with("AVB")));
     }
 
     #[test]
@@ -3033,7 +3104,17 @@ mod tests {
         let mut state = CaptureState::new();
         state.handle_avb(0x00, Some([1, 2, 3, 4, 5, 6, 7, 8]), 100, Some(0), None, Instant::now());
         assert_eq!(state.avb.avtp_streams.len(), 1);
-        assert!(state.streams.keys().any(|k| k.starts_with("AVB")));
+    }
+
+    #[test]
+    fn avb_media_never_creates_generic_stream_entry() {
+        // AVB media is tracked solely on avtp_streams (keyed by stream_id) — it must
+        // never also populate the generic `streams` map, which used to hold a
+        // subtype-label-keyed StreamStats aggregate that the report layer silently
+        // skipped rendering (report.rs used to `continue` past "AVB "-prefixed keys).
+        let mut state = CaptureState::new();
+        state.handle_avb(0x00, Some([1, 2, 3, 4, 5, 6, 7, 8]), 100, Some(0), None, Instant::now());
+        assert!(state.streams.is_empty());
     }
 
     // ── Flow control (PAUSE / PFC) ──────────────────────────────────────────
@@ -3491,11 +3572,43 @@ mod tests {
     }
 
     #[test]
+    fn pcp_violation_tracked_per_stream_id_not_shared_by_subtype_label() {
+        // Two distinct AVB streams sharing the same subtype (0x00 = IEC 61883) must
+        // not share PCP violation state just because they'd render under the same
+        // "AVB {label}" grouping — each stream_id gets its own AvtpStreamStats entry.
+        let mut state = CaptureState::new();
+        let sid_a = [1u8, 2, 3, 4, 5, 6, 7, 8];
+        let sid_b = [9u8, 9, 9, 9, 9, 9, 9, 9];
+        for (sid, priority) in [(sid_a, 3u8), (sid_b, 3u8)] {
+            state.avb.msrp_state.insert(sid, crate::protocols::MsrpDeclaration {
+                stream_id: sid,
+                decl_type: crate::protocols::MsrpDeclType::TalkerAdvertise,
+                dest_mac: None,
+                vlan_id: Some(2),
+                max_frame_size: None,
+                max_interval_frames: None,
+                priority: Some(priority),
+                failure_code: None,
+                listener_state: None,
+            });
+        }
+        state.handle_avb(0x00, Some(sid_a), 100, Some(0), Some(2), Instant::now()); // mismatch
+        state.handle_avb(0x00, Some(sid_b), 100, Some(0), Some(3), Instant::now()); // matches
+
+        let a = &state.avb.avtp_streams[&sid_a];
+        let b = &state.avb.avtp_streams[&sid_b];
+        assert_eq!(a.pcp_violations, 1);
+        assert_eq!(a.observed_pcp, Some(2));
+        assert_eq!(a.msrp_declared_pcp, Some(3));
+        assert_eq!(b.pcp_violations, 0);
+    }
+
+    #[test]
     fn pcp_mismatch_fires_when_pcp_differs_from_msrp() {
         let mut state = avb_stream_with_msrp(3);
         // AVTP frame arriving with PCP=2 (wrong — MSRP declared 3)
         state.handle_avb(0x00, Some([1,2,3,4,5,6,7,8]), 100, Some(0), Some(2), Instant::now());
-        let s = state.streams.values().find(|s| s.protocol == "AVB").expect("stream");
+        let s = &state.avb.avtp_streams[&[1,2,3,4,5,6,7,8]];
         assert_eq!(s.pcp_violations, 1);
         assert_eq!(s.observed_pcp, Some(2));
         assert_eq!(s.msrp_declared_pcp, Some(3));
@@ -3505,7 +3618,7 @@ mod tests {
     fn pcp_no_mismatch_when_pcp_matches_msrp() {
         let mut state = avb_stream_with_msrp(3);
         state.handle_avb(0x00, Some([1,2,3,4,5,6,7,8]), 100, Some(0), Some(3), Instant::now());
-        let s = state.streams.values().find(|s| s.protocol == "AVB").expect("stream");
+        let s = &state.avb.avtp_streams[&[1,2,3,4,5,6,7,8]];
         assert_eq!(s.pcp_violations, 0);
     }
 
@@ -3513,7 +3626,7 @@ mod tests {
     fn pcp_no_alert_without_vlan_tag() {
         let mut state = avb_stream_with_msrp(3);
         state.handle_avb(0x00, Some([1,2,3,4,5,6,7,8]), 100, Some(0), None, Instant::now());
-        let s = state.streams.values().find(|s| s.protocol == "AVB").expect("stream");
+        let s = &state.avb.avtp_streams[&[1,2,3,4,5,6,7,8]];
         assert_eq!(s.pcp_violations, 0);
     }
 
@@ -3522,7 +3635,7 @@ mod tests {
         let mut state = CaptureState::new();
         // No MSRP entry for this stream_id
         state.handle_avb(0x00, Some([1,2,3,4,5,6,7,8]), 100, Some(0), Some(2), Instant::now());
-        let s = state.streams.values().find(|s| s.protocol == "AVB").expect("stream");
+        let s = &state.avb.avtp_streams[&[1,2,3,4,5,6,7,8]];
         assert_eq!(s.pcp_violations, 0);
     }
 

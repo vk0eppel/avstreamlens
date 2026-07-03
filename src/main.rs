@@ -249,6 +249,113 @@ struct LiveConfig<'a> {
     mc_joined:     &'a mut HashSet<Ipv4Addr>,
 }
 
+/// Offline replay's report-timing decision: a report fires every 5 seconds of
+/// *pcap* time (the packet's own timestamp), not wall-clock time — extracted out
+/// of `run_loop` so the decision is testable without a real pcap capture. Live
+/// capture's report timing stays a plain wall-clock check in `run_loop` (it has
+/// no per-packet state to extract).
+#[derive(Default)]
+struct OfflineReportClock {
+    last_report_pcap: i64,
+    initialized: bool,
+}
+
+impl OfflineReportClock {
+    /// `true` exactly when at least 5 seconds of pcap time have elapsed since the
+    /// last report (or since the first packet, for the first window). Rebases
+    /// its baseline every time it returns `true`.
+    fn should_report(&mut self, pkt_ts: i64) -> bool {
+        if !self.initialized {
+            self.last_report_pcap = pkt_ts;
+            self.initialized = true;
+            return false;
+        }
+        if pkt_ts - self.last_report_pcap >= 5 {
+            self.last_report_pcap = pkt_ts;
+            return true;
+        }
+        false
+    }
+}
+
+/// Per-packet dispatch + network-health tracking — takes an already-parsed
+/// `EthernetPacket`, never a raw `pcap::Packet` or `Capture<T>`, so it's testable
+/// with hand-built frames the same way `capture.rs`'s `handle_*` methods are.
+/// Excludes the join-drain (see `drain_pending_joins`) and report-timing
+/// decisions, which are `run_loop`'s own per-cycle concerns, not per-packet ones.
+fn process_packet(
+    state: &mut CaptureState,
+    eth: &EthernetPacket,
+    expanded_protocols: &[protocols::ProtocolChoice],
+    now: Instant,
+    logger: &mut crate::report::Logger,
+) {
+    let (l2_et, l2_pcp, l2_payload) = unwrap_vlan(eth).unwrap_or((0, None, &[][..]));
+    let frame_bytes = eth.packet().len() as u64;
+
+    state.packets_dispatched += 1;
+    // Reuse the VLAN unwrap above instead of letting detect_protocol walk the
+    // tag stack a second time on every packet.
+    if let Some(proto) = detect_protocol_unwrapped(eth, l2_et, l2_payload)
+        && proto.is_selected(expanded_protocols)
+    {
+        capture::dispatch(state, proto, l2_payload, l2_pcp, frame_bytes, now, logger);
+    }
+
+    // ── IPv4 parse for multicast/unicast health tracking ─────────────────
+    let outer_ip = if l2_et == 0x0800 {
+        pnet_packet::ipv4::Ipv4Packet::new(l2_payload)
+    } else {
+        None
+    };
+
+    // ── Network health tracking ───────────────────────────────────────────
+    state.network_health.total_packets += 1;
+    state.bytes_this_window += frame_bytes;
+    if let Some(ref ip) = outer_ip {
+        if is_multicast(ip.get_destination()) {
+            state.network_health.multicast_packets += 1;
+            state.multicast_bytes_this_window += frame_bytes;
+        } else {
+            state.network_health.unicast_packets += 1;
+        }
+    }
+}
+
+/// Drain `state.pending_join_groups`, joining any newly-learned stream
+/// multicast group on the live capture interface. A no-op (beyond clearing the
+/// queue) in offline replay, where joining a group is meaningless — there is no
+/// live interface to join on. Takes `Option<&mut LiveConfig>` rather than the
+/// pcap `Capture<T>` itself, so it only depends on the socket/group bookkeeping.
+fn drain_pending_joins(
+    state: &mut CaptureState,
+    live: Option<&mut LiveConfig<'_>>,
+    expanded_protocols: &[protocols::ProtocolChoice],
+    logger: &mut crate::report::Logger,
+) {
+    if let Some(lc) = live {
+        for group in state.pending_join_groups.drain(..) {
+            if should_join_group(&group, expanded_protocols) && !lc.mc_joined.contains(&group) {
+                match UdpSocket::bind("0.0.0.0:0")
+                    .and_then(|s| { s.join_multicast_v4(&group, &lc.iface_ip)?; Ok(s) })
+                {
+                    Ok(s) => {
+                        lc.mc_joined.insert(group);
+                        state.joined_multicast.insert(group);
+                        lc.mc_sockets.push(s);
+                        logger.log(&format!("   ✓ Joined stream multicast {}", group));
+                    }
+                    Err(e) => {
+                        logger.log(&format!("   ⚠ Could not join {} — {}", group, e));
+                    }
+                }
+            }
+        }
+    } else {
+        state.pending_join_groups.clear();
+    }
+}
+
 /// Unified capture loop for live (`Capture<Active>`) and offline (`Capture<Offline>`).
 ///
 /// Live mode:   5s wall-clock timer drives reports; `TimeoutExpired` continues;
@@ -265,8 +372,7 @@ fn run_loop<T: Activated>(
 ) {
     let is_offline = live.is_none();
     let mut last_report      = Instant::now();
-    let mut last_report_pcap = 0i64;   // pcap seconds; initialised on first packet
-    let mut pcap_ts_init     = false;
+    let mut offline_clock    = OfflineReportClock::default();
     let run_start            = Instant::now();
     // Session-lifetime report config: `quiet` is fixed; `no_flows_diagnostic_shown`
     // latches after the no-active-flows diagnostic first appears.
@@ -310,73 +416,15 @@ fn run_loop<T: Activated>(
         let pkt_ts = packet.header.ts.tv_sec as i64;
 
         let eth = match EthernetPacket::new(packet.data) { Some(e) => e, _ => continue };
-        let now = Instant::now();
-        let (l2_et, l2_pcp, l2_payload) = unwrap_vlan(&eth).unwrap_or((0, None, &[][..]));
-        let frame_bytes = eth.packet().len() as u64;
-
-        state.packets_dispatched += 1;
-        // Reuse the VLAN unwrap above instead of letting detect_protocol walk the
-        // tag stack a second time on every packet.
-        if let Some(proto) = detect_protocol_unwrapped(&eth, l2_et, l2_payload)
-            && proto.is_selected(expanded_protocols)
-        {
-            capture::dispatch(state, proto, l2_payload, l2_pcp, frame_bytes, now, logger);
-        }
-
-        // ── Dynamic IGMP joins (live only) ───────────────────────────────────
-        if let Some(ref mut lc) = live {
-            for group in state.pending_join_groups.drain(..) {
-                if should_join_group(&group, expanded_protocols) && !lc.mc_joined.contains(&group) {
-                    match UdpSocket::bind("0.0.0.0:0")
-                        .and_then(|s| { s.join_multicast_v4(&group, &lc.iface_ip)?; Ok(s) })
-                    {
-                        Ok(s) => {
-                            lc.mc_joined.insert(group);
-                            state.joined_multicast.insert(group);
-                            lc.mc_sockets.push(s);
-                            logger.log(&format!("   ✓ Joined stream multicast {}", group));
-                        }
-                        Err(e) => {
-                            logger.log(&format!("   ⚠ Could not join {} — {}", group, e));
-                        }
-                    }
-                }
-            }
-        } else {
-            state.pending_join_groups.clear();
-        }
-
-        // ── IPv4 parse for multicast/unicast health tracking ─────────────────
-        let outer_ip = if l2_et == 0x0800 {
-            pnet_packet::ipv4::Ipv4Packet::new(l2_payload)
-        } else {
-            None
-        };
-
-        // ── Network health tracking ───────────────────────────────────────────
-        state.network_health.total_packets += 1;
-        state.bytes_this_window += frame_bytes;
-        if let Some(ref ip) = outer_ip {
-            if is_multicast(ip.get_destination()) {
-                state.network_health.multicast_packets += 1;
-                state.multicast_bytes_this_window += frame_bytes;
-            } else {
-                state.network_health.unicast_packets += 1;
-            }
-        }
+        process_packet(state, &eth, expanded_protocols, Instant::now(), logger);
+        drain_pending_joins(state, live.as_mut(), expanded_protocols, logger);
 
         // ── Offline: report based on pcap timestamp ───────────────────────────
         // eth/outer_ip are no longer used past this point — NLL ends their borrows
         // of packet.data before we access pkt_ts (which was copied earlier).
-        if is_offline {
-            if !pcap_ts_init {
-                last_report_pcap = pkt_ts;
-                pcap_ts_init = true;
-            } else if pkt_ts - last_report_pcap >= 5 {
-                emit_periodic_alerts(state, is_offline, logger);
-                do_report(state, expanded_protocols, None, &mut session, logger);
-                last_report_pcap = pkt_ts;
-            }
+        if is_offline && offline_clock.should_report(pkt_ts) {
+            emit_periodic_alerts(state, is_offline, logger);
+            do_report(state, expanded_protocols, None, &mut session, logger);
         }
     }
 }
@@ -421,7 +469,7 @@ fn do_report(
 
     state.network_health.calculate_score(
         &state.streams, &state.tcp_streams, &state.ptp.domains,
-        &state.avb.msrp_state, &state.eee_ports,
+        &state.avb.msrp_state, &state.eee_ports, &state.avb.avtp_streams,
     );
     let missing_ptp = state.missing_ptp_clocks(expanded_protocols);
 
@@ -436,25 +484,31 @@ fn do_report(
         missing_ptp: &missing_ptp,
         health: &state.network_health,
         bytes_this_window: state.bytes_this_window,
-        avtp_streams: &state.avb.avtp_streams,
-        msrp_state: &state.avb.msrp_state,
-        mvrp_vlans: &state.avb.mvrp_vlans,
         eee_ports: &state.eee_ports,
-        dante_sources: &state.dante.sources,
-        dante_names: &state.dante.names,
-        dante_conmon: &state.dante.conmon,
-        dante_unverified: &dante_unverified,
+        dante: crate::report::DanteSnapshot {
+            sources: &state.dante.sources,
+            names: &state.dante.names,
+            conmon: &state.dante.conmon,
+            unverified: &dante_unverified,
+        },
+        avb: crate::report::AvbSnapshot {
+            avtp_streams: &state.avb.avtp_streams,
+            msrp_state: &state.avb.msrp_state,
+            mvrp_vlans: &state.avb.mvrp_vlans,
+            avdecc_entities: &state.avb.avdecc_entities,
+        },
         ndi_sources: &state.ndi.sources,
         ndi_names: &state.ndi.names,
-        avdecc_entities: &state.avb.avdecc_entities,
         pause_frames: state.pause_frames_this_window,
         pfc_frames: state.pfc_frames_this_window,
         pcap_stats,
         packets_dispatched: state.packets_dispatched,
-        ip_config_alerts: &ip_config_alerts,
-        conmon_bridge_alerts: &conmon_bridge_alerts,
-        follower_census_alerts: &follower_census_alerts,
-        ptp_sync_alerts: &ptp_sync_alerts,
+        periodic_alerts: crate::report::PeriodicAlerts {
+            ip_config: &ip_config_alerts,
+            conmon_bridge: &conmon_bridge_alerts,
+            follower_census: &follower_census_alerts,
+            ptp_sync: &ptp_sync_alerts,
+        },
         clock_dropout_correlated: state.clock_dropout_correlated,
     };
     print_report(&snap, session, logger);
@@ -550,5 +604,180 @@ fn ts_refclk_alerts(state: &CaptureState) -> Vec<Alert> {
         }
     }
     alerts
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── OfflineReportClock — offline replay's per-packet report-timing decision,
+    // extracted out of run_loop so it's testable without a real pcap capture ──
+
+    #[test]
+    fn offline_clock_does_not_report_on_first_packet() {
+        // The first packet only initialises the baseline timestamp — it must not
+        // itself trigger a report (there is no elapsed window yet).
+        let mut clock = OfflineReportClock::default();
+        assert!(!clock.should_report(1_000));
+    }
+
+    #[test]
+    fn offline_clock_reports_after_five_seconds_of_pcap_time() {
+        let mut clock = OfflineReportClock::default();
+        assert!(!clock.should_report(1_000)); // baseline
+        assert!(!clock.should_report(1_003)); // 3s elapsed — not yet
+        assert!(clock.should_report(1_005));  // 5s elapsed — report
+    }
+
+    #[test]
+    fn offline_clock_rebases_after_reporting() {
+        let mut clock = OfflineReportClock::default();
+        clock.should_report(1_000);
+        assert!(clock.should_report(1_005), "first 5s window");
+        assert!(!clock.should_report(1_007), "only 2s since the last report");
+        assert!(clock.should_report(1_010), "another full 5s window");
+    }
+
+    // ── process_packet — dispatch + network-health tracking, pcap-free ────────
+
+    /// Build a raw Ethernet+IPv4+UDP+RTP frame (AES67 shape: dst 239.69.0.1:5004).
+    fn eth_aes67_frame() -> Vec<u8> {
+        let mut f = vec![0u8; 12];
+        f.extend_from_slice(&[0x08, 0x00]); // EtherType IPv4
+        let mut ip = vec![0u8; 20 + 8 + 12];
+        ip[0] = 0x45;
+        let total: u16 = (20 + 8 + 12) as u16;
+        ip[2..4].copy_from_slice(&total.to_be_bytes());
+        ip[8] = 64;
+        ip[9] = 0x11; // UDP
+        ip[12..16].copy_from_slice(&[192, 168, 1, 10]); // src (unicast)
+        ip[16..20].copy_from_slice(&[239, 69, 0, 1]);   // dst (AES67 multicast)
+        // Port 6004, not 5004: both-ports-even-5000-6000 is Dante's strict audio
+        // heuristic (parser.rs::is_likely_dante_audio) — it runs before the AES67
+        // IP-block check and would steal this frame (see parser.rs's
+        // dante_port_heuristic_wins_over_aes67_multicast_address regression test).
+        ip[20..22].copy_from_slice(&6004u16.to_be_bytes());
+        ip[22..24].copy_from_slice(&6004u16.to_be_bytes());
+        ip[24..26].copy_from_slice(&20u16.to_be_bytes());
+        ip[28] = 0x80; // RTP V=2
+        ip[29] = 96;   // PT 96
+        f.extend_from_slice(&ip);
+        f
+    }
+
+    #[test]
+    fn process_packet_dispatches_and_creates_a_stream() {
+        let mut state = CaptureState::new();
+        let mut logger = crate::report::Logger::for_test();
+        let frame = eth_aes67_frame();
+        let eth = EthernetPacket::new(&frame).unwrap();
+        let expanded = vec![protocols::ProtocolChoice::AES67];
+
+        process_packet(&mut state, &eth, &expanded, Instant::now(), &mut logger);
+
+        assert_eq!(state.packets_dispatched, 1);
+        assert!(state.streams.values().any(|s| s.protocol == "AES67"),
+            "an AES67 RTP frame must create a stream");
+    }
+
+    #[test]
+    fn process_packet_counts_multicast_bandwidth() {
+        let mut state = CaptureState::new();
+        let mut logger = crate::report::Logger::for_test();
+        let frame = eth_aes67_frame();
+        let eth = EthernetPacket::new(&frame).unwrap();
+        let expanded = vec![protocols::ProtocolChoice::AES67];
+
+        process_packet(&mut state, &eth, &expanded, Instant::now(), &mut logger);
+
+        assert_eq!(state.network_health.total_packets, 1);
+        assert_eq!(state.network_health.multicast_packets, 1);
+        assert_eq!(state.network_health.unicast_packets, 0);
+        assert!(state.bytes_this_window > 0);
+        assert!(state.multicast_bytes_this_window > 0);
+    }
+
+    #[test]
+    fn process_packet_does_not_dispatch_unselected_protocol() {
+        // AES67 frame, but only Dante is selected — must not create a stream.
+        let mut state = CaptureState::new();
+        let mut logger = crate::report::Logger::for_test();
+        let frame = eth_aes67_frame();
+        let eth = EthernetPacket::new(&frame).unwrap();
+        let expanded = vec![protocols::ProtocolChoice::Dante];
+
+        process_packet(&mut state, &eth, &expanded, Instant::now(), &mut logger);
+
+        assert!(state.streams.is_empty());
+        assert_eq!(state.packets_dispatched, 1, "dispatched counter still increments");
+    }
+
+    // ── drain_pending_joins — dynamic IGMP join bootstrap, pcap-free ──────────
+
+    #[test]
+    fn drain_pending_joins_offline_clears_queue_without_joining() {
+        // Joining a multicast group is meaningless in offline replay — there is
+        // no live interface. `live: None` must still drain the queue so it
+        // doesn't grow unbounded across packets.
+        let mut state = CaptureState::new();
+        let mut logger = crate::report::Logger::for_test();
+        state.pending_join_groups.push(Ipv4Addr::new(239, 255, 0, 1));
+        let expanded = vec![protocols::ProtocolChoice::Dante];
+
+        drain_pending_joins(&mut state, None, &expanded, &mut logger);
+
+        assert!(state.pending_join_groups.is_empty());
+        assert!(state.joined_multicast.is_empty());
+    }
+
+    #[test]
+    fn drain_pending_joins_live_joins_group_matching_selected_protocol() {
+        let mut state = CaptureState::new();
+        let mut logger = crate::report::Logger::for_test();
+        let group = Ipv4Addr::new(239, 255, 0, 1); // octet[1]=255 → gated on Dante
+        state.pending_join_groups.push(group);
+        let expanded = vec![protocols::ProtocolChoice::Dante];
+
+        let mut mc_sockets = Vec::new();
+        let mut mc_joined = HashSet::new();
+        let mut live = LiveConfig {
+            iface_ip: Ipv4Addr::new(127, 0, 0, 1),
+            duration_secs: None,
+            mc_sockets: &mut mc_sockets,
+            mc_joined: &mut mc_joined,
+        };
+
+        drain_pending_joins(&mut state, Some(&mut live), &expanded, &mut logger);
+
+        assert!(state.pending_join_groups.is_empty());
+        assert!(mc_joined.contains(&group), "group matching the selection must be joined");
+        assert!(state.joined_multicast.contains(&group));
+        assert_eq!(mc_sockets.len(), 1);
+    }
+
+    #[test]
+    fn drain_pending_joins_skips_group_not_matching_selected_protocol() {
+        // octet[1]=69 is AES67's block, but only Dante is selected.
+        let mut state = CaptureState::new();
+        let mut logger = crate::report::Logger::for_test();
+        let group = Ipv4Addr::new(239, 69, 0, 1);
+        state.pending_join_groups.push(group);
+        let expanded = vec![protocols::ProtocolChoice::Dante];
+
+        let mut mc_sockets = Vec::new();
+        let mut mc_joined = HashSet::new();
+        let mut live = LiveConfig {
+            iface_ip: Ipv4Addr::new(127, 0, 0, 1),
+            duration_secs: None,
+            mc_sockets: &mut mc_sockets,
+            mc_joined: &mut mc_joined,
+        };
+
+        drain_pending_joins(&mut state, Some(&mut live), &expanded, &mut logger);
+
+        assert!(mc_joined.is_empty(), "AES67 group must not be joined when only Dante is selected");
+        assert!(state.joined_multicast.is_empty());
+        assert!(mc_sockets.is_empty());
+    }
 }
 

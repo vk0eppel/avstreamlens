@@ -132,32 +132,52 @@ pub struct ReportSnapshot<'a> {
     pub missing_ptp:    &'a [MissingClock],
     pub health:         &'a NetworkHealth,
     pub bytes_this_window: u64,
-    pub avtp_streams:   &'a HashMap<[u8; 8], AvtpStreamStats>,
-    pub msrp_state:     &'a HashMap<[u8; 8], MsrpDeclaration>,
-    pub mvrp_vlans:     &'a HashSet<u16>,
     pub eee_ports:      &'a HashMap<(String, String), (u16, u16)>,
-    pub dante_sources:  &'a HashSet<Ipv4Addr>,
-    pub dante_names:    &'a HashMap<Ipv4Addr, String>,
-    pub dante_conmon:   &'a HashMap<Ipv4Addr, ConmonDevice>,
-    pub dante_unverified: &'a HashSet<Ipv4Addr>,
+    pub dante:          DanteSnapshot<'a>,
+    pub avb:            AvbSnapshot<'a>,
     pub ndi_sources:    &'a HashSet<Ipv4Addr>,
     pub ndi_names:      &'a HashMap<Ipv4Addr, String>,
-    pub avdecc_entities: &'a HashMap<[u8; 8], AvdeccEntity>,
     pub pause_frames:   u64,
     pub pfc_frames:     u64,
     pub pcap_stats:     Option<(u32, u32, u32)>,
     pub packets_dispatched: u64,
-    // Section-level diagnostics computed once per cycle in `do_report` and
-    // rendered inline in their target sections (Discovered / Clock Sources).
-    pub ip_config_alerts:       &'a [Alert],
-    pub conmon_bridge_alerts:   &'a [Alert],
-    pub follower_census_alerts: &'a [Alert],
-    pub ptp_sync_alerts:        &'a [Alert],
+    pub periodic_alerts: PeriodicAlerts<'a>,
     // Set when PTP clock loss and stream packet loss are correlated in the same
     // window. Suppresses the individual "no clock" and per-stream loss alerts
     // so the combined dropout alert (already emitted by emit_periodic_alerts)
     // dominates.
     pub clock_dropout_correlated: bool,
+}
+
+/// Dante-only fields, mirroring `CaptureState`'s `dante: DanteState` substate
+/// (see CLAUDE.md Capture Module section) — the report-side view of the same
+/// grouping, rather than 4 fields flattened into `ReportSnapshot` alongside
+/// everything else.
+#[derive(Clone, Copy)]
+pub struct DanteSnapshot<'a> {
+    pub sources:    &'a HashSet<Ipv4Addr>,
+    pub names:      &'a HashMap<Ipv4Addr, String>,
+    pub conmon:     &'a HashMap<Ipv4Addr, ConmonDevice>,
+    pub unverified: &'a HashSet<Ipv4Addr>,
+}
+
+/// AVB-only fields, mirroring `CaptureState`'s `avb: AvbState` substate.
+#[derive(Clone, Copy)]
+pub struct AvbSnapshot<'a> {
+    pub avtp_streams:    &'a HashMap<[u8; 8], AvtpStreamStats>,
+    pub msrp_state:      &'a HashMap<[u8; 8], MsrpDeclaration>,
+    pub mvrp_vlans:      &'a HashSet<u16>,
+    pub avdecc_entities: &'a HashMap<[u8; 8], AvdeccEntity>,
+}
+
+/// Section-level diagnostics computed once per cycle in `do_report` and
+/// rendered inline in their target sections (Discovered / Clock Sources).
+#[derive(Clone, Copy)]
+pub struct PeriodicAlerts<'a> {
+    pub ip_config:       &'a [Alert],
+    pub conmon_bridge:   &'a [Alert],
+    pub follower_census: &'a [Alert],
+    pub ptp_sync:        &'a [Alert],
 }
 
 /// Session-lifetime report config — distinct from the per-Window `ReportSnapshot`.
@@ -223,6 +243,19 @@ impl Logger {
             std::io::ErrorKind::AlreadyExists,
             "could not create a unique log file",
         ))
+    }
+
+    /// A throwaway `Logger` backed by a temp file, for tests elsewhere in the
+    /// crate that need a `&mut Logger` but don't care about its contents (e.g.
+    /// `main.rs`'s `process_packet` tests, which exercise `dispatch()`).
+    #[cfg(test)]
+    pub(crate) fn for_test() -> Self {
+        let path = std::env::temp_dir().join(format!(
+            "avsl_test_logger_{}_{}.log",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos(),
+        ));
+        Logger { file: std::fs::File::options().read(true).write(true).create(true).truncate(true).open(&path).unwrap() }
     }
 
     /// Log a message to the file. Flushes immediately so the last lines
@@ -510,7 +543,7 @@ fn render_clock_sources(
             } else {
                 format!("{}ns", ns)
             };
-            let hops = (min / 5_000).max(0) as u32;
+            let hops = crate::stats::path_delay_hop_estimate(min);
             let hops_str = if hops > 0 { format!("  ~{} hop{}", hops, if hops == 1 { "" } else { "s" }) } else { String::new() };
             let line = if min == max {
                 status_detail(&format!("path delay: {}{}", fmt(max), hops_str))
@@ -518,10 +551,10 @@ fn render_clock_sources(
                 status_detail(&format!("path delay: {} – {}  (spread {}){}", fmt(min), fmt(max), fmt(spread_ns), hops_str))
             };
             lines.push(RenderedLine::plain(line));
-            if spread_ns > 10_000 {
+            if crate::stats::path_delay_spread_unstable(min, max) {
                 lines.push(RenderedLine::colored("33", status_detail("⚠  PTP path-delay variance > 10µs — unstable link (EEE, half-duplex, or cable)")));
             }
-            if max > 1_000_000 {
+            if crate::stats::path_delay_too_many_hops(max) {
                 lines.push(RenderedLine::colored("33", status_detail("⚠  PTP path delay > 1ms — too many hops between this node and grandmaster")));
             }
         }
@@ -705,6 +738,13 @@ fn render_streams(
                 lines.push(RenderedLine::colored("33", status_detail("⚠  No VLAN registration — L2 QoS may not be configured")));
             }
 
+            if avtp.pcp_violations > 0 {
+                lines.push(RenderedLine::colored("33", status_detail(&format!(
+                    "⚠  AVTP stream using PCP {}, MSRP reservation declared PCP {} — frame lands in wrong CBS queue",
+                    avtp.observed_pcp.unwrap_or(0), avtp.msrp_declared_pcp.unwrap_or(3)
+                ))));
+            }
+
             if dead {
                 lines.push(RenderedLine::colored("31", status_detail(&format!("💀 No signal for {:.0}s", avtp.last_seen.elapsed().as_secs_f64()))));
             }
@@ -842,12 +882,13 @@ pub fn print_report(snap: &ReportSnapshot, session: &mut ReportSession, logger: 
     // field is Copy (a borrow or scalar), so this is zero-cost.
     let ReportSnapshot {
         streams, tcp_streams, ptp_domains, missing_ptp, health, bytes_this_window,
-        avtp_streams, msrp_state, mvrp_vlans, eee_ports, dante_sources, dante_names,
-        dante_conmon, dante_unverified, ndi_sources, ndi_names, avdecc_entities,
+        eee_ports, dante, avb, ndi_sources, ndi_names,
         pause_frames, pfc_frames, pcap_stats, packets_dispatched,
-        ip_config_alerts, conmon_bridge_alerts, follower_census_alerts, ptp_sync_alerts,
-        clock_dropout_correlated,
+        periodic_alerts, clock_dropout_correlated,
     } = *snap;
+    let DanteSnapshot { sources: dante_sources, names: dante_names, conmon: dante_conmon, unverified: dante_unverified } = dante;
+    let AvbSnapshot { avtp_streams, msrp_state, mvrp_vlans, avdecc_entities } = avb;
+    let PeriodicAlerts { ip_config: ip_config_alerts, conmon_bridge: conmon_bridge_alerts, follower_census: follower_census_alerts, ptp_sync: ptp_sync_alerts } = periodic_alerts;
     let quiet = session.quiet;
     let no_flows_diagnostic_shown = &mut session.no_flows_diagnostic_shown;
 
@@ -893,7 +934,7 @@ pub fn print_report(snap: &ReportSnapshot, session: &mut ReportSession, logger: 
     // the scoring table exactly (NetworkHealth::build_health_summary). Empty when
     // the score is 100%.
     let health_summary =
-        health.build_health_summary(streams, tcp_streams, ptp_domains, msrp_state, eee_ports);
+        health.build_health_summary(streams, tcp_streams, ptp_domains, msrp_state, eee_ports, avtp_streams);
 
     // ── Quiet mode: suppress stdout only, never the log ─────────────────────
     // A quiet cycle prints nothing to stdout when the report is fully healthy —
@@ -1206,12 +1247,14 @@ mod tests {
         let health = NetworkHealth::new();
         let snap = ReportSnapshot {
             streams: &streams, tcp_streams: &tcp, ptp_domains: &ptp, missing_ptp: &[],
-            health: &health, bytes_this_window: 0, avtp_streams: &avtp, msrp_state: &msrp,
-            mvrp_vlans: &mvrp, eee_ports: &eee, dante_sources: &dsrc, dante_names: &dnames,
-            dante_conmon: &dconmon, dante_unverified: &dunver, ndi_sources: &nsrc, ndi_names: &nnames,
-            avdecc_entities: &avdecc, pause_frames: 0, pfc_frames: 0, pcap_stats: None,
-            packets_dispatched: 0, ip_config_alerts: &[], conmon_bridge_alerts: &[],
-            follower_census_alerts: &[], ptp_sync_alerts: &[], clock_dropout_correlated: false,
+            health: &health, bytes_this_window: 0, eee_ports: &eee,
+            dante: DanteSnapshot { sources: &dsrc, names: &dnames, conmon: &dconmon, unverified: &dunver },
+            avb: AvbSnapshot { avtp_streams: &avtp, msrp_state: &msrp, mvrp_vlans: &mvrp, avdecc_entities: &avdecc },
+            ndi_sources: &nsrc, ndi_names: &nnames,
+            pause_frames: 0, pfc_frames: 0, pcap_stats: None,
+            packets_dispatched: 0,
+            periodic_alerts: PeriodicAlerts { ip_config: &[], conmon_bridge: &[], follower_census: &[], ptp_sync: &[] },
+            clock_dropout_correlated: false,
         };
         let tmp = std::env::temp_dir().join(format!("avsl_quiet_{}.log", std::process::id()));
         let file = std::fs::File::options().read(true).write(true).create(true).truncate(true)
@@ -1270,5 +1313,46 @@ mod tests {
     #[test]
     fn network_status_detail_matches_other_sections_indent() {
         assert_eq!(status_detail("port detail"), format!("{}port detail", DETAIL_INDENT));
+    }
+
+    // ── AVB PCP mismatch rendering (per stream_id, via AvtpStreamStats) ──────
+
+    #[test]
+    fn avb_stream_renders_pcp_mismatch_line() {
+        use crate::stats::AvtpStreamStats;
+        let sid = [1u8, 2, 3, 4, 5, 6, 7, 8];
+        let mut avtp = AvtpStreamStats::new(sid, 0x00);
+        avtp.pcp_violations = 1;
+        avtp.observed_pcp = Some(2);
+        avtp.msrp_declared_pcp = Some(3);
+        let mut avtp_streams = HashMap::new();
+        avtp_streams.insert(sid, avtp);
+
+        let lines = render_streams(
+            &HashMap::new(), &HashMap::new(), &HashSet::new(), &HashMap::new(),
+            &avtp_streams, &HashMap::new(), &HashSet::new(), false,
+        );
+
+        assert!(
+            lines.iter().any(|l| l.text.contains("PCP") && l.text.contains("2") && l.text.contains("3")),
+            "expected a PCP mismatch line mentioning observed(2) vs. expected(3), got: {:#?}",
+            lines.iter().map(|l| &l.text).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn avb_stream_no_pcp_line_when_no_violation() {
+        use crate::stats::AvtpStreamStats;
+        let sid = [1u8, 2, 3, 4, 5, 6, 7, 8];
+        let avtp = AvtpStreamStats::new(sid, 0x00);
+        let mut avtp_streams = HashMap::new();
+        avtp_streams.insert(sid, avtp);
+
+        let lines = render_streams(
+            &HashMap::new(), &HashMap::new(), &HashSet::new(), &HashMap::new(),
+            &avtp_streams, &HashMap::new(), &HashSet::new(), false,
+        );
+
+        assert!(!lines.iter().any(|l| l.text.contains("PCP")));
     }
 }

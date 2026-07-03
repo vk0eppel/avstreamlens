@@ -98,11 +98,8 @@ pub struct StreamStats {
     // AES67/ST2110: any non-6 value (advisory only).
     pub pcp_violations:                 u64,
     // Outermost VLAN tag PCP observed on the first tagged packet. Set once,
-    // never reset. Used in diagnostic messages alongside msrp_declared_pcp.
+    // never reset. Used in the AES67/ST2110 PcpAdvisory diagnostic message.
     pub observed_pcp:                   Option<u8>,
-    // MSRP TalkerAdvertise priority for AVB streams. Set in handle_avb when a
-    // PCP mismatch is first detected; None for non-AVB streams.
-    pub msrp_declared_pcp:              Option<u8>,
 }
 
 impl StreamStats {
@@ -153,7 +150,6 @@ impl StreamStats {
             observed_dscp:                  None,
             pcp_violations:                 0,
             observed_pcp:                   None,
-            msrp_declared_pcp:              None,
         }
     }
 
@@ -222,6 +218,20 @@ impl StreamStats {
             self.expected_pt = Some(pt);
         }
         media.clock_hz > 0.0
+    }
+
+    /// AES67/ST2110 PCP advisory: PCP=6 is the IEEE 802.1p priority recommended
+    /// for these protocols on managed switches. Untagged frames (`pcp = None`)
+    /// produce no violation. The single seam for this check — previously
+    /// hand-copied identically in `handle_aes67` and `handle_st2110`. AVB's PCP
+    /// mismatch is unrelated (scored against MSRP-declared priority on
+    /// `AvtpStreamStats`, not this advisory) and Dante's PCP handling is
+    /// DSCP/Transmitter-Class-driven — neither belongs in this function.
+    pub fn apply_pcp_advisory(&mut self, pcp: Option<u8>) {
+        if let Some(p) = pcp && p != 6 {
+            self.pcp_violations += 1;
+            self.observed_pcp.get_or_insert(p);
+        }
     }
 
     /// `udp_payload_len`: actual length of UDP payload (without IP/UDP header),
@@ -482,15 +492,12 @@ impl StreamStats {
         {
             d.push(StreamDiagnostic::Dead { silent_secs: last_time.elapsed().as_secs_f64() });
         }
-        if self.pcp_violations > 0 {
-            if self.protocol == "AVB" || self.protocol.starts_with("AVB ") {
-                d.push(StreamDiagnostic::PcpMismatch {
-                    observed: self.observed_pcp.unwrap_or(0),
-                    expected: self.msrp_declared_pcp.unwrap_or(3),
-                });
-            } else if self.protocol == "AES67" || self.protocol.starts_with("2110-") {
-                d.push(StreamDiagnostic::PcpAdvisory { observed: self.observed_pcp.unwrap_or(0) });
-            }
+        // AVB PCP mismatch is scored/rendered straight off `AvtpStreamStats` (see
+        // `NetworkHealth::collect_penalties` and `report.rs`'s AVTP render block) —
+        // no `StreamStats` entry with `protocol == "AVB"` is ever constructed, so
+        // this diagnostic only applies to the AES67/ST2110 advisory.
+        if self.pcp_violations > 0 && (self.protocol == "AES67" || self.protocol.starts_with("2110-")) {
+            d.push(StreamDiagnostic::PcpAdvisory { observed: self.observed_pcp.unwrap_or(0) });
         }
 
         d
@@ -518,10 +525,9 @@ pub enum StreamDiagnostic {
     UnknownStreamType,
     Aes67PtpLockHint,
     DanteClockOrSubscriptionHint,
-    // AVB: observed frame PCP differs from MSRP TalkerAdvertise declared priority.
-    // Frame exits CBS protection. Penalty −15/stream.
-    PcpMismatch { observed: u8, expected: u8 },
     // AES67/ST2110: frame not marked PCP 6. Advisory only — no score penalty.
+    // (AVB's PCP mismatch is scored/rendered off AvtpStreamStats, not StreamStats
+    // — see NetworkHealth::collect_penalties and report.rs's AVTP render block.)
     PcpAdvisory { observed: u8 },
 }
 
@@ -540,7 +546,6 @@ impl StreamDiagnostic {
             StreamDiagnostic::SignalGap { .. } => 10.0,
             StreamDiagnostic::DscpViolation { .. } => 5.0,
             StreamDiagnostic::Dead { .. } => 30.0,
-            StreamDiagnostic::PcpMismatch { .. } => 15.0,
             StreamDiagnostic::Reorder { .. }
             | StreamDiagnostic::TtlRouted { .. }
             | StreamDiagnostic::PtMismatch { .. }
@@ -599,10 +604,6 @@ impl StreamDiagnostic {
             ),
             StreamDiagnostic::Dead { silent_secs } => format!(
                 "    💀 No signal for {:.0}s", silent_secs
-            ),
-            StreamDiagnostic::PcpMismatch { observed, expected } => format!(
-                "    ⚠  AVTP PCP {} but MSRP declared PCP {} — frame exits CBS protection (Milan Class A requires PCP 3)",
-                observed, expected
             ),
             StreamDiagnostic::PcpAdvisory { observed } =>
                 format!("    ⚠  Stream uses PCP {} — PCP 6 recommended for AES67/ST2110 on managed switches", observed),
@@ -667,6 +668,11 @@ pub struct AvtpStreamStats {
     pub bytes_at_check:     u64,
     pub bitrate_bps:        u64,
     pub last_bitrate_check: Instant,
+    // PCP (802.1p) vs. MSRP TalkerAdvertise priority — per stream_id, never shared
+    // across other AVTP streams of the same subtype label. See CLAUDE.md AVB PCP note.
+    pub pcp_violations:     u64,
+    pub observed_pcp:       Option<u8>,
+    pub msrp_declared_pcp:  Option<u8>,
 }
 
 impl AvtpStreamStats {
@@ -682,6 +688,9 @@ impl AvtpStreamStats {
             bytes_at_check:     0,
             bitrate_bps:        0,
             last_bitrate_check: Instant::now(),
+            pcp_violations:     0,
+            observed_pcp:       None,
+            msrp_declared_pcp:  None,
         }
     }
 
@@ -881,6 +890,7 @@ impl NetworkHealth {
         ptp_domains: &HashMap<(u8, u8), PtpStats>,
         msrp_state:  &HashMap<[u8; 8], crate::protocols::MsrpDeclaration>,
         eee_ports:   &HashMap<(String, String), (u16, u16)>,
+        avtp_streams: &HashMap<[u8; 8], AvtpStreamStats>,
     ) -> Vec<ScorePenalty> {
         let mut p: Vec<ScorePenalty> = Vec::new();
 
@@ -933,6 +943,14 @@ impl NetworkHealth {
         per_stream!(dead_count,   dead_count as f64 * 30.0,       "⚠  {} dead stream(s) (silent)");
         per_stream!(gap_count,    gap_count  as f64 * 10.0,       "⚠  {} stream(s) with signal gaps");
         per_stream!(dscp_count,   (dscp_count as f64 * 5.0).min(20.0), "⚠  {} stream(s) with incorrect DSCP");
+
+        // ── AVB PCP mismatch (per stream_id, on AvtpStreamStats) ───────────────
+        // AVB media is tracked on `avtp_streams`, not `streams` — this is the one
+        // per-stream penalty category collect_penalties sources from a map other
+        // than `streams`/`tcp_streams`. AES67/ST2110 PcpAdvisory is informational
+        // only (deduction 0.0) and already flows through the `streams` loop above.
+        let pcp_count = avtp_streams.values().filter(|s| s.pcp_violations > 0).count();
+        per_stream!(pcp_count, pcp_count as f64 * 15.0, "⚠  {} AVB stream(s) with PCP mismatch");
 
         // ── TCP quality ───────────────────────────────────────────────────────
         let mut tcp_count = 0usize; let mut tcp_total = 0.0f64;
@@ -1040,11 +1058,12 @@ impl NetworkHealth {
         ptp_domains: &std::collections::HashMap<(u8, u8), PtpStats>,
         msrp_state: &std::collections::HashMap<[u8; 8], crate::protocols::MsrpDeclaration>,
         eee_ports: &std::collections::HashMap<(String, String), (u16, u16)>,
+        avtp_streams: &std::collections::HashMap<[u8; 8], AvtpStreamStats>,
     ) {
         // Score = 100 − Σ penalties. The penalty table lives once in
         // `collect_penalties`; this is a thin consumer of it.
         let total: f64 = self
-            .collect_penalties(streams, tcp_streams, ptp_domains, msrp_state, eee_ports)
+            .collect_penalties(streams, tcp_streams, ptp_domains, msrp_state, eee_ports, avtp_streams)
             .iter()
             .map(|p| p.deduction())
             .sum();
@@ -1071,8 +1090,9 @@ impl NetworkHealth {
         ptp_domains: &HashMap<(u8, u8), PtpStats>,
         msrp_state: &HashMap<[u8; 8], crate::protocols::MsrpDeclaration>,
         eee_ports: &HashMap<(String, String), (u16, u16)>,
+        avtp_streams: &HashMap<[u8; 8], AvtpStreamStats>,
     ) -> Vec<String> {
-        self.collect_penalties(streams, tcp_streams, ptp_domains, msrp_state, eee_ports)
+        self.collect_penalties(streams, tcp_streams, ptp_domains, msrp_state, eee_ports, avtp_streams)
             .into_iter()
             .map(ScorePenalty::into_bullet)
             .collect()
@@ -1250,6 +1270,42 @@ impl PtpStats {
             None
         }
     }
+
+    /// `true` for an IP-network PTP domain (AES67/ST2110/Dante, PTPv1 or PTPv2
+    /// over UDP) — i.e. NOT an L2 gPTP (AVB) domain. A domain with no
+    /// `protocol_kind` set yet counts as IP-PTP, matching the historical
+    /// `!= Some("AVB")` behavior. The single named predicate for a distinction
+    /// previously inlined four times across `missing_ptp_clocks` and
+    /// `check_clock_dropout_correlation`.
+    pub fn is_ip_ptp_domain(&self) -> bool {
+        self.protocol_kind.as_deref() != Some("AVB")
+    }
+
+    /// `true` for an L2 gPTP (AVB) domain.
+    pub fn is_gptp_domain(&self) -> bool {
+        self.protocol_kind.as_deref() == Some("AVB")
+    }
+}
+
+/// `true` when the path-delay spread (max − min, both nanoseconds) indicates an
+/// unstable link — EEE, half-duplex, or a dodgy cable. The single seam for this
+/// threshold, extracted out of `report.rs::render_clock_sources` so tuning it
+/// (an open TODO.md field-verification item) is a unit test, not a full-report
+/// string match.
+pub fn path_delay_spread_unstable(min_ns: i64, max_ns: i64) -> bool {
+    (max_ns - min_ns) > 10_000
+}
+
+/// `true` when the absolute path delay indicates too many hops between this
+/// node and the grandmaster.
+pub fn path_delay_too_many_hops(max_ns: i64) -> bool {
+    max_ns > 1_000_000
+}
+
+/// Rough hop-count estimate: ~5µs per gigabit switch hop. Never negative;
+/// suppressed (0) below one hop's worth of delay.
+pub fn path_delay_hop_estimate(min_ns: i64) -> u32 {
+    (min_ns / 5_000).max(0) as u32
 }
 // ═════════════════════════════════════════════════════════════════
 // TESTS
@@ -1597,6 +1653,7 @@ mod tests {
     fn empty_ptp() -> HashMap<(u8, u8), PtpStats> { HashMap::new() }
     fn empty_msrp() -> HashMap<[u8; 8], crate::protocols::MsrpDeclaration> { HashMap::new() }
     fn empty_eee() -> HashMap<(String, String), (u16, u16)> { HashMap::new() }
+    fn empty_avtp() -> HashMap<[u8; 8], AvtpStreamStats> { HashMap::new() }
 
     /// A stream that has received `packets` packets and `lost` losses, so
     /// loss_pct() and liveness are controllable without driving update().
@@ -1618,7 +1675,7 @@ mod tests {
         let health = NetworkHealth::new();
         let mut streams = empty_streams();
         streams.insert("s1".into(), live_stream(0));
-        let out = health.build_health_summary(&streams, &empty_tcp(), &empty_ptp(), &empty_msrp(), &empty_eee());
+        let out = health.build_health_summary(&streams, &empty_tcp(), &empty_ptp(), &empty_msrp(), &empty_eee(), &empty_avtp());
         assert!(out.is_empty(), "healthy state must yield no bullets, got {out:?}");
     }
 
@@ -1627,7 +1684,7 @@ mod tests {
         let health = NetworkHealth::new();
         let mut streams = empty_streams();
         streams.insert("s1".into(), live_stream(5));
-        let out = health.build_health_summary(&streams, &empty_tcp(), &empty_ptp(), &empty_msrp(), &empty_eee());
+        let out = health.build_health_summary(&streams, &empty_tcp(), &empty_ptp(), &empty_msrp(), &empty_eee(), &empty_avtp());
         assert_eq!(out.len(), 1);
         assert!(out[0].contains("1 stream(s) with packet loss"), "got {out:?}");
     }
@@ -1639,7 +1696,7 @@ mod tests {
         streams.insert("s1".into(), live_stream(5));
         streams.insert("s2".into(), live_stream(3));
         streams.insert("s3".into(), live_stream(1));
-        let out = health.build_health_summary(&streams, &empty_tcp(), &empty_ptp(), &empty_msrp(), &empty_eee());
+        let out = health.build_health_summary(&streams, &empty_tcp(), &empty_ptp(), &empty_msrp(), &empty_eee(), &empty_avtp());
         assert_eq!(out.len(), 1, "three lossy streams collapse to one bullet, got {out:?}");
         assert!(out[0].contains("3 stream(s) with packet loss"));
     }
@@ -1657,7 +1714,7 @@ mod tests {
         jittery.jitter = 0.015;                    // 15 ms > 10 ms threshold
         streams.insert("s2".into(), jittery);
 
-        let out = health.build_health_summary(&streams, &empty_tcp(), &empty_ptp(), &empty_msrp(), &empty_eee());
+        let out = health.build_health_summary(&streams, &empty_tcp(), &empty_ptp(), &empty_msrp(), &empty_eee(), &empty_avtp());
         // loss, jitter, DSCP — three distinct categories, one bullet each.
         assert_eq!(out.len(), 3, "got {out:?}");
         assert!(out.iter().any(|b| b.contains("packet loss")));
@@ -1681,7 +1738,7 @@ mod tests {
         let mut eee = empty_eee();
         eee.insert(("chassis".into(), "port3".into()), (10, 20));
 
-        let out = health.build_health_summary(&empty_streams(), &empty_tcp(), &ptp, &empty_msrp(), &eee);
+        let out = health.build_health_summary(&empty_streams(), &empty_tcp(), &ptp, &empty_msrp(), &eee, &empty_avtp());
         assert!(out.iter().any(|b| b.contains("TCP retransmissions")), "got {out:?}");
         assert!(out.iter().any(|b| b.contains("ECN congestion")));
         assert!(out.iter().any(|b| b.contains("Multiple IGMP queriers")));
@@ -1696,7 +1753,7 @@ mod tests {
         let health = NetworkHealth::new();
         let mut unicast = empty_streams();
         unicast.insert("u1".into(), live_stream(0)); // is_multicast = false by default
-        let out = health.build_health_summary(&unicast, &empty_tcp(), &empty_ptp(), &empty_msrp(), &empty_eee());
+        let out = health.build_health_summary(&unicast, &empty_tcp(), &empty_ptp(), &empty_msrp(), &empty_eee(), &empty_avtp());
         assert!(out.is_empty(), "no multicast → no querier bullet, got {out:?}");
 
         // Same querier state, but now an active multicast stream → querier-absent bullet.
@@ -1704,7 +1761,7 @@ mod tests {
         let mut m = live_stream(0);
         m.is_multicast = true;
         mc.insert("m1".into(), m);
-        let out = health.build_health_summary(&mc, &empty_tcp(), &empty_ptp(), &empty_msrp(), &empty_eee());
+        let out = health.build_health_summary(&mc, &empty_tcp(), &empty_ptp(), &empty_msrp(), &empty_eee(), &empty_avtp());
         assert!(out.iter().any(|b| b.contains("IGMP querier absent")), "got {out:?}");
     }
 
@@ -1716,7 +1773,7 @@ mod tests {
         let health = NetworkHealth::new();
         let mut streams = empty_streams();
         streams.insert("s1".into(), live_stream(0));
-        let out = health.build_health_summary(&streams, &empty_tcp(), &empty_ptp(), &empty_msrp(), &empty_eee());
+        let out = health.build_health_summary(&streams, &empty_tcp(), &empty_ptp(), &empty_msrp(), &empty_eee(), &empty_avtp());
         assert!(out.is_empty());
     }
 
@@ -1728,7 +1785,7 @@ mod tests {
         dead.packets = 100;
         dead.last_packet_time = Some(Instant::now() - Duration::from_secs(crate::protocols::STREAM_TIMEOUT_SECS + 5));
         streams.insert("s1".into(), dead);
-        let out = health.build_health_summary(&streams, &empty_tcp(), &empty_ptp(), &empty_msrp(), &empty_eee());
+        let out = health.build_health_summary(&streams, &empty_tcp(), &empty_ptp(), &empty_msrp(), &empty_eee(), &empty_avtp());
         assert!(out.iter().any(|b| b.contains("dead stream")), "got {out:?}");
     }
 
@@ -1752,13 +1809,13 @@ mod tests {
         eee.insert(("chassis".into(), "port3".into()), (10, 20));
 
         let penalties = health.collect_penalties(
-            &streams, &empty_tcp(), &empty_ptp(), &empty_msrp(), &eee,
+            &streams, &empty_tcp(), &empty_ptp(), &empty_msrp(), &eee, &empty_avtp(),
         );
         let summary = health.build_health_summary(
-            &streams, &empty_tcp(), &empty_ptp(), &empty_msrp(), &eee,
+            &streams, &empty_tcp(), &empty_ptp(), &empty_msrp(), &eee, &empty_avtp(),
         );
         let expected: f64 = penalties.iter().map(|p| p.deduction()).sum();
-        health.calculate_score(&streams, &empty_tcp(), &empty_ptp(), &empty_msrp(), &eee);
+        health.calculate_score(&streams, &empty_tcp(), &empty_ptp(), &empty_msrp(), &eee, &empty_avtp());
 
         // One bullet per penalty (biconditional), and the score is exactly the
         // complement of the summed deductions.
@@ -1766,6 +1823,45 @@ mod tests {
         assert!(expected > 0.0, "test state must produce penalties");
         assert!((health.network_score - (100.0 - expected)).abs() < 1e-9,
             "score {} != 100 - {}", health.network_score, expected);
+    }
+
+    #[test]
+    fn summary_avb_pcp_mismatch_deducts_and_produces_bullet() {
+        // PcpMismatch carries a real -15/stream deduction (see StreamDiagnostic::
+        // deduction) but until now `collect_penalties` never read from
+        // `avtp_streams` at all, so it never contributed to the Health Score or
+        // Health Summary — this pins the fix.
+        let health = NetworkHealth::new();
+        let mut avtp = empty_avtp();
+        let mut s = AvtpStreamStats::new([1, 2, 3, 4, 5, 6, 7, 8], 0x00);
+        s.pcp_violations = 1;
+        s.observed_pcp = Some(2);
+        s.msrp_declared_pcp = Some(3);
+        avtp.insert(s.stream_id, s);
+
+        let penalties = health.collect_penalties(
+            &empty_streams(), &empty_tcp(), &empty_ptp(), &empty_msrp(), &empty_eee(), &avtp,
+        );
+        let summary = health.build_health_summary(
+            &empty_streams(), &empty_tcp(), &empty_ptp(), &empty_msrp(), &empty_eee(), &avtp,
+        );
+        let total: f64 = penalties.iter().map(|p| p.deduction()).sum();
+
+        assert_eq!(total, 15.0, "PCP mismatch must deduct 15 points, got total {total}");
+        assert!(summary.iter().any(|b| b.contains("PCP mismatch")), "got {summary:?}");
+    }
+
+    #[test]
+    fn summary_no_bullet_for_avb_stream_without_pcp_violation() {
+        let health = NetworkHealth::new();
+        let mut avtp = empty_avtp();
+        let s = AvtpStreamStats::new([1, 2, 3, 4, 5, 6, 7, 8], 0x00);
+        avtp.insert(s.stream_id, s);
+
+        let out = health.build_health_summary(
+            &empty_streams(), &empty_tcp(), &empty_ptp(), &empty_msrp(), &empty_eee(), &avtp,
+        );
+        assert!(out.is_empty(), "got {out:?}");
     }
 
     // ── timing_metronomic (Transmitter Class) ────────────────────────────────
@@ -1837,6 +1933,32 @@ mod tests {
         assert_eq!(s.clock_hz, 96_000.0, "technical fields must still refresh");
     }
 
+    // ── apply_pcp_advisory — single seam for the AES67/ST2110 PCP=6 check ────
+    // Previously hand-copied identically in handle_aes67 and handle_st2110.
+
+    #[test]
+    fn apply_pcp_advisory_flags_non_six_pcp() {
+        let mut s = aes67();
+        s.apply_pcp_advisory(Some(3));
+        assert_eq!(s.pcp_violations, 1);
+        assert_eq!(s.observed_pcp, Some(3));
+    }
+
+    #[test]
+    fn apply_pcp_advisory_silent_on_pcp_six() {
+        let mut s = aes67();
+        s.apply_pcp_advisory(Some(6));
+        assert_eq!(s.pcp_violations, 0);
+        assert_eq!(s.observed_pcp, None);
+    }
+
+    #[test]
+    fn apply_pcp_advisory_silent_on_untagged_frame() {
+        let mut s = aes67();
+        s.apply_pcp_advisory(None);
+        assert_eq!(s.pcp_violations, 0);
+    }
+
     #[test]
     fn apply_sdp_zero_fields_do_not_clobber_existing_values() {
         let mut s = aes67();
@@ -1847,5 +1969,64 @@ mod tests {
         s.apply_sdp(&media(48_000.0, 0, 0.0, 96), "Name");
         assert_eq!(s.channels, 4);
         assert_eq!(s.ptime_ms, 4.0);
+    }
+
+    // ── PTP path-delay alert thresholds — pure, testable independent of rendering ─
+
+    #[test]
+    fn path_delay_spread_not_unstable_under_10us() {
+        assert!(!path_delay_spread_unstable(1_000, 10_999));
+    }
+
+    #[test]
+    fn path_delay_spread_unstable_over_10us() {
+        assert!(path_delay_spread_unstable(1_000, 11_001));
+    }
+
+    #[test]
+    fn path_delay_not_too_many_hops_under_1ms() {
+        assert!(!path_delay_too_many_hops(1_000_000));
+    }
+
+    #[test]
+    fn path_delay_too_many_hops_over_1ms() {
+        assert!(path_delay_too_many_hops(1_000_001));
+    }
+
+    #[test]
+    fn path_delay_hop_estimate_scales_by_5us_per_hop() {
+        assert_eq!(path_delay_hop_estimate(0), 0);
+        assert_eq!(path_delay_hop_estimate(4_999), 0, "suppressed below one hop's worth");
+        assert_eq!(path_delay_hop_estimate(5_000), 1);
+        assert_eq!(path_delay_hop_estimate(12_000), 2);
+    }
+
+    // ── PtpStats::is_ip_ptp_domain / is_gptp_domain ──────────────────────────
+    // Named predicates replacing `protocol_kind.as_deref() != / == Some("AVB")`
+    // inlined four times across missing_ptp_clocks/check_clock_dropout_correlation.
+
+    #[test]
+    fn is_ip_ptp_domain_true_for_aes67() {
+        let mut s = PtpStats::new(0, crate::protocols::PTP_VERSION_V2);
+        s.protocol_kind = Some("AES67".to_string());
+        assert!(s.is_ip_ptp_domain());
+        assert!(!s.is_gptp_domain());
+    }
+
+    #[test]
+    fn is_gptp_domain_true_for_avb() {
+        let mut s = PtpStats::new(0, crate::protocols::PTP_VERSION_V2);
+        s.protocol_kind = Some("AVB".to_string());
+        assert!(s.is_gptp_domain());
+        assert!(!s.is_ip_ptp_domain());
+    }
+
+    #[test]
+    fn is_ip_ptp_domain_true_when_protocol_kind_unset() {
+        // A domain seen before its protocol_kind is assigned is IP-PTP by default
+        // (matches the existing `!= Some("AVB")` behavior for None).
+        let s = PtpStats::new(0, crate::protocols::PTP_VERSION_V2);
+        assert!(s.is_ip_ptp_domain());
+        assert!(!s.is_gptp_domain());
     }
 }
