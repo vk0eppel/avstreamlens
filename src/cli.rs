@@ -163,9 +163,15 @@ mod bpf_tests {
         assert!(f.contains("vlan and ("), "all-protocols filter must include a VLAN arm: {f}");
     }
 
+    // Excluded on Windows (not just #[ignore]d): this is the only test that
+    // references a pcap runtime symbol (Capture::dead). Merely compiling the
+    // reference into the test binary makes wpcap.dll a load-time import, and the
+    // Npcap *runtime* DLL is absent in Windows CI (only the SDK link libs are
+    // installed) — so the whole test binary would fail to load with
+    // STATUS_DLL_NOT_FOUND. cfg-ing it out drops the import; Linux and macOS still
+    // run the libpcap compile check.
+    #[cfg(not(windows))]
     #[test]
-    #[cfg_attr(windows, ignore = "calls into pcap, which delay-loads wpcap.dll; \
-        the Npcap runtime is not installed in Windows CI (only the SDK link libs)")]
     fn generated_filters_compile_in_libpcap() {
         // The real guarantee: libpcap must accept the generated expression (VLAN arm
         // included) on an Ethernet datalink. A dead capture compiles without a device.
