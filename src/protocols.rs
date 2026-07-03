@@ -118,7 +118,6 @@ pub struct PtpInfo {
     pub port_id:           Option<u16>,
     pub sequence_id:       u16,
     pub log_sync_interval: i8,
-    pub log_min_pdelay_req_interval: i8,
     // Protocol association
     pub protocol_kind:     Option<String>,           // Parent AV protocol name (AES67, ST2110, Dante, AVB)
     pub src_ip:            Option<std::net::Ipv4Addr>, // Source IP (UDP PTP); None for L2 gPTP
@@ -443,17 +442,23 @@ pub struct TransmitterSignals {
 /// existing ConMon/Control detection, not here.
 pub fn dante_control_plane_class(src_port: u16, dst_port: u16) -> Option<TransmitterClass> {
     let either = |f: &dyn Fn(u16) -> bool| f(src_port) || f(dst_port);
-    // DVS control & monitoring: external 38700–38708 / 38800, internal 38900 / 8899.
-    let is_dvs = |p: u16| (38700..=38708).contains(&p) || p == 38800 || p == 38900 || p == 8899;
+    // DVS control & monitoring: external 38700–38708 / 38800, internal 38900.
+    let is_dvs = |p: u16| (38700..=38708).contains(&p) || p == 38800 || p == 38900;
     // Via: control & monitoring 28700–28708 / 28800 / 28900, control 4777,
     // audio control 24440/24441/24444/24455, audio 34336–34600.
     let is_via = |p: u16| (28700..=28708).contains(&p) || p == 28800 || p == 28900 || p == 4777
         || matches!(p, 24440 | 24441 | 24444 | 24455) || (34336..=34600).contains(&p);
-    // Hardware/FPGA tells: metering 8751 (FPGA-based devices), FPGA flow keepalive 61440–61951.
-    let is_hw = |p: u16| p == 8751 || (61440..=61951).contains(&p);
-    if either(&is_dvs) { Some(TransmitterClass::Dvs) }
+    // Hardware/FPGA tell: metering 8751 (FPGA-based devices).
+    let is_hw = |p: u16| p == 8751;
+    // Ambiguous tells that overlap common non-Dante ports: the FPGA flow keepalive
+    // range 61440–61951 sits inside the OS ephemeral range (49152–65535), and DVS
+    // 8899 is a common alt-HTTP port. Match these on the DESTINATION port only — a
+    // random ephemeral *source* port must not fingerprint an unrelated flow as Dante.
+    let is_dvs_dst = |p: u16| p == 8899;
+    let is_hw_dst  = |p: u16| (61440..=61951).contains(&p);
+    if either(&is_dvs) || is_dvs_dst(dst_port) { Some(TransmitterClass::Dvs) }
     else if either(&is_via) { Some(TransmitterClass::Via) }
-    else if either(&is_hw) { Some(TransmitterClass::Hardware) }
+    else if either(&is_hw) || is_hw_dst(dst_port) { Some(TransmitterClass::Hardware) }
     else { None }
 }
 
@@ -575,6 +580,16 @@ pub struct SdpMedia {
     pub mediaclk:      String,
 }
 
+impl SdpMedia {
+    /// Parse the `c=` connection line ("IN IP4 <addr>[/ttl]") into its IPv4
+    /// address, if present and well-formed. `None` when the media has no
+    /// connection line — callers then fall back to port-only matching.
+    pub fn connection_ip(&self) -> Option<Ipv4Addr> {
+        let addr = self.connection.trim().strip_prefix("IN IP4 ")?;
+        addr.split('/').next()?.trim().parse().ok()
+    }
+}
+
 #[cfg(test)]
 mod transmitter_tests {
     use super::*;
@@ -585,7 +600,7 @@ mod transmitter_tests {
         assert_eq!(dante_control_plane_class(38700, 50000), Some(TransmitterClass::Dvs));
         assert_eq!(dante_control_plane_class(50000, 38708), Some(TransmitterClass::Dvs));
         assert_eq!(dante_control_plane_class(38800, 1), Some(TransmitterClass::Dvs));
-        assert_eq!(dante_control_plane_class(8899, 1), Some(TransmitterClass::Dvs));
+        assert_eq!(dante_control_plane_class(1, 8899), Some(TransmitterClass::Dvs)); // 8899 is dst-only
     }
 
     #[test]
@@ -606,6 +621,19 @@ mod transmitter_tests {
     fn unrelated_ports_classify_nothing() {
         assert_eq!(dante_control_plane_class(5004, 5004), None);
         assert_eq!(dante_control_plane_class(8700, 8800), None); // hardware ConMon/control handled elsewhere
+    }
+
+    #[test]
+    fn ephemeral_source_port_not_classified_as_control_plane() {
+        // 61440–61951 (FPGA keepalive) overlaps the OS ephemeral source-port range,
+        // and 8899 is a common alt-HTTP port. A random *source* port there must not
+        // fingerprint an unrelated flow as a Dante device — only a destination port
+        // in these ranges counts.
+        assert_eq!(dante_control_plane_class(61500, 50000), None);
+        assert_eq!(dante_control_plane_class(8899, 50000), None);
+        // But a destination port in-family still fingerprints the service.
+        assert_eq!(dante_control_plane_class(50000, 61500), Some(TransmitterClass::Hardware));
+        assert_eq!(dante_control_plane_class(50000, 8899), Some(TransmitterClass::Dvs));
     }
 
     // ── classify_transmitter: control-plane (Confirmed) ───────────────────────

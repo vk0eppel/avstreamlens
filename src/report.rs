@@ -15,6 +15,17 @@ fn ansi(code: &str, text: &str) -> String {
     }
 }
 
+// Whether report-body lines are written to stdout. Always true except during a
+// quiet-mode healthy cycle, when `print_report` sets it false so the report goes
+// to the log file only (the documented `--quiet` contract). Thread-local, mirror
+// of the `COLOR` global — set once at the top of `print_report`, restored at the
+// end. The log file always receives every line regardless of this flag.
+thread_local! {
+    static STDOUT_ENABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+fn stdout_enabled() -> bool { STDOUT_ENABLED.with(|c| c.get()) }
+fn set_stdout_enabled(v: bool) { STDOUT_ENABLED.with(|c| c.set(v)); }
+
 /// Log `text` to the file and print it coloured to stdout. The single place
 /// `report.rs` pairs file and console output — every report section used to
 /// repeat this same `logger.log(&x); println!("{}", ansi(c, &x));` pair at
@@ -22,14 +33,14 @@ fn ansi(code: &str, text: &str) -> String {
 #[inline]
 fn emit_line(logger: &mut Logger, color: &str, text: &str) {
     logger.log(text);
-    println!("{}", ansi(color, text));
+    if stdout_enabled() { println!("{}", ansi(color, text)); }
 }
 
 /// Log + print an uncoloured line (the no-colour sibling of `emit_line`).
 #[inline]
 fn plain_line(logger: &mut Logger, text: &str) {
     logger.log(text);
-    println!("{}", text);
+    if stdout_enabled() { println!("{}", text); }
 }
 
 /// Leading indent for a section's top-level entries (`▸ Name`, `Bandwidth: ...`).
@@ -90,7 +101,7 @@ fn emit_lines(lines: &[RenderedLine], logger: &mut Logger) {
 /// across Discovered/AVDECC/Clock Sources/Streams/Network Status.
 fn section_header(logger: &mut Logger, plain_label: &str, decorated_label: &str) {
     logger.log(&format!("\n{}", plain_label));
-    println!("{}", ansi("36", &format!("\n{}", decorated_label)));
+    if stdout_enabled() { println!("{}", ansi("36", &format!("\n{}", decorated_label))); }
 }
 use std::collections::{HashMap, HashSet};
 use std::net::Ipv4Addr;
@@ -164,16 +175,54 @@ pub struct Logger {
     file: std::fs::File,
 }
 
+/// Create a file at `path`, failing (rather than following or truncating) if
+/// anything already exists there. `create_new` maps to `O_CREAT | O_EXCL`, which
+/// refuses an existing path including a symlink; on Unix `O_NOFOLLOW` is added as
+/// belt-and-suspenders. This matters because live capture runs as root and the log
+/// is created in the current working directory, which may be attacker-writable — a
+/// plain `File::create` would follow a planted symlink and truncate its target.
+fn open_exclusive(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(libc::O_NOFOLLOW);
+    }
+    opts.open(path)
+}
+
 impl Logger {
     /// Create a new logger with a filename based on protocol prefix and timestamp.
+    /// The file is opened exclusively (never following a symlink or truncating an
+    /// existing file — see `open_exclusive`); on the rare name collision a few
+    /// randomized suffixes are tried before giving up.
     pub fn new(prefix: &str) -> std::io::Result<Self> {
         let now = Local::now();
-        let filename = format!(
-            "avstreamlens_{}-{:02}-{:02}_{:02}-{:02}-{:02}_{}.log",
+        let base = format!(
+            "avstreamlens_{}-{:02}-{:02}_{:02}-{:02}-{:02}_{}",
             now.year(), now.month(), now.day(), now.hour(), now.minute(), now.second(), prefix
         );
-        let file = std::fs::File::create(filename)?;
-        Ok(Logger { file })
+        for attempt in 0..8u32 {
+            let filename = if attempt == 0 {
+                format!("{base}.log")
+            } else {
+                let salt = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.subsec_nanos())
+                    .unwrap_or(attempt) ^ attempt;
+                format!("{base}_{:05x}.log", salt & 0xF_FFFF)
+            };
+            match open_exclusive(std::path::Path::new(&filename)) {
+                Ok(file) => return Ok(Logger { file }),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "could not create a unique log file",
+        ))
     }
 
     /// Log a message to the file. Flushes immediately so the last lines
@@ -390,7 +439,7 @@ fn render_clock_sources(
     let mut lines = Vec::new();
     let multi_domain = ptp_domains.len() > 1;
 
-    for ((domain, version), stats) in ptp_domains.iter() {
+    for ((domain, _version), stats) in ptp_domains.iter() {
         let gm_icon = if stats.clock_valid { "✓" } else if stats.last_grandmaster.is_some() { "⚠" } else { "❌" };
 
         let proto_label = stats.protocol_kind.as_deref().unwrap_or("PTP");
@@ -474,10 +523,6 @@ fn render_clock_sources(
             }
             if max > 1_000_000 {
                 lines.push(RenderedLine::colored("33", status_detail("⚠  PTP path delay > 1ms — too many hops between this node and grandmaster")));
-            }
-            if *version == PTP_VERSION_V1 && hops >= 3 {
-                let min_latency = if hops >= 10 { "5ms" } else if hops >= 5 { "2ms" } else { "0.5ms" };
-                lines.push(RenderedLine::plain(status_detail(&format!("ℹ  {} hops: Dante latency should be ≥ {}", hops, min_latency))));
             }
         }
 
@@ -850,15 +895,17 @@ pub fn print_report(snap: &ReportSnapshot, session: &mut ReportSession, logger: 
     let health_summary =
         health.build_health_summary(streams, tcp_streams, ptp_domains, msrp_state, eee_ports);
 
-    // ── Quiet-mode early exit ───────────────────────────────────────────────
-    // Healthy = no Health Summary bullets AND no pcap drops. pcap drops are not a
-    // score factor, but they still force output so the operator sees the
-    // "measurements may be understated" warning in Network Status.
-    let pcap_drops_ok = pcap_stats.is_none_or(|(_, d, id)| d == 0 && id == 0);
-    if quiet && health_summary.is_empty() && pcap_drops_ok {
-        logger.log("");
-        return;
-    }
+    // ── Quiet mode: suppress stdout only, never the log ─────────────────────
+    // A quiet cycle prints nothing to stdout when the report is fully healthy —
+    // no summary bullets, no pcap drops, no missing required clock, and no
+    // section-level diagnostic alert (the latter two carry no Health-Score penalty
+    // so the summary can't see them; see `quiet_suppressible`). The log file always
+    // receives the full report, so `--quiet` never loses a record of the cycle.
+    let section_alerts: [&[Alert]; 4] =
+        [ip_config_alerts, conmon_bridge_alerts, follower_census_alerts, ptp_sync_alerts];
+    let suppress_stdout =
+        quiet && quiet_suppressible(&health_summary, pcap_stats, missing_ptp, &section_alerts);
+    set_stdout_enabled(!suppress_stdout);
 
     // ── 1. Report header block + Health Score ──────────────────────────────
     let score = format!("{:.0}%", health.network_score);
@@ -866,9 +913,11 @@ pub fn print_report(snap: &ReportSnapshot, session: &mut ReportSession, logger: 
     logger.log(&format!("\n{}", rule));
     logger.log(&format!("  AVStreamLens  ·  {}", full_timestamp));
     logger.log(&rule);
-    println!("\n{}", ansi("36", &rule));
-    println!("{}", ansi("36", &format!("  AVStreamLens  ·  {}", full_timestamp)));
-    println!("{}", ansi("36", &rule));
+    if stdout_enabled() {
+        println!("\n{}", ansi("36", &rule));
+        println!("{}", ansi("36", &format!("  AVStreamLens  ·  {}", full_timestamp)));
+        println!("{}", ansi("36", &rule));
+    }
 
     // Time is already in the header rule line above (full date + time) — don't repeat it here.
     let header = if proto_parts.is_empty() {
@@ -877,7 +926,7 @@ pub fn print_report(snap: &ReportSnapshot, session: &mut ReportSession, logger: 
         format!("\n🔬 Network Health — {}  |  {}", score, streams_str)
     };
     logger.log(&format!("Network Health — {}  |  {}", score, streams_str));
-    println!("{}", ansi("36", &header));
+    if stdout_enabled() { println!("{}", ansi("36", &header)); }
 
     // ── 2. Health Summary ───────────────────────────────────────────────────
     // Rendered only when the Health Score is below 100% (non-empty summary). A
@@ -942,6 +991,30 @@ pub fn print_report(snap: &ReportSnapshot, session: &mut ReportSession, logger: 
     emit_lines(&network_status_lines, logger);
 
     logger.log("");
+    // Restore stdout for any output that follows this report (e.g. next cycle's
+    // alerts emitted via capture::emit, which does not consult this gate).
+    set_stdout_enabled(true);
+}
+
+/// Whether a quiet-mode cycle may suppress stdout. Only when the report is fully
+/// healthy: no Health Summary bullets, no pcap kernel/interface drops, no missing
+/// required clock, and none of the section-level diagnostic alerts (Dante
+/// IP-config, ConMon bridge, follower census, PTP sync conflict). Missing clocks
+/// and section alerts carry no Health-Score penalty, so they are invisible to the
+/// summary and must be checked explicitly — otherwise `--quiet` would hide a
+/// "no clock" or "redundancy bridged" warning entirely. The log file always
+/// receives the full report regardless of this decision.
+fn quiet_suppressible(
+    health_summary: &[String],
+    pcap_stats: Option<(u32, u32, u32)>,
+    missing_ptp: &[MissingClock],
+    section_alerts: &[&[Alert]],
+) -> bool {
+    let pcap_drops_ok = pcap_stats.is_none_or(|(_, d, id)| d == 0 && id == 0);
+    health_summary.is_empty()
+        && pcap_drops_ok
+        && missing_ptp.is_empty()
+        && section_alerts.iter().all(|a| a.is_empty())
 }
 
 /// Render a `MissingClock` as the user-facing red alert line.
@@ -1062,6 +1135,116 @@ mod tests {
     fn tag_inferred_hardware_single_signal() {
         let v = TransmitterVerdict { class: TransmitterClass::Hardware, confidence: TransmitterConfidence::Inferred, signals: 1 };
         assert_eq!(transmitter_tag(Some(v)), "  ·  Hardware (likely)");
+    }
+
+    // ── quiet-mode suppression decision ─────────────────────────────────────
+
+    #[test]
+    fn quiet_suppressible_false_when_required_clock_missing() {
+        // A missing required clock carries no Health-Score penalty when there is no
+        // PTP traffic at all (ptp_domains empty), so the summary is empty — but
+        // quiet must NOT suppress a "no clock" warning.
+        let missing = [MissingClock { kind: MissingClockKind::Ptp, affected: vec!["Dante"] }];
+        assert!(!quiet_suppressible(&[], None, &missing, &[]));
+    }
+
+    #[test]
+    fn quiet_suppressible_false_when_section_alert_present() {
+        // Section-level diagnostics (Dante IP-config, ConMon bridge, follower
+        // census, PTP sync conflict) are not Health-Summary bullets, so quiet must
+        // check them explicitly.
+        let alerts = [Alert::error("Dante redundancy bridged")];
+        let slices: [&[Alert]; 1] = [&alerts];
+        assert!(!quiet_suppressible(&[], None, &[], &slices));
+    }
+
+    #[test]
+    fn quiet_suppressible_true_when_fully_healthy() {
+        assert!(quiet_suppressible(&[], None, &[], &[]));
+        assert!(quiet_suppressible(&[], Some((100, 0, 0)), &[], &[]), "zero drops is healthy");
+    }
+
+    #[test]
+    fn quiet_suppressible_false_on_pcap_drops_or_summary() {
+        assert!(!quiet_suppressible(&[], Some((100, 5, 0)), &[], &[]), "kernel drops force output");
+        assert!(!quiet_suppressible(&["⚠ loss".to_string()], None, &[], &[]), "summary forces output");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn log_open_refuses_to_follow_symlink() {
+        // Live capture runs as root and the log is created in CWD, which may be
+        // attacker-writable (/tmp, a shared dir). A pre-planted symlink at the log
+        // path must NOT be followed and its target must NOT be truncated.
+        let dir = std::env::temp_dir().join(format!("avsl_symlink_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let victim = dir.join("victim.txt");
+        std::fs::write(&victim, b"important").unwrap();
+        let link = dir.join("planted.log");
+        std::os::unix::fs::symlink(&victim, &link).unwrap();
+
+        let res = open_exclusive(&link);
+        assert!(res.is_err(), "must refuse to open through an existing symlink path");
+        assert_eq!(std::fs::read(&victim).unwrap(), b"important",
+            "the symlink target must not be truncated");
+
+        // A fresh, unplanted path still succeeds.
+        assert!(open_exclusive(&dir.join("fresh.log")).is_ok());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn quiet_healthy_cycle_still_writes_full_report_to_log() {
+        use std::io::Read;
+        // The documented --quiet contract: a fully healthy cycle prints nothing to
+        // stdout but MUST still write the complete report to the log file.
+        let streams = HashMap::new(); let tcp = HashMap::new(); let ptp = HashMap::new();
+        let avtp = HashMap::new(); let msrp = HashMap::new(); let mvrp = HashSet::new();
+        let eee = HashMap::new(); let dsrc = HashSet::new(); let dnames = HashMap::new();
+        let dconmon = HashMap::new(); let dunver = HashSet::new(); let nsrc = HashSet::new();
+        let nnames = HashMap::new(); let avdecc = HashMap::new();
+        let health = NetworkHealth::new();
+        let snap = ReportSnapshot {
+            streams: &streams, tcp_streams: &tcp, ptp_domains: &ptp, missing_ptp: &[],
+            health: &health, bytes_this_window: 0, avtp_streams: &avtp, msrp_state: &msrp,
+            mvrp_vlans: &mvrp, eee_ports: &eee, dante_sources: &dsrc, dante_names: &dnames,
+            dante_conmon: &dconmon, dante_unverified: &dunver, ndi_sources: &nsrc, ndi_names: &nnames,
+            avdecc_entities: &avdecc, pause_frames: 0, pfc_frames: 0, pcap_stats: None,
+            packets_dispatched: 0, ip_config_alerts: &[], conmon_bridge_alerts: &[],
+            follower_census_alerts: &[], ptp_sync_alerts: &[], clock_dropout_correlated: false,
+        };
+        let tmp = std::env::temp_dir().join(format!("avsl_quiet_{}.log", std::process::id()));
+        let file = std::fs::File::options().read(true).write(true).create(true).truncate(true)
+            .open(&tmp).unwrap();
+        let mut logger = Logger { file };
+        let mut session = ReportSession { quiet: true, no_flows_diagnostic_shown: false };
+        print_report(&snap, &mut session, &mut logger);
+
+        let mut contents = String::new();
+        std::fs::File::open(&tmp).unwrap().read_to_string(&mut contents).unwrap();
+        std::fs::remove_file(&tmp).ok();
+        assert!(contents.contains("Network Health"),
+            "log must contain the full report even when quiet suppresses stdout");
+        assert!(contents.contains("Network Status:"), "log must include all sections");
+    }
+
+    // ── Clock Sources: PTPv1 hops advisory removed ──────────────────────────
+
+    #[test]
+    fn ptpv1_domain_does_not_render_hops_latency_advisory() {
+        // PTPv1 path delay is never measured (parse_ptp_v1 returns None for
+        // path_delay_ns), so the old "N hops: Dante latency should be ≥ X" line was
+        // unreachable. Even when the path-delay fields are populated, a v1 domain
+        // must not render it — v1 path delay is not a real measurement.
+        let mut domains = HashMap::new();
+        let mut ptp = PtpStats::new(0, PTP_VERSION_V1);
+        ptp.min_path_delay_ns = Some(20_000); // 4 "hops" by the 5µs heuristic
+        ptp.max_path_delay_ns = Some(20_000);
+        domains.insert((0, PTP_VERSION_V1), ptp);
+
+        let lines = render_clock_sources(&domains, &[], &HashMap::new(), false).unwrap();
+        assert!(!lines.iter().any(|l| l.text.contains("Dante latency should be")),
+            "PTPv1 must not render the hops latency advisory");
     }
 
     // ── shared indent constants (Network Status alignment) ───────────────────

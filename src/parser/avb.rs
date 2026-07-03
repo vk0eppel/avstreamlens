@@ -99,30 +99,56 @@ pub fn parse_msrp(payload: &[u8]) -> Vec<MsrpDeclaration> {
     decls
 }
 
-/// Parse an MVRP PDU (IEEE 802.1Q, EtherType 0x88F5).
-/// Returns the list of VLAN IDs being registered (deduped).
+/// Parse an MVRP PDU (IEEE 802.1Q clause 10, EtherType 0x88F5).
+/// Returns the list of registered VLAN IDs (deduped).
+///
+/// MVRP is an MRP application. An MRPDU is `ProtocolVersion(1)` followed by
+/// Messages and a two-octet EndMark. Each Message is
+/// `AttributeType(1) AttributeLength(1)` then a run of VectorAttributes ended by a
+/// two-octet EndMark. **MVRP has no AttributeListLength field** — that is specific
+/// to MSRP; treating the VectorHeader as a byte count (the previous bug) misreads
+/// the VLAN ID and mis-advances the walker. Each VectorAttribute is
+/// `VectorHeader(2)` = `LeaveAllEvent(3 bits) | NumberOfValues(13 bits)`, then
+/// `FirstValue(AttributeLength)`, then `ceil(NumberOfValues/3)` ThreePackedEvents
+/// octets. VLAN attribute values are consecutive, so a vector of N values declares
+/// FirstValue, FirstValue+1, …, FirstValue+N-1.
 pub fn parse_mvrp(payload: &[u8]) -> Vec<u16> {
     let mut vlans: Vec<u16> = Vec::new();
-    if payload.is_empty() || payload[0] != 0x00 { return vlans; }
+    if payload.is_empty() || payload[0] != 0x00 { return vlans; } // ProtocolVersion
 
     let mut pos = 1usize;
     while pos < payload.len() {
         let attr_type = payload[pos];
-        if attr_type == 0x00 { break; }
-        if pos + 4 > payload.len() { break; }
+        if attr_type == 0x00 { break; }  // first octet of the MRPDU EndMark
+        pos += 1;
+        if pos >= payload.len() { break; }
+        let attr_len = payload[pos] as usize;
+        pos += 1;
+        if attr_len == 0 { break; }      // malformed
 
-        let attr_len = payload[pos + 1] as usize;
-        let list_len = u16::from_be_bytes([payload[pos + 2], payload[pos + 3]]) as usize;
-        pos += 4;
+        // VectorAttribute list, terminated by a two-octet EndMark (0x0000).
+        loop {
+            if pos + 2 > payload.len() { return vlans; }
+            let vector_header = u16::from_be_bytes([payload[pos], payload[pos + 1]]);
+            pos += 2;
+            if vector_header == 0 { break; }  // EndMark for this attribute's vectors
+            let num_values = (vector_header & 0x1FFF) as usize;
+            if num_values == 0 { continue; }  // LeaveAll-only: no FirstValue, no vector
 
-        // VLAN ID: AttributeType=1, AttributeLength=2
-        if attr_type == 1 && attr_len == 2 && pos + 2 + 2 <= payload.len() {
-            let vid = u16::from_be_bytes([payload[pos + 2], payload[pos + 3]]) & 0x0FFF;
-            if vid > 0 && !vlans.contains(&vid) { vlans.push(vid); }
+            if pos + attr_len > payload.len() { return vlans; }
+            if attr_type == 1 && attr_len == 2 {
+                let base = u16::from_be_bytes([payload[pos], payload[pos + 1]]) & 0x0FFF;
+                for i in 0..num_values {
+                    let vid = base.wrapping_add(i as u16) & 0x0FFF;
+                    if vid > 0 && !vlans.contains(&vid) { vlans.push(vid); }
+                }
+            }
+            pos += attr_len;                 // consume FirstValue
+
+            let packed = num_values.div_ceil(3);
+            if pos + packed > payload.len() { return vlans; }
+            pos += packed;                   // consume ThreePackedEvents
         }
-
-        if list_len == 0 { break; }
-        pos += list_len;
     }
     vlans
 }
@@ -218,15 +244,50 @@ mod tests {
 
     #[test]
     fn mvrp_single_vlan_id_parsed() {
+        // Spec-correct MVRP MRPDU (IEEE 802.1Q clause 10) — NO AttributeListLength
+        // field (that is an MSRP-only field). Layout:
+        //   ProtocolVersion(1) AttributeType(1) AttributeLength(1)
+        //   VectorHeader(2) FirstValue(2) ThreePackedEvents(ceil(N/3)) EndMark(2)
         let p = [
-            0x00,       // version
-            0x01,       // attr_type = VLAN member
-            0x02,       // attr_len = 2
-            0x00, 0x04, // list_len = 4
-            0x00, 0x01, // VectorHeader
+            0x00,       // ProtocolVersion
+            0x01,       // AttributeType = VID
+            0x02,       // AttributeLength = 2
+            0x00, 0x01, // VectorHeader: LeaveAll=0, NumberOfValues=1
             0x00, 0x64, // FirstValue = VLAN 100
+            0x00,       // ThreePackedEvents (1 value → 1 octet; content ignored)
+            0x00, 0x00, // EndMark
         ];
         assert_eq!(parse_mvrp(&p), vec![100]);
+    }
+
+    #[test]
+    fn mvrp_multi_value_vector_yields_consecutive_vids() {
+        // A VectorAttribute with NumberOfValues=3 declares VLANs FirstValue,
+        // FirstValue+1, FirstValue+2 (VLAN attribute values are consecutive).
+        let p = [
+            0x00,       // ProtocolVersion
+            0x01,       // AttributeType = VID
+            0x02,       // AttributeLength = 2
+            0x00, 0x03, // VectorHeader: NumberOfValues=3
+            0x00, 0x64, // FirstValue = VLAN 100
+            0x00,       // ThreePackedEvents (ceil(3/3)=1 octet)
+            0x00, 0x00, // EndMark
+        ];
+        assert_eq!(parse_mvrp(&p), vec![100, 101, 102]);
+    }
+
+    #[test]
+    fn mvrp_leave_all_only_vector_has_no_vid() {
+        // A LeaveAll-only VectorAttribute (NumberOfValues=0) carries no FirstValue
+        // and no packed-events octets — it must not fabricate a VLAN ID.
+        let p = [
+            0x00,       // ProtocolVersion
+            0x01,       // AttributeType = VID
+            0x02,       // AttributeLength = 2
+            0x20, 0x00, // VectorHeader: LeaveAll=1, NumberOfValues=0
+            0x00, 0x00, // EndMark
+        ];
+        assert!(parse_mvrp(&p).is_empty());
     }
 
     #[test]

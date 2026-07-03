@@ -170,7 +170,6 @@ fn parse_ptp_v1(payload: &[u8], hdr_shift: usize) -> Option<PtpInfo> {
         port_id,
         sequence_id,
         log_sync_interval,
-        log_min_pdelay_req_interval: 0,
         protocol_kind:               None,
         src_ip:                      None, // set by caller
         stratum:                     ptp_stratum,
@@ -239,12 +238,6 @@ pub fn parse_ptp(payload: &[u8]) -> Option<PtpInfo> {
         None
     };
 
-    let log_min_pdelay_req_interval = if payload.len() >= 55 {
-        payload[54] as i8
-    } else {
-        0
-    };
-
     // Grandmaster (Announce only): identity at bytes 53-60, quality at 48-49.
     let grandmaster_id = if message_type == 0x0B && payload.len() >= 64 {
         Some(format!("{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
@@ -286,7 +279,6 @@ pub fn parse_ptp(payload: &[u8]) -> Option<PtpInfo> {
         port_id,
         sequence_id,
         log_sync_interval,
-        log_min_pdelay_req_interval,
         protocol_kind:     None,  // set by caller
         src_ip:            None,  // set by caller
         stratum:           None,  // PTPv2 uses clockClass in Announce, not stratum

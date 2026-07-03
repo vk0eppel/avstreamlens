@@ -48,7 +48,7 @@
 
 - **JSON output mode (`--output json`)** *(nice to have — useful for headless/dashboard use, low priority for spot-check workflows)* — emit newline-delimited JSON (one object per report cycle) for Grafana/Prometheus/`jq` integration. Add `serde::Serialize` to `StreamStats`, `PtpStats`, `NetworkHealth`; serialize at the point `print_report` is called. Log file format unchanged unless `--output json` is set. (`src/report.rs`, `src/stats.rs`)
 
-- **SAP re-announcement rate monitoring** — RFC 2974 requires SAP senders to re-announce every ~30 s. Track `last_sap_time` per stream in `sdp_cache`; alert when >90 s with no re-announcement while the RTP stream is still live. Catches sources that silently drop off SAP. (`src/capture.rs` — `handle_sap`; `src/stats.rs` — `StreamStats` or `sdp_cache` entry)
+- **SAP re-announcement rate monitoring** — RFC 2974 requires SAP senders to re-announce every ~30 s. Track `last_sap_time` per stream in `sdp_cache`; alert when >90 s with no re-announcement while the RTP stream is still live. Catches sources that silently drop off SAP. Note: `parse_sap_packet` now rejects SAP *deletion* messages (T bit set) so they never reach `handle_sap`; a re-announce monitor should treat an explicit deletion as an intentional teardown (not an alert-worthy drop-off). (`src/capture.rs` — `handle_sap`; `src/stats.rs` — `StreamStats` or `sdp_cache` entry)
 
 - **Redundant stream pairing (ST 2110 / AES67)** — productions often run dual-redundant streams (same SSRC, same codec, two different multicast groups). Detect pairs by matching SSRC + clock_hz + media_type and report them as `primary / redundant` with a combined health indicator. (`src/capture.rs` — post-dispatch pairing pass; `src/report.rs`)
 

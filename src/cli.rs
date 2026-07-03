@@ -142,6 +142,46 @@ mod color_tests {
     }
 }
 
+#[cfg(test)]
+mod bpf_tests {
+    use super::build_bpf_filter;
+    use crate::protocols::ProtocolChoice;
+
+    #[test]
+    fn selective_filter_includes_vlan_tagged_arm() {
+        // Plain udp/igmp/ether-proto primitives match only UNtagged frames. On a
+        // Linux trunk/SPAN port (where tagged AVB traffic lives) a parallel
+        // `vlan and (...)` arm is required or every tagged frame is dropped by the
+        // kernel filter before the parser's unwrap_vlan ever runs.
+        let f = build_bpf_filter(&[ProtocolChoice::AES67]);
+        assert!(f.contains("vlan and ("), "selective filter must include a VLAN arm: {f}");
+    }
+
+    #[test]
+    fn all_protocols_filter_includes_vlan_tagged_arm() {
+        let f = build_bpf_filter(&[ProtocolChoice::All]);
+        assert!(f.contains("vlan and ("), "all-protocols filter must include a VLAN arm: {f}");
+    }
+
+    #[test]
+    fn generated_filters_compile_in_libpcap() {
+        // The real guarantee: libpcap must accept the generated expression (VLAN arm
+        // included) on an Ethernet datalink. A dead capture compiles without a device.
+        use pcap::{Capture, Linktype};
+        let cases = [
+            vec![ProtocolChoice::All],
+            vec![ProtocolChoice::AES67, ProtocolChoice::Dante],
+            vec![ProtocolChoice::AVB],
+            vec![ProtocolChoice::NDI],
+        ];
+        for choices in cases {
+            let f = build_bpf_filter(&choices);
+            let cap = Capture::dead(Linktype::ETHERNET).expect("dead capture");
+            assert!(cap.compile(&f, true).is_ok(), "filter must compile in libpcap: {f}");
+        }
+    }
+}
+
 /// Resolve a device by exact pcap name (e.g. `en0`).
 /// Exits with a clear error if the name is not found.
 pub fn resolve_interface_by_name(name: &str) -> Device {
@@ -355,7 +395,19 @@ pub fn build_bpf_filter(selected: &[ProtocolChoice]) -> String {
 
     // After All/Audio/Video expansion, every concrete ProtocolChoice triggers
     // one of needs_udp/tcp/avb — so this list always has at least 5 entries.
-    filters.join(" or ")
+    with_vlan_arm(&filters.join(" or "))
+}
+
+/// Duplicate a BPF expression under a `vlan and (...)` arm so the filter matches
+/// both untagged and 802.1Q-tagged frames. libpcap's plain primitives (`udp`,
+/// `igmp`, `ether proto …`) only match untagged frames; the `vlan` keyword shifts
+/// the decode offset so the same primitives match the tagged payload. Per tcpdump
+/// semantics the `vlan` keyword mutates offsets for the remainder of the
+/// expression, so it goes LAST as a self-contained arm with the untagged
+/// expression first. Covers a single tag; QinQ (stacked tags) would need a second
+/// nested `vlan` and is out of scope (documented as a capture-setup caveat).
+fn with_vlan_arm(expr: &str) -> String {
+    format!("({expr}) or (vlan and ({expr}))")
 }
 
 /// Suffix showing which infrastructure protocols are auto-enabled alongside the
@@ -423,5 +475,5 @@ fn macos_port_names() -> std::collections::HashMap<String, String> {
 }
 
 fn all_protocols_filter() -> String {
-    "igmp or udp or tcp or (ether proto 0x22f0) or (ether proto 0x22ea) or (ether proto 0x88f5) or (ether proto 0x88f7) or (ether proto 0x88cc) or (ether proto 0x8808)".to_string()
+    with_vlan_arm("igmp or udp or tcp or (ether proto 0x22f0) or (ether proto 0x22ea) or (ether proto 0x88f5) or (ether proto 0x88f7) or (ether proto 0x88cc) or (ether proto 0x8808)")
 }
