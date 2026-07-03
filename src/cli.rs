@@ -164,6 +164,8 @@ mod bpf_tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "calls into pcap, which delay-loads wpcap.dll; \
+        the Npcap runtime is not installed in Windows CI (only the SDK link libs)")]
     fn generated_filters_compile_in_libpcap() {
         // The real guarantee: libpcap must accept the generated expression (VLAN arm
         // included) on an Ethernet datalink. A dead capture compiles without a device.
