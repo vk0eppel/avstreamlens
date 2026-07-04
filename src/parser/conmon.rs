@@ -13,8 +13,21 @@
 //   [0-1]    flags/version  (0xffff seen on 8705, 0xfffe on 8708)
 //   [2-3]    u16 BE payload length — matches the UDP payload exactly
 //   [4-5]    u16 BE sequence number, monotonic per device
-//   [8-13]   sender MAC address (matches the Ethernet source)
+//   [8-15]   sender identity — 8 bytes; see below for the two wire formats seen
 //   [16-23]  ASCII "Audinate" — protocol signature
+//
+// Sender identity at [8-15] has two observed encodings. Audinate Brooklyn-class
+// firmware (Rio3224-D2) writes a plain 6-byte MAC in [8-13] with [14-15] unused.
+// Other Yamaha modules (mpsoc-based Rio1608-D3, confirmed 2026-07-04 from a
+// live false-positive report) instead write a *modified EUI-64* — the standard
+// `OUI + FF:FE + NIC-bytes` 8-byte expansion of a MAC, the same convention used
+// for 802.1AS/gPTP clock identities elsewhere in this codebase. Truncating that
+// to 6 bytes (as the parser used to) keeps only `OUI + FF:FE + <high NIC byte>`,
+// which collides across two devices sharing an OUI and high NIC byte — e.g.
+// `f4:d5:80:22:24:82` and `f4:d5:80:22:34:42` both truncate to
+// `f4:d5:80:ff:fe:22`, producing a false "Dante redundancy bridged" alert
+// (`check_conmon_bridge` in capture.rs). Detecting the `FF:FE` filler at
+// bytes [11-12] and stripping it recovers the real MAC in both encodings.
 //
 // Metering frames (port 8705) additionally carry an "MBC" tag at [0x2a..0x2d],
 // the channel count at [0x44], and one meter byte per channel from [0x47].
@@ -43,8 +56,16 @@ pub fn parse_conmon(payload: &[u8]) -> Option<ConmonInfo> {
         return None;
     }
 
-    let mut device_mac = [0u8; 6];
-    device_mac.copy_from_slice(&payload[8..14]);
+    let identity = &payload[8..16];
+    let device_mac = if identity[3] == 0xff && identity[4] == 0xfe {
+        // Modified EUI-64 (OUI + FF:FE + NIC bytes) — strip the filler to
+        // recover the real burned-in MAC. See the file header for why this
+        // matters: without it, devices sharing an OUI and high NIC byte
+        // collide when truncated to 6 bytes.
+        [identity[0], identity[1], identity[2], identity[5], identity[6], identity[7]]
+    } else {
+        [identity[0], identity[1], identity[2], identity[3], identity[4], identity[5]]
+    };
 
     // Metering frame: "MBC" tag, channel count, then one meter byte per channel.
     // The bounds check ties the count to the declared frame size so a stray
@@ -119,6 +140,41 @@ mod tests {
         let info = parse_conmon(&status_frame(mac)).expect("valid ConMon frame");
         assert_eq!(info.device_mac, mac);
         assert_eq!(info.channels, None);
+    }
+
+    /// Minimal status-style frame carrying an 8-byte modified-EUI-64 identity
+    /// (`OUI + FF:FE + NIC bytes`) at [8-15] instead of a plain 6-byte MAC.
+    fn eui64_status_frame(identity: [u8; 8]) -> Vec<u8> {
+        let mut p = vec![0u8; 64];
+        p[0] = 0xff;
+        p[1] = 0xfe;
+        p[2..4].copy_from_slice(&(64u16).to_be_bytes());
+        p[4..6].copy_from_slice(&0xb986u16.to_be_bytes());
+        p[8..16].copy_from_slice(&identity);
+        p[16..24].copy_from_slice(b"Audinate");
+        p
+    }
+
+    #[test]
+    fn eui64_identity_stripped_to_real_mac() {
+        // f4:d5:80:22:24:82 expanded to modified EUI-64: f4:d5:80:ff:fe:22:24:82
+        let info = parse_conmon(&eui64_status_frame([0xf4, 0xd5, 0x80, 0xff, 0xfe, 0x22, 0x24, 0x82]))
+            .expect("valid ConMon frame");
+        assert_eq!(info.device_mac, [0xf4, 0xd5, 0x80, 0x22, 0x24, 0x82]);
+    }
+
+    #[test]
+    fn eui64_identity_disambiguates_devices_sharing_oui_and_high_nic_byte() {
+        // Real bug report (2026-07-04): two Yamaha Rio1608-D3 devices whose
+        // real MACs both truncate to the same 6-byte value under the old
+        // (plain-MAC) parsing, causing a false "redundancy bridged" alert.
+        let a = parse_conmon(&eui64_status_frame([0xf4, 0xd5, 0x80, 0xff, 0xfe, 0x22, 0x24, 0x82]))
+            .expect("valid ConMon frame");
+        let b = parse_conmon(&eui64_status_frame([0xf4, 0xd5, 0x80, 0xff, 0xfe, 0x22, 0x34, 0x42]))
+            .expect("valid ConMon frame");
+        assert_eq!(a.device_mac, [0xf4, 0xd5, 0x80, 0x22, 0x24, 0x82]);
+        assert_eq!(b.device_mac, [0xf4, 0xd5, 0x80, 0x22, 0x34, 0x42]);
+        assert_ne!(a.device_mac, b.device_mac);
     }
 
     #[test]
