@@ -88,6 +88,28 @@ impl Alert {
     pub fn error(s: impl Into<String>) -> Self { Self { level: AlertLevel::Error, message: s.into() } }
 }
 
+/// Bounded-eviction insert shared by `DanteState::record_source` and
+/// `NdiState::record_source`: when `sources` is at `max` and `ip` is new, evicts
+/// one existing entry (arbitrary choice — anything but `ip` itself) from
+/// `sources` and lets `evict_extra` clear that same IP from the caller's sibling
+/// maps (names, transmitter_class, ...). Returns whether `ip` was newly seen.
+fn record_bounded_source(
+    sources: &mut HashSet<Ipv4Addr>,
+    max: usize,
+    ip: Ipv4Addr,
+    evict_extra: impl FnOnce(Ipv4Addr),
+) -> bool {
+    let is_new = !sources.contains(&ip);
+    if is_new && sources.len() >= max
+        && let Some(&victim) = sources.iter().find(|v| **v != ip)
+    {
+        sources.remove(&victim);
+        evict_extra(victim);
+    }
+    sources.insert(ip);
+    is_new
+}
+
 /// Dante-specific per-session state. Grouped so that Dante-only methods take
 /// a narrow `&mut DanteState` seam rather than all of `CaptureState`.
 pub struct DanteState {
@@ -158,15 +180,10 @@ impl DanteState {
     /// flood of spoofed source IPs cannot grow the maps without limit. Returns
     /// whether the IP was newly discovered (drives the discovery alert).
     pub fn record_source(&mut self, ip: Ipv4Addr, name: Option<&str>) -> bool {
-        let is_new = !self.sources.contains(&ip);
-        if is_new && self.sources.len() >= Self::MAX_SOURCES
-            && let Some(&victim) = self.sources.iter().find(|v| **v != ip)
-        {
-            self.sources.remove(&victim);
+        let is_new = record_bounded_source(&mut self.sources, Self::MAX_SOURCES, ip, |victim| {
             self.names.remove(&victim);
             self.transmitter_class.remove(&victim);
-        }
-        self.sources.insert(ip);
+        });
         if let Some(n) = name { self.names.insert(ip, n.to_string()); }
         is_new
     }
@@ -316,14 +333,9 @@ impl NdiState {
     /// bounded against a spoofed-source-IP flood. Evicts one existing entry when at
     /// capacity and the IP is new. Returns whether the IP was newly discovered.
     pub fn record_source(&mut self, ip: Ipv4Addr, name: Option<&str>) -> bool {
-        let is_new = !self.sources.contains(&ip);
-        if is_new && self.sources.len() >= Self::MAX_SOURCES
-            && let Some(&victim) = self.sources.iter().find(|v| **v != ip)
-        {
-            self.sources.remove(&victim);
+        let is_new = record_bounded_source(&mut self.sources, Self::MAX_SOURCES, ip, |victim| {
             self.names.remove(&victim);
-        }
-        self.sources.insert(ip);
+        });
         if let Some(n) = name { self.names.insert(ip, n.to_string()); }
         is_new
     }
@@ -881,7 +893,7 @@ impl CaptureState {
         {
             // AES67 requires DSCP EF (46) per spec
             if ip.get_dscp() != 46 { stats.dscp_violations += 1; }
-            if ip.get_ecn() == 3 { self.network_health.ecn_congestion_marks += 1; }
+            self.network_health.record_ecn_mark_if_congested(ip.get_ecn());
             stats.apply_pcp_advisory(pcp);
             if let Some((seq, ts, ssrc)) = parse_rtp(udp.payload()) {
                 if stats.expected_pt.is_some_and(|exp| payload_type != exp) {
@@ -930,7 +942,7 @@ impl CaptureState {
                 ip.get_dscp() == 46
             };
             if !dscp_ok { stats.dscp_violations += 1; }
-            if ip.get_ecn() == 3 { self.network_health.ecn_congestion_marks += 1; }
+            self.network_health.record_ecn_mark_if_congested(ip.get_ecn());
             stats.apply_pcp_advisory(pcp);
             if let Some((seq, ts, ssrc)) = parse_rtp(udp.payload()) {
                 let rtp_pt = udp.payload()[1] & 0x7F;
@@ -1017,7 +1029,7 @@ impl CaptureState {
                     let dscp = ip.get_dscp();
                     if stats.observed_dscp.is_none() { stats.observed_dscp = Some(dscp); }
                     dscp_seen = Some(dscp);
-                    if ip.get_ecn() == 3 { self.network_health.ecn_congestion_marks += 1; }
+                    self.network_health.record_ecn_mark_if_congested(ip.get_ecn());
                     // TTL routing check: Dante is L2-only; track minimum TTL so the
                     // report can alert when a router decremented it (TTL < 64 from a
                     // Linux/macOS source means ≥ 1 router hop — misconfiguration).
@@ -2853,6 +2865,27 @@ mod tests {
         assert!(d.names.len() <= cap, "names bounded, got {}", d.names.len());
         let newest = Ipv4Addr::from(cap as u32 + 49);
         assert!(d.sources.contains(&newest), "newest entry must be retained");
+    }
+
+    #[test]
+    fn dante_sources_eviction_also_clears_transmitter_class() {
+        // transmitter_class is DanteState's one field NdiState doesn't have —
+        // eviction must clear it too, or a stale verdict would survive under
+        // a recycled IP once MAX_SOURCES forces an eviction.
+        let mut d = DanteState::new();
+        let cap = DanteState::MAX_SOURCES;
+        let victim_candidate = Ipv4Addr::from(0u32);
+        d.record_source(victim_candidate, Some("nm"));
+        d.record_tx_class(victim_candidate, crate::protocols::TransmitterClass::Dvs);
+        for i in 1..(cap as u32 + 50) {
+            d.record_source(Ipv4Addr::from(i), Some("nm"));
+        }
+        assert!(
+            !d.sources.contains(&victim_candidate) || d.transmitter_class.contains_key(&victim_candidate),
+            "if the original source survived eviction its transmitter_class must too; \
+             if it was evicted, transmitter_class must not leak a stale verdict"
+        );
+        assert!(d.transmitter_class.len() <= cap, "transmitter_class bounded, got {}", d.transmitter_class.len());
     }
 
     #[test]

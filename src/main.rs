@@ -779,5 +779,97 @@ mod tests {
         assert!(state.joined_multicast.is_empty());
         assert!(mc_sockets.is_empty());
     }
+
+    // ── ts_refclk_alerts — SDP-claimed vs. wire PTP grandmaster cross-check ──
+
+    fn sdp_with_ts_refclk(port: u16, ts_refclk: &str) -> crate::protocols::SdpSession {
+        crate::protocols::SdpSession {
+            session_id: "1".to_string(),
+            session_name: "Test Mix".to_string(),
+            info: String::new(),
+            media: vec![crate::protocols::SdpMedia {
+                media_type: "audio".to_string(),
+                port,
+                payload_types: vec![96],
+                connection: String::new(),
+                rtpmap: "L24/48000/2".to_string(),
+                clock_hz: 48_000.0,
+                channels: 2,
+                ptime_ms: 1.0,
+                ts_refclk: ts_refclk.to_string(),
+                mediaclk: String::new(),
+            }],
+        }
+    }
+
+    fn active_aes67_stream(port: u16) -> crate::stats::StreamStats {
+        let mut s = crate::stats::StreamStats::new_with_info(
+            "AES67", 48_000.0, true, Ipv4Addr::new(239, 69, 0, 1), port);
+        s.packets = 10;
+        s
+    }
+
+    #[test]
+    fn ts_refclk_alerts_warns_when_claimed_domain_has_no_ptp_traffic() {
+        let mut state = CaptureState::new();
+        state.streams.insert("s1".into(), active_aes67_stream(5004));
+        state.sdp_cache.insert("1".into(),
+            sdp_with_ts_refclk(5004, "ptp=IEEE1588-2008:00-1a-e5-ff-fe-12-34-56:0"));
+        // No entry in state.ptp.domains for domain 0 at all.
+
+        let alerts = ts_refclk_alerts(&state);
+
+        assert_eq!(alerts.len(), 1);
+        assert!(alerts[0].message.contains("no PTP traffic detected"), "got {}", alerts[0].message);
+    }
+
+    #[test]
+    fn ts_refclk_alerts_silent_when_active_grandmaster_matches_claim() {
+        let mut state = CaptureState::new();
+        state.streams.insert("s1".into(), active_aes67_stream(5004));
+        state.sdp_cache.insert("1".into(),
+            sdp_with_ts_refclk(5004, "ptp=IEEE1588-2008:00-1a-e5-ff-fe-12-34-56:0"));
+
+        let mut ptp = crate::stats::PtpStats::new(0, protocols::PTP_VERSION_V2);
+        ptp.clock_valid = true;
+        ptp.last_grandmaster = Some("00:1a:e5:ff:fe:12:34:56".to_string());
+        state.ptp.domains.insert((0, protocols::PTP_VERSION_V2), ptp);
+
+        let alerts = ts_refclk_alerts(&state);
+
+        assert!(alerts.is_empty(), "matching grandmaster must not alert, got {:?}",
+            alerts.iter().map(|a| &a.message).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn ts_refclk_alerts_warns_on_grandmaster_mismatch() {
+        let mut state = CaptureState::new();
+        state.streams.insert("s1".into(), active_aes67_stream(5004));
+        state.sdp_cache.insert("1".into(),
+            sdp_with_ts_refclk(5004, "ptp=IEEE1588-2008:00-1a-e5-ff-fe-12-34-56:0"));
+
+        let mut ptp = crate::stats::PtpStats::new(0, protocols::PTP_VERSION_V2);
+        ptp.clock_valid = true;
+        ptp.last_grandmaster = Some("aa:bb:cc:dd:ee:ff:00:11".to_string());
+        state.ptp.domains.insert((0, protocols::PTP_VERSION_V2), ptp);
+
+        let alerts = ts_refclk_alerts(&state);
+
+        assert_eq!(alerts.len(), 1);
+        assert!(alerts[0].message.contains("grandmaster mismatch"), "got {}", alerts[0].message);
+    }
+
+    #[test]
+    fn ts_refclk_alerts_silent_when_session_not_active() {
+        // No stream references this SDP's port at all — session_active is false,
+        // so the ts-refclk cross-check must not fire even with a domain mismatch.
+        let mut state = CaptureState::new();
+        state.sdp_cache.insert("1".into(),
+            sdp_with_ts_refclk(5004, "ptp=IEEE1588-2008:00-1a-e5-ff-fe-12-34-56:0"));
+
+        let alerts = ts_refclk_alerts(&state);
+
+        assert!(alerts.is_empty());
+    }
 }
 

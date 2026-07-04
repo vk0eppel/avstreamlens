@@ -880,6 +880,15 @@ impl NetworkHealth {
         self.igmp_query_interval_secs.map(|i| i * 2 + 10).unwrap_or(260)
     }
 
+    /// Count an ECN Congestion-Experienced mark (ECN field value 3 — RFC 3168).
+    /// The single seam for this check — previously hand-copied identically in
+    /// `handle_aes67`, `handle_st2110`, and `handle_dante`.
+    pub fn record_ecn_mark_if_congested(&mut self, ecn: u8) {
+        if ecn == 3 {
+            self.ecn_congestion_marks += 1;
+        }
+    }
+
     /// Collect every active penalty this Window. Both `calculate_score` and
     /// `build_health_summary` are thin consumers of this function, so the
     /// score and the summary are always derived from the same source of truth.
@@ -1971,6 +1980,102 @@ mod tests {
         assert_eq!(s.ptime_ms, 4.0);
     }
 
+    // ── TcpStreamStats::update_quality / update_bitrate ──────────────────────
+
+    fn ndi_tcp() -> TcpStreamStats {
+        TcpStreamStats::new(Ipv4Addr::new(192, 168, 1, 60), Ipv4Addr::new(192, 168, 1, 5))
+    }
+
+    #[test]
+    fn tcp_quality_healthy_at_zero_retransmissions() {
+        let mut t = ndi_tcp();
+        t.update_quality();
+        assert_eq!(t.stream_quality, StreamQuality::Healthy);
+    }
+
+    #[test]
+    fn tcp_quality_healthy_at_two_retransmissions() {
+        let mut t = ndi_tcp();
+        t.retransmissions = 2;
+        t.update_quality();
+        assert_eq!(t.stream_quality, StreamQuality::Healthy, "boundary: 2 is still Healthy");
+    }
+
+    #[test]
+    fn tcp_quality_degrading_at_three_retransmissions() {
+        let mut t = ndi_tcp();
+        t.retransmissions = 3;
+        t.update_quality();
+        assert_eq!(t.stream_quality, StreamQuality::Degrading);
+    }
+
+    #[test]
+    fn tcp_quality_degrading_at_ten_retransmissions() {
+        let mut t = ndi_tcp();
+        t.retransmissions = 10;
+        t.update_quality();
+        assert_eq!(t.stream_quality, StreamQuality::Degrading, "boundary: 10 is still Degrading");
+    }
+
+    #[test]
+    fn tcp_quality_critical_at_eleven_retransmissions() {
+        let mut t = ndi_tcp();
+        t.retransmissions = 11;
+        t.update_quality();
+        assert_eq!(t.stream_quality, StreamQuality::Critical);
+    }
+
+    #[test]
+    fn tcp_quality_terminated_on_rst() {
+        let mut t = ndi_tcp();
+        t.rst_packets = 1;
+        t.update_quality();
+        assert_eq!(t.stream_quality, StreamQuality::Terminated);
+    }
+
+    #[test]
+    fn tcp_quality_terminated_overrides_high_retransmissions() {
+        let mut t = ndi_tcp();
+        t.retransmissions = 50;
+        t.rst_packets = 1;
+        t.update_quality();
+        assert_eq!(t.stream_quality, StreamQuality::Terminated, "RST dominates regardless of retransmission count");
+    }
+
+    #[test]
+    fn tcp_quality_healthy_on_single_fin() {
+        let mut t = ndi_tcp();
+        t.fin_packets = 1;
+        t.update_quality();
+        assert_eq!(t.stream_quality, StreamQuality::Healthy, "one FIN is a normal half-close, not termination");
+    }
+
+    #[test]
+    fn tcp_quality_terminated_on_second_fin() {
+        let mut t = ndi_tcp();
+        t.fin_packets = 2;
+        t.update_quality();
+        assert_eq!(t.stream_quality, StreamQuality::Terminated);
+    }
+
+    #[test]
+    fn tcp_bitrate_not_recalculated_within_one_second_window() {
+        let mut t = ndi_tcp();
+        t.bytes = 125_000; // 1 Mbit
+        t.update_bitrate();
+        assert_eq!(t.bitrate_bps, 0, "no recalculation until the 1s window elapses");
+    }
+
+    #[test]
+    fn tcp_bitrate_recalculated_after_window_elapses() {
+        let mut t = ndi_tcp();
+        t.bytes = 125_000; // 1 Mbit of bytes accumulated over the window
+        t.last_bitrate_check = Instant::now() - Duration::from_secs(2);
+        t.update_bitrate();
+        assert!(t.bitrate_bps > 0, "bitrate must be computed once the window has elapsed");
+        assert_eq!(t.bytes_at_check, 125_000, "checkpoint must advance to the current byte count");
+    }
+
     // ── PTP path-delay alert thresholds — pure, testable independent of rendering ─
 
     #[test]
@@ -2028,5 +2133,25 @@ mod tests {
         let s = PtpStats::new(0, crate::protocols::PTP_VERSION_V2);
         assert!(s.is_ip_ptp_domain());
         assert!(!s.is_gptp_domain());
+    }
+
+    // ── NetworkHealth::record_ecn_mark_if_congested ──────────────────────────
+    // Single seam for the ECN=3 check, previously hand-copied identically in
+    // handle_aes67, handle_st2110, and handle_dante.
+
+    #[test]
+    fn record_ecn_mark_if_congested_counts_ce_marked_packet() {
+        let mut health = NetworkHealth::new();
+        health.record_ecn_mark_if_congested(3);
+        assert_eq!(health.ecn_congestion_marks, 1);
+    }
+
+    #[test]
+    fn record_ecn_mark_if_congested_ignores_non_ce_ecn() {
+        let mut health = NetworkHealth::new();
+        for ecn in [0u8, 1, 2] {
+            health.record_ecn_mark_if_congested(ecn);
+        }
+        assert_eq!(health.ecn_congestion_marks, 0);
     }
 }

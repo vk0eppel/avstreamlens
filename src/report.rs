@@ -1355,4 +1355,103 @@ mod tests {
 
         assert!(!lines.iter().any(|l| l.text.contains("PCP")));
     }
+
+    // ── render_network_status — QoS / IGMP querier status strings ────────────
+
+    fn network_status_inputs<'a>(
+        streams: &'a HashMap<String, StreamStats>,
+        health: &'a NetworkHealth,
+        eee_ports: &'a HashMap<(String, String), (u16, u16)>,
+    ) -> NetworkStatusInputs<'a> {
+        NetworkStatusInputs {
+            mbps: 0.0,
+            streams,
+            health,
+            pause_frames: 0,
+            pfc_frames: 0,
+            eee_ports,
+            pcap_stats: None,
+            packets_dispatched: 0,
+        }
+    }
+
+    #[test]
+    fn qos_status_reads_no_ip_streams_when_all_ndi_or_avb() {
+        let mut streams = HashMap::new();
+        streams.insert("NDI a".into(), StreamStats::new("NDI", 0.0));
+        streams.insert("AVB a".into(), StreamStats::new("AVB", 0.0));
+        let health = NetworkHealth::new();
+
+        let lines = render_network_status(&network_status_inputs(&streams, &health, &HashMap::new()));
+
+        assert!(lines.iter().any(|l| l.text.contains("QoS: – (no IP streams)")),
+            "got {:?}", lines.iter().map(|l| &l.text).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn qos_status_reads_all_correct_when_no_dscp_violations() {
+        let mut streams = HashMap::new();
+        streams.insert("AES67 a".into(), StreamStats::new("AES67", 48_000.0));
+        let health = NetworkHealth::new();
+
+        let lines = render_network_status(&network_status_inputs(&streams, &health, &HashMap::new()));
+
+        assert!(lines.iter().any(|l| l.text.contains("QoS: ✓ all streams correctly marked")),
+            "got {:?}", lines.iter().map(|l| &l.text).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn qos_status_reports_violation_count() {
+        let mut streams = HashMap::new();
+        let mut bad = StreamStats::new("AES67", 48_000.0);
+        bad.dscp_violations = 3;
+        streams.insert("AES67 a".into(), bad);
+        let health = NetworkHealth::new();
+
+        let lines = render_network_status(&network_status_inputs(&streams, &health, &HashMap::new()));
+
+        assert!(lines.iter().any(|l| l.text.contains("QoS: ⚠ 1 stream(s) with incorrect DSCP")),
+            "got {:?}", lines.iter().map(|l| &l.text).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn igmp_status_reads_no_querier_seen() {
+        let streams: HashMap<String, StreamStats> = HashMap::new();
+        let health = NetworkHealth::new();
+
+        let lines = render_network_status(&network_status_inputs(&streams, &health, &HashMap::new()));
+
+        assert!(lines.iter().any(|l| l.text.contains("IGMP: – (no querier seen)")),
+            "got {:?}", lines.iter().map(|l| &l.text).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn igmp_status_reads_querier_silent_past_threshold() {
+        let streams: HashMap<String, StreamStats> = HashMap::new();
+        let mut health = NetworkHealth::new();
+        // Default querier_silent_after_secs() is 260s with no interval established.
+        health.last_igmp_query = Some(std::time::Instant::now() - Duration::from_secs(300));
+
+        let lines = render_network_status(&network_status_inputs(&streams, &health, &HashMap::new()));
+
+        assert!(lines.iter().any(|l| l.text.contains("IGMP: ⚠ querier silent")),
+            "got {:?}", lines.iter().map(|l| &l.text).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn igmp_status_reads_active_querier_with_interval_ip_and_mac() {
+        let streams: HashMap<String, StreamStats> = HashMap::new();
+        let mut health = NetworkHealth::new();
+        health.last_igmp_query = Some(std::time::Instant::now());
+        health.igmp_query_interval_secs = Some(125);
+        health.igmp_querier_ip = Some(Ipv4Addr::new(192, 168, 1, 1));
+        health.igmp_querier_mac = Some([0x00, 0x1a, 0x2b, 0x3c, 0x4d, 0x5e]);
+
+        let lines = render_network_status(&network_status_inputs(&streams, &health, &HashMap::new()));
+
+        let line = lines.iter().find(|l| l.text.contains("IGMP: ✓")).expect("querier line");
+        assert!(line.text.contains("192.168.1.1"), "got {}", line.text);
+        assert!(line.text.contains("00:1a:2b:3c:4d:5e"), "got {}", line.text);
+        assert!(line.text.contains("interval 125s"), "got {}", line.text);
+    }
 }
