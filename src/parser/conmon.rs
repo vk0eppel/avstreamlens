@@ -16,18 +16,21 @@
 //   [8-15]   sender identity — 8 bytes; see below for the two wire formats seen
 //   [16-23]  ASCII "Audinate" — protocol signature
 //
-// Sender identity at [8-15] has two observed encodings. Audinate Brooklyn-class
-// firmware (Rio3224-D2) writes a plain 6-byte MAC in [8-13] with [14-15] unused.
-// Other Yamaha modules (mpsoc-based Rio1608-D3, confirmed 2026-07-04 from a
-// live false-positive report) instead write a *modified EUI-64* — the standard
-// `OUI + FF:FE + NIC-bytes` 8-byte expansion of a MAC, the same convention used
-// for 802.1AS/gPTP clock identities elsewhere in this codebase. Truncating that
-// to 6 bytes (as the parser used to) keeps only `OUI + FF:FE + <high NIC byte>`,
-// which collides across two devices sharing an OUI and high NIC byte — e.g.
-// `f4:d5:80:22:24:82` and `f4:d5:80:22:34:42` both truncate to
-// `f4:d5:80:ff:fe:22`, producing a false "Dante redundancy bridged" alert
-// (`check_conmon_bridge` in capture.rs). Detecting the `FF:FE` filler at
-// bytes [11-12] and stripping it recovers the real MAC in both encodings.
+// Sender identity at [8-15] has two observed encodings, and which one a device
+// uses is per-firmware, not per-vendor — a live 14-device capture (2026-07-04)
+// showed both encodings from devices sharing the same Audinate OUI (00:1d:c1).
+// Some firmware (e.g. an Audinate Brooklyn-class Rio3224-D2) writes a plain
+// 6-byte MAC in [8-13] with [14-15] unused. Other firmware (confirmed on both
+// a Yamaha Rio1608-D3 and an Audinate-OUI device in the same capture) instead
+// writes a *modified EUI-64* — the standard `OUI + FF:FE + NIC-bytes` 8-byte
+// expansion of a MAC, the same convention used for 802.1AS/gPTP clock
+// identities elsewhere in this codebase. Truncating that to 6 bytes (as the
+// parser used to) keeps only `OUI + FF:FE + <high NIC byte>`, which collides
+// across two devices sharing an OUI and high NIC byte — e.g. `f4:d5:80:22:24:82`
+// and `f4:d5:80:22:34:42` both truncate to `f4:d5:80:ff:fe:22`, producing a
+// false "Dante redundancy bridged" alert (`check_conmon_bridge` in capture.rs).
+// Detecting the `FF:FE` filler at bytes [11-12] and stripping it recovers the
+// real MAC in both encodings.
 //
 // Metering frames (port 8705) additionally carry an "MBC" tag at [0x2a..0x2d],
 // the channel count at [0x44], and one meter byte per channel from [0x47].
