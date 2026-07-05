@@ -50,11 +50,8 @@ fn join_multicast_groups(
     expanded: &[protocols::ProtocolChoice],
     logger: &mut crate::report::Logger,
 ) -> Vec<UdpSocket> {
-    let needs_ptp = expanded.iter().any(|c| matches!(c,
-        protocols::ProtocolChoice::AES67 | protocols::ProtocolChoice::ST2110
-        | protocols::ProtocolChoice::Dante | protocols::ProtocolChoice::AVB));
-    let needs_sap = expanded.iter().any(|c| matches!(c,
-        protocols::ProtocolChoice::AES67 | protocols::ProtocolChoice::ST2110));
+    let needs_ptp = expanded.iter().any(|c| c.needs_ptp());
+    let needs_sap = expanded.iter().any(|c| c.needs_sap());
 
     let mut groups: Vec<(Ipv4Addr, &str)> = Vec::new();
     if needs_ptp {

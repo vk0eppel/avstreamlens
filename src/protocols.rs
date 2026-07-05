@@ -226,6 +226,14 @@ impl ProtocolChoice {
     pub fn needs_igmp(&self) -> bool {
         matches!(self, ProtocolChoice::AES67 | ProtocolChoice::ST2110 | ProtocolChoice::Dante)
     }
+
+    /// Whether this protocol choice's traffic requires SAP (Session Announcement)
+    /// multicast — same role as `needs_ptp`/`needs_igmp`, one source of truth
+    /// read by `is_selected`'s `Sap` arm and by `main::join_multicast_groups`
+    /// (which used to re-derive this list independently).
+    pub fn needs_sap(&self) -> bool {
+        matches!(self, ProtocolChoice::AES67 | ProtocolChoice::ST2110)
+    }
 }
 
 impl AvProtocol {
@@ -250,8 +258,7 @@ impl AvProtocol {
             // IGMP is only relevant for IP multicast protocols (AES67, ST2110, Dante)
             AvProtocol::Igmp { .. } => expanded.iter().any(|c| c.needs_igmp()),
             // SAP/SDP is only relevant for protocols that use it (AES67 and ST2110)
-            AvProtocol::Sap { .. } =>
-                expanded.iter().any(|c| matches!(c, ProtocolChoice::AES67 | ProtocolChoice::ST2110)),
+            AvProtocol::Sap { .. } => expanded.iter().any(|c| c.needs_sap()),
         }
     }
 }
@@ -280,6 +287,16 @@ mod gating_rules_tests {
         }
         assert!(!ProtocolChoice::AVB.needs_igmp(), "AVB is L2-only, no IP multicast");
         assert!(!ProtocolChoice::NDI.needs_igmp());
+    }
+
+    #[test]
+    fn needs_sap_true_only_for_aes67_and_st2110() {
+        for c in [ProtocolChoice::AES67, ProtocolChoice::ST2110] {
+            assert!(c.needs_sap(), "{:?} should need SAP", c);
+        }
+        assert!(!ProtocolChoice::Dante.needs_sap(), "Dante uses mDNS, not SAP");
+        assert!(!ProtocolChoice::AVB.needs_sap());
+        assert!(!ProtocolChoice::NDI.needs_sap());
     }
 
     #[test]
