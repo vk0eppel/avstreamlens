@@ -235,8 +235,12 @@ impl StreamStats {
     }
 
     /// `udp_payload_len`: actual length of UDP payload (without IP/UDP header),
-    /// used for exact bitrate calculation.
-    pub fn update(&mut self, seq: u16, rtp_ts: u32, ssrc: u32, udp_payload_len: usize) {
+    /// used for exact bitrate calculation. `now` drives jitter/IAT, dead-stream
+    /// presence, and bitrate — always the real capture clock live, but a
+    /// pcap-timestamp-derived virtual clock in offline replay (see issue #35),
+    /// so replaying a file faster or slower than real time still produces
+    /// correct rate/timing metrics instead of near-zero or wildly inflated ones.
+    pub fn update(&mut self, seq: u16, rtp_ts: u32, ssrc: u32, udp_payload_len: usize, now: Instant) {
         self.packets += 1;
         self.packets_this_window += 1;
         self.rtp_seen = true;
@@ -302,7 +306,6 @@ impl StreamStats {
         }
 
         // ── RFC 3550 §6.4.1 Jitter + IAT burst detection ──────────
-        let now = Instant::now();
 
         // Timing-regularity sampling (Transmitter Class) — before last_arrival is
         // overwritten below.
@@ -338,7 +341,7 @@ impl StreamStats {
 
         // Accumulate actual bytes (UDP payload) and calculate throughput every second.
         self.bytes_total += udp_payload_len as u64;
-        let elapsed = self.last_bitrate_check.elapsed();
+        let elapsed = now.saturating_duration_since(self.last_bitrate_check);
         if elapsed > Duration::from_secs(1) {
             let bytes_delta = self.bytes_total.saturating_sub(self.bytes_at_check);
             self.bitrate_bps = (bytes_delta as f64 * 8.0 / elapsed.as_secs_f64()) as u64;
@@ -360,7 +363,7 @@ impl StreamStats {
         self.last_arrival = Some(now);
         self.last_packet_time = Some(now);
         self.bytes_total += udp_payload_len as u64;
-        let elapsed = self.last_bitrate_check.elapsed();
+        let elapsed = now.saturating_duration_since(self.last_bitrate_check);
         if elapsed > Duration::from_secs(1) {
             let bytes_delta = self.bytes_total.saturating_sub(self.bytes_at_check);
             self.bitrate_bps = (bytes_delta as f64 * 8.0 / elapsed.as_secs_f64()) as u64;
@@ -1226,9 +1229,9 @@ impl PtpStats {
 
     /// Update from a freshly-parsed PTP message.
     /// Returns an event when grandmaster state changes, so the caller can print/log it.
-    pub fn update(&mut self, info: &crate::protocols::PtpInfo, protocol_kind: &Option<String>) -> Option<PtpEvent> {
+    pub fn update(&mut self, info: &crate::protocols::PtpInfo, protocol_kind: &Option<String>, now: Instant) -> Option<PtpEvent> {
         self.packets += 1;
-        self.last_seen = Instant::now();
+        self.last_seen = now;
         self.protocol_kind = protocol_kind.as_ref().map(|s| s.to_string());
         if let Some(ip) = info.src_ip { self.last_src_ip = Some(ip); }
         if let Some(ref id) = info.clock_id { self.last_clock_id = Some(id.clone()); }
@@ -1268,7 +1271,7 @@ impl PtpStats {
             // Clock is back — clear the "lost" sticky flag so the report stops
             // showing the stale "grandmaster disappeared" alert after recovery.
             self.protocol_clock_lost = false;
-            self.last_seen = Instant::now();
+            self.last_seen = now;
             if let Some(q) = &info.clock_quality {
                 self.last_quality = Some(q.clone());
             }
@@ -1276,7 +1279,7 @@ impl PtpStats {
 
         // ── Sync/Follow_Up: update last_seen and offset for timeout/reporting ────
         if info.message_type == 0x00 || info.message_type == 0x08 {
-            self.last_seen = Instant::now();
+            self.last_seen = now;
             self.last_offset_ns = info.correction_ns;
         }
         // A real Sync (0x00) marks an actual clock/grandmaster attempt — as opposed
@@ -1307,10 +1310,14 @@ impl PtpStats {
         event
     }
 
-    /// Call from the periodic report cycle (not from packet handlers).
+    /// Call from the periodic report cycle (not from packet handlers). `now` is
+    /// the real clock live, or a pcap-timestamp-derived virtual clock in
+    /// offline replay (issue #35) — using `.elapsed()` here would measure real
+    /// processing time, which in replay bears no relation to the capture's own
+    /// pace, so a clock loss could never fire (or could fire spuriously).
     /// Returns `Some(ClockLost)` if the clock just transitioned to LOST this call.
-    pub fn check_timeout(&mut self) -> Option<PtpEvent> {
-        if self.clock_valid && self.last_seen.elapsed() > Duration::from_secs(self.timeout_secs) {
+    pub fn check_timeout(&mut self, now: Instant) -> Option<PtpEvent> {
+        if self.clock_valid && now.saturating_duration_since(self.last_seen) > Duration::from_secs(self.timeout_secs) {
             self.clock_valid = false;
             self.protocol_clock_lost = true;
             self.last_grandmaster = None; // reset so re-detection fires DETECTED again
@@ -1368,14 +1375,70 @@ mod tests {
         StreamStats::new("AES67", 48_000.0)
     }
 
+    // ── Bitrate reflects the caller's clock, not wall time (issue #35) ───────
+    // Offline replay processes packets far faster (or slower) than the capture's
+    // own pace — bitrate must be computed from the `now` the caller passes in,
+    // not from real elapsed wall-clock time between two `update()` calls that
+    // might execute microseconds apart in a replay loop.
+
+    #[test]
+    fn bitrate_reflects_caller_supplied_now_not_wall_clock() {
+        let mut s = aes67();
+        let t0 = Instant::now();
+        s.update(0, 0, 1, 100, t0);
+        // A synthetic 2-second gap, passed explicitly — real wall-clock time
+        // between these two statements is microseconds, not 2 seconds.
+        let t1 = t0 + Duration::from_secs(2);
+        s.update(1, 48, 1, 1000, t1);
+        assert!(s.bitrate_bps > 0, "bitrate must reflect the 2s synthetic gap, not near-zero real elapsed time");
+        // bytes_at_check never advances on the first packet (elapsed since stream
+        // creation is near-zero, so the >1s check doesn't fire) — bytes_delta at
+        // the second update is both packets' bytes: 100 + 1000 = 1100 over ~2s ≈
+        // 4400 bits/sec. A small tolerance absorbs the real-time epsilon between
+        // stream construction and `t0`. If this were still wall-clock-driven (the
+        // bug), elapsed would be microseconds and bitrate would be astronomically
+        // higher instead.
+        assert!((4300..=4400).contains(&s.bitrate_bps),
+            "expected ~4400 bits/sec from the 2s synthetic gap, got {}", s.bitrate_bps);
+    }
+
+    // ── PTP clock-loss timeout reflects the caller's clock, not wall time ────
+    // (issue #35) — replay processes packets far faster than the capture's own
+    // pace, so check_timeout must fire based on the `now` passed in, not on how
+    // much real time actually elapsed between two check_timeout() calls.
+
+    #[test]
+    fn check_timeout_fires_on_synthetic_gap_exceeding_timeout() {
+        let mut ptp = PtpStats::new(0, crate::protocols::PTP_VERSION_V2);
+        ptp.clock_valid = true;
+        let t0 = Instant::now();
+        ptp.last_seen = t0;
+        // No real wall-clock time has passed, but the synthetic gap (6s) exceeds
+        // the 5s default timeout — clock loss must fire from the synthetic now.
+        let t1 = t0 + Duration::from_secs(6);
+        assert_eq!(ptp.check_timeout(t1), Some(PtpEvent::ClockLost));
+        assert!(!ptp.clock_valid);
+    }
+
+    #[test]
+    fn check_timeout_silent_before_synthetic_gap_reaches_timeout() {
+        let mut ptp = PtpStats::new(0, crate::protocols::PTP_VERSION_V2);
+        ptp.clock_valid = true;
+        let t0 = Instant::now();
+        ptp.last_seen = t0;
+        let t1 = t0 + Duration::from_secs(2); // under the 5s default timeout
+        assert_eq!(ptp.check_timeout(t1), None);
+        assert!(ptp.clock_valid);
+    }
+
     // ── Loss counter ─────────────────────────────────────────────────────────
 
     #[test]
     fn no_loss_on_sequential_packets() {
         let mut s = aes67();
-        s.update(0, 0,  1, 100);
-        s.update(1, 48, 1, 100);
-        s.update(2, 96, 1, 100);
+        s.update(0, 0,  1, 100, Instant::now());
+        s.update(1, 48, 1, 100, Instant::now());
+        s.update(2, 96, 1, 100, Instant::now());
         assert_eq!(s.lost_packets, 0);
         assert_eq!(s.packets, 3);
     }
@@ -1383,8 +1446,8 @@ mod tests {
     #[test]
     fn loss_counted_on_seq_gap() {
         let mut s = aes67();
-        s.update(0, 0,   1, 100);
-        s.update(3, 144, 1, 100); // skipped seq 1 and 2 → 2 lost
+        s.update(0, 0,   1, 100, Instant::now());
+        s.update(3, 144, 1, 100, Instant::now()); // skipped seq 1 and 2 → 2 lost
         assert_eq!(s.lost_packets, 2);
     }
 
@@ -1392,9 +1455,9 @@ mod tests {
     fn no_loss_on_seq_number_wrap() {
         // 0xFFFF → 0x0000 is the normal 16-bit wrap, not a loss
         let mut s = aes67();
-        s.update(0xFFFE, 0,  1, 100);
-        s.update(0xFFFF, 48, 1, 100);
-        s.update(0x0000, 96, 1, 100);
+        s.update(0xFFFE, 0,  1, 100, Instant::now());
+        s.update(0xFFFF, 48, 1, 100, Instant::now());
+        s.update(0x0000, 96, 1, 100, Instant::now());
         assert_eq!(s.lost_packets, 0);
     }
 
@@ -1402,8 +1465,8 @@ mod tests {
     fn backward_seq_not_counted_as_loss() {
         // Out-of-order / reordered packet — should be ignored, not add 65000+ to lost_packets
         let mut s = aes67();
-        s.update(10, 0, 1, 100);
-        s.update(5,  0, 1, 100); // backward
+        s.update(10, 0, 1, 100, Instant::now());
+        s.update(5,  0, 1, 100, Instant::now()); // backward
         assert_eq!(s.lost_packets, 0);
     }
 
@@ -1413,8 +1476,8 @@ mod tests {
         // separately so high reorder rates surface (typical fingerprint of
         // per-packet ECMP/LAG load-balancing).
         let mut s = aes67();
-        s.update(10, 0, 1, 100);
-        s.update(5,  0, 1, 100);
+        s.update(10, 0, 1, 100, Instant::now());
+        s.update(5,  0, 1, 100, Instant::now());
         assert_eq!(s.reorders_this_window, 1);
         assert_eq!(s.lost_packets, 0);
     }
@@ -1422,14 +1485,14 @@ mod tests {
     #[test]
     fn lost_this_window_tracks_per_window_drops() {
         let mut s = aes67();
-        s.update(0, 0,   1, 100);
-        s.update(3, 144, 1, 100); // 2 lost in this window
+        s.update(0, 0,   1, 100, Instant::now());
+        s.update(3, 144, 1, 100, Instant::now()); // 2 lost in this window
         assert_eq!(s.lost_this_window, 2);
         assert_eq!(s.lost_packets,     2);
         // Caller (CaptureState::reset_window) zeros this_window after each report;
         // simulate that and verify cumulative loss survives.
         s.lost_this_window = 0;
-        s.update(4, 192, 1, 100); // sequential — no new loss
+        s.update(4, 192, 1, 100, Instant::now()); // sequential — no new loss
         assert_eq!(s.lost_this_window, 0, "no new loss this window");
         assert_eq!(s.lost_packets,     2, "cumulative loss preserved");
     }
@@ -1483,17 +1546,17 @@ mod tests {
     #[test]
     fn ssrc_change_increments_counter() {
         let mut s = aes67();
-        s.update(0, 0,  0xAAAA, 100);
-        s.update(1, 48, 0xBBBB, 100); // source changed
+        s.update(0, 0,  0xAAAA, 100, Instant::now());
+        s.update(1, 48, 0xBBBB, 100, Instant::now()); // source changed
         assert_eq!(s.ssrc_changes, 1);
     }
 
     #[test]
     fn stable_ssrc_no_change_counted() {
         let mut s = aes67();
-        s.update(0, 0,  0xAAAA, 100);
-        s.update(1, 48, 0xAAAA, 100);
-        s.update(2, 96, 0xAAAA, 100);
+        s.update(0, 0,  0xAAAA, 100, Instant::now());
+        s.update(1, 48, 0xAAAA, 100, Instant::now());
+        s.update(2, 96, 0xAAAA, 100, Instant::now());
         assert_eq!(s.ssrc_changes, 0);
     }
 
@@ -1505,7 +1568,7 @@ mod tests {
         assert!(!s.clock_hz_confirmed);
         // 9 packets: first establishes baseline, next 8 produce deltas of 48
         for i in 0..9u16 {
-            s.update(i, i as u32 * 48, 1, 100);
+            s.update(i, i as u32 * 48, 1, 100, Instant::now());
         }
         assert!(s.clock_hz_confirmed, "should confirm 48 kHz from delta=48");
         assert!((s.clock_hz - 48000.0).abs() < 1.0);
@@ -1516,7 +1579,7 @@ mod tests {
     fn clock_rate_inferred_48k_4ms() {
         let mut s = aes67();
         for i in 0..9u16 {
-            s.update(i, i as u32 * 192, 1, 100);
+            s.update(i, i as u32 * 192, 1, 100, Instant::now());
         }
         assert!(s.clock_hz_confirmed);
         assert!((s.clock_hz - 48000.0).abs() < 1.0);
@@ -1527,7 +1590,7 @@ mod tests {
     fn clock_rate_inferred_44k1_10ms() {
         let mut s = aes67();
         for i in 0..9u16 {
-            s.update(i, i as u32 * 441, 1, 100);
+            s.update(i, i as u32 * 441, 1, 100, Instant::now());
         }
         assert!(s.clock_hz_confirmed);
         assert!((s.clock_hz - 44100.0).abs() < 1.0);
@@ -1538,7 +1601,7 @@ mod tests {
     fn clock_rate_not_inferred_from_unknown_delta() {
         let mut s = aes67();
         for i in 0..9u16 {
-            s.update(i, i as u32 * 100, 1, 100); // 100 doesn't match any known pair
+            s.update(i, i as u32 * 100, 1, 100, Instant::now()); // 100 doesn't match any known pair
         }
         assert!(!s.clock_hz_confirmed, "should not confirm on unrecognised delta");
     }
@@ -1549,7 +1612,7 @@ mod tests {
         // 7 normal packets (delta=48), then 1 late arrival (delta=96), then normal again
         let ts_sequence = [0u32, 48, 96, 144, 192, 240, 288, 384, 432];
         for (i, &ts) in ts_sequence.iter().enumerate() {
-            s.update(i as u16, ts, 1, 100);
+            s.update(i as u16, ts, 1, 100, Instant::now());
         }
         // deltas collected: 48,48,48,48,48,48,96,48 → mode=48 → 48 kHz
         assert!(s.clock_hz_confirmed);
@@ -1564,7 +1627,7 @@ mod tests {
         s.clock_hz_confirmed = true; // SDP set this
         // Feed packets that would infer 48 kHz — inference should not run
         for i in 0..9u16 {
-            s.update(i, i as u32 * 48, 1, 100);
+            s.update(i, i as u32 * 48, 1, 100, Instant::now());
         }
         assert!((s.clock_hz - 96000.0).abs() < 1.0, "SDP value should be preserved");
     }
@@ -1579,8 +1642,8 @@ mod tests {
     #[test]
     fn loss_pct_correct_with_gap() {
         let mut s = aes67();
-        s.update(0, 0,   1, 100); // received
-        s.update(3, 144, 1, 100); // received — but 2 lost
+        s.update(0, 0,   1, 100, Instant::now()); // received
+        s.update(3, 144, 1, 100, Instant::now()); // received — but 2 lost
         // received=2, lost=2, total=4 → 50%
         let pct = s.loss_pct();
         assert!((pct - 50.0).abs() < 0.1, "expected 50%, got {:.1}%", pct);
@@ -1591,8 +1654,8 @@ mod tests {
     #[test]
     fn diagnostics_empty_for_clean_stream() {
         let mut s = aes67();
-        s.update(0, 0,  1, 100);
-        s.update(1, 48, 1, 100);
+        s.update(0, 0,  1, 100, Instant::now());
+        s.update(1, 48, 1, 100, Instant::now());
         assert!(s.diagnostics().is_empty());
     }
 
@@ -1672,7 +1735,7 @@ mod tests {
         let mut s = aes67();
         s.clock_hz_confirmed = true;
         s.ptime_ms = 1.0;
-        s.update(0, 0, 1, 100); // baseline — no previous ts to compare
+        s.update(0, 0, 1, 100, Instant::now()); // baseline — no previous ts to compare
         assert_eq!(s.ts_discontinuities, 0);
     }
 
@@ -1681,8 +1744,8 @@ mod tests {
         let mut s = aes67();
         s.clock_hz_confirmed = true;
         s.ptime_ms = 1.0; // expected diff = 48 samples
-        s.update(0, 0,   1, 100);
-        s.update(1, 96,  1, 100); // diff=96 = 2× expected → discontinuity
+        s.update(0, 0,   1, 100, Instant::now());
+        s.update(1, 96,  1, 100, Instant::now()); // diff=96 = 2× expected → discontinuity
         assert_eq!(s.ts_discontinuities, 1);
     }
 
@@ -1691,8 +1754,8 @@ mod tests {
         let mut s = aes67();
         s.clock_hz_confirmed = true;
         s.ptime_ms = 1.0;
-        s.update(0, 0,  1, 100);
-        s.update(1, 48, 1, 100); // exactly on time
+        s.update(0, 0,  1, 100, Instant::now());
+        s.update(1, 48, 1, 100, Instant::now()); // exactly on time
         assert_eq!(s.ts_discontinuities, 0);
     }
 

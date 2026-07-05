@@ -275,6 +275,42 @@ impl OfflineReportClock {
     }
 }
 
+/// Wall-clock time live; a pcap-timestamp-derived virtual clock in offline
+/// replay (issue #35) — elapsed-time-dependent metrics (bitrate, dead-stream
+/// detection, PTP clock-loss timeout) need `now` to advance at the capture's
+/// own pace, not however fast the replay loop happens to execute. `Instant`
+/// has no public constructor besides `now()`, so replay anchors one real
+/// `Instant` at the first packet processed and offsets every subsequent
+/// packet by its pcap-timestamp delta from that first packet.
+#[derive(Default)]
+struct CaptureClock {
+    anchor: Option<Instant>,
+    anchor_pkt_ts: Option<(i64, i64)>, // (tv_sec, tv_usec) of the first packet
+}
+
+impl CaptureClock {
+    fn new() -> Self { Self::default() }
+
+    /// Live mode always returns real time, ignoring `tv_sec`/`tv_usec`.
+    /// Offline mode returns the anchor offset by the pcap-timestamp delta
+    /// (microsecond precision) from the first packet this clock has seen.
+    fn now(&mut self, is_offline: bool, tv_sec: i64, tv_usec: i64) -> Instant {
+        if !is_offline {
+            return Instant::now();
+        }
+        let anchor = *self.anchor.get_or_insert_with(Instant::now);
+        let (first_sec, first_usec) = *self.anchor_pkt_ts.get_or_insert((tv_sec, tv_usec));
+        let delta_us = (tv_sec - first_sec) * 1_000_000 + (tv_usec - first_usec);
+        if delta_us >= 0 {
+            anchor + Duration::from_micros(delta_us as u64)
+        } else {
+            // Out-of-order pcap timestamps (malformed capture) — clamp to the
+            // anchor rather than underflow.
+            anchor
+        }
+    }
+}
+
 /// Per-packet dispatch + network-health tracking — takes an already-parsed
 /// `EthernetPacket`, never a raw `pcap::Packet` or `Capture<T>`, so it's testable
 /// with hand-built frames the same way `capture.rs`'s `handle_*` methods are.
@@ -370,16 +406,22 @@ fn run_loop<T: Activated>(
     let is_offline = live.is_none();
     let mut last_report      = Instant::now();
     let mut offline_clock    = OfflineReportClock::default();
+    let mut capture_clock    = CaptureClock::new();
     let run_start            = Instant::now();
     // Session-lifetime report config: `quiet` is fixed; `no_flows_diagnostic_shown`
     // latches after the no-active-flows diagnostic first appears.
     let mut session = ReportSession { quiet, no_flows_diagnostic_shown: false };
+    // The most recent `now` computed for a processed packet — live mode this is
+    // always ~real time anyway; offline mode this is the last synthetic virtual
+    // time, reused for report cycles that aren't triggered by a specific packet
+    // (the live top-of-loop timer, and EOF) so they don't jump ahead of it.
+    let mut last_now = Instant::now();
 
     loop {
         // ── Live: report at TOP so it fires even when next_packet() times out ─
         if !is_offline && last_report.elapsed() > Duration::from_secs(5) {
             let pcap_stats = cap.stats().ok().map(|s| (s.received, s.dropped, s.if_dropped));
-            do_report(state, expanded_protocols, is_offline, pcap_stats, &mut session, logger);
+            do_report(state, expanded_protocols, is_offline, last_now, pcap_stats, &mut session, logger);
             last_report = Instant::now();
 
             if let Some(secs) = live.as_ref().and_then(|l| l.duration_secs)
@@ -395,7 +437,7 @@ fn run_loop<T: Activated>(
             Err(pcap::Error::TimeoutExpired) => continue,
             Err(pcap::Error::NoMorePackets)  => {
                 // EOF — print whatever accumulated in the last partial window.
-                do_report(state, expanded_protocols, is_offline, None, &mut session, logger);
+                do_report(state, expanded_protocols, is_offline, last_now, None, &mut session, logger);
                 let healthy = state.network_health.network_score >= 100.0;
                 std::process::exit(if healthy { 0 } else { 1 });
             }
@@ -409,16 +451,18 @@ fn run_loop<T: Activated>(
 
         // Extract pcap timestamp before borrowing packet.data.
         let pkt_ts = packet.header.ts.tv_sec as i64;
+        let now = capture_clock.now(is_offline, pkt_ts, packet.header.ts.tv_usec as i64);
+        last_now = now;
 
         let eth = match EthernetPacket::new(packet.data) { Some(e) => e, _ => continue };
-        process_packet(state, &eth, expanded_protocols, Instant::now(), logger);
+        process_packet(state, &eth, expanded_protocols, now, logger);
         drain_pending_joins(state, live.as_mut(), expanded_protocols, logger);
 
         // ── Offline: report based on pcap timestamp ───────────────────────────
         // eth/outer_ip are no longer used past this point — NLL ends their borrows
         // of packet.data before we access pkt_ts (which was copied earlier).
         if is_offline && offline_clock.should_report(pkt_ts) {
-            do_report(state, expanded_protocols, is_offline, None, &mut session, logger);
+            do_report(state, expanded_protocols, is_offline, now, None, &mut session, logger);
         }
     }
 }
@@ -434,12 +478,13 @@ fn do_report(
     state: &mut CaptureState,
     expanded_protocols: &[protocols::ProtocolChoice],
     is_offline: bool,
+    now: Instant,
     pcap_stats: Option<(u32, u32, u32)>,
     session: &mut ReportSession,
     logger: &mut crate::report::Logger,
 ) {
     let ts_refclk = ts_refclk_alerts(state);
-    let checks = state.end_of_window(expanded_protocols, is_offline);
+    let checks = state.end_of_window(expanded_protocols, is_offline, now);
 
     if let Some(ref combined) = checks.clock_dropout_alert {
         capture::emit(std::slice::from_ref(combined), logger);
@@ -583,6 +628,42 @@ mod tests {
         assert!(clock.should_report(1_005), "first 5s window");
         assert!(!clock.should_report(1_007), "only 2s since the last report");
         assert!(clock.should_report(1_010), "another full 5s window");
+    }
+
+    // ── CaptureClock — issue #35: offline replay must derive `now` from pcap
+    // timestamps, not wall time, so elapsed-time-dependent metrics (bitrate,
+    // dead-stream detection, PTP clock-loss timeout) reflect the capture's own
+    // pace rather than however fast the replay loop actually executes ────────
+
+    #[test]
+    fn capture_clock_live_mode_always_returns_real_time() {
+        let mut clock = CaptureClock::new();
+        let before = Instant::now();
+        let now = clock.now(false, 0, 0);
+        let after = Instant::now();
+        assert!(now >= before && now <= after, "live mode must return real time regardless of pkt_ts");
+    }
+
+    #[test]
+    fn capture_clock_offline_mode_anchors_to_first_packet() {
+        let mut clock = CaptureClock::new();
+        let t0 = clock.now(true, 1_000, 0);
+        // Real time may have advanced by microseconds between these two calls,
+        // but the offline delta (5 pcap-seconds) must dominate the difference.
+        let t1 = clock.now(true, 1_005, 0);
+        let delta = t1.duration_since(t0);
+        assert!(delta >= Duration::from_millis(4990) && delta <= Duration::from_millis(5100),
+            "expected ~5s synthetic gap, got {:?}", delta);
+    }
+
+    #[test]
+    fn capture_clock_offline_mode_uses_microsecond_precision() {
+        let mut clock = CaptureClock::new();
+        let t0 = clock.now(true, 1_000, 0);
+        let t1 = clock.now(true, 1_000, 500_000); // same second, +500ms
+        let delta = t1.duration_since(t0);
+        assert!(delta >= Duration::from_millis(490) && delta <= Duration::from_millis(510),
+            "expected ~500ms synthetic gap, got {:?}", delta);
     }
 
     // ── process_packet — dispatch + network-health tracking, pcap-free ────────

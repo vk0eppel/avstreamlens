@@ -1512,7 +1512,7 @@ mod tests {
         state.streams.insert("s1".into(), StreamStats::new("AES67", 48_000.0));
         state.dante.sources.insert(Ipv4Addr::new(169, 254, 1, 1));
 
-        let checks = state.end_of_window(&[], false);
+        let checks = state.end_of_window(&[], false, std::time::Instant::now());
         let snap = ReportSnapshot::from_state(&state, &checks, Some((100, 2, 0)));
 
         assert_eq!(snap.streams.len(), 1, "streams must come from state.streams");

@@ -548,12 +548,14 @@ impl PtpState {
         self.v1_followers.retain(|_, t| t.elapsed().as_secs() < 15);
     }
 
-    /// Periodic clock-loss check, called from the report cycle. Returns
-    /// Error alerts for any domain whose PTP clock has timed out.
-    pub fn check_ptp_timeouts(&mut self) -> Vec<Alert> {
+    /// Periodic clock-loss check, called from the report cycle. `now` is the
+    /// real clock live, or a pcap-timestamp-derived virtual clock in offline
+    /// replay (issue #35) — see `PtpStats::check_timeout`. Returns Error alerts
+    /// for any domain whose PTP clock has timed out.
+    pub fn check_ptp_timeouts(&mut self, now: Instant) -> Vec<Alert> {
         let mut alerts = Vec::new();
         for stats in self.domains.values_mut() {
-            if let Some(PtpEvent::ClockLost) = stats.check_timeout() {
+            if let Some(PtpEvent::ClockLost) = stats.check_timeout(now) {
                 alerts.push(Alert::error(format!(
                     "❌ PTP Clock LOST (Domain {} v{}) [{}]",
                     stats.domain,
@@ -877,13 +879,13 @@ impl CaptureState {
     }
 
     /// PTP: update the (domain, version) entry, return Detected/Changed alert if any.
-    pub fn handle_ptp(&mut self, info: PtpInfo) -> Vec<Alert> {
+    pub fn handle_ptp(&mut self, info: PtpInfo, now: Instant) -> Vec<Alert> {
         // PTPv1 Delay_Req (msg 0x01) — sender is a clock follower.
         if info.version == crate::protocols::PTP_VERSION_V1
             && info.message_type == 0x01
             && let Some(ip) = info.src_ip
         {
-            self.ptp.v1_followers.insert(ip, Instant::now());
+            self.ptp.v1_followers.insert(ip, now);
         }
 
         let kind   = info.protocol_kind.clone();
@@ -891,7 +893,7 @@ impl CaptureState {
         let stats  = self.ptp.domains
             .entry((info.domain, info.version))
             .or_insert_with(|| PtpStats::new(info.domain, info.version));
-        let event  = stats.update(&info, &kind);
+        let event  = stats.update(&info, &kind, now);
         let ip_str = src_ip.map(|ip| format!("  ({})", ip)).unwrap_or_default();
         match event {
             Some(PtpEvent::GrandmasterDetected) => {
@@ -925,7 +927,7 @@ impl CaptureState {
     }
 
     /// AES67 RTP audio.
-    pub fn handle_aes67(&mut self, dst: Ipv4Addr, dst_port: u16, payload_type: u8, l2_payload: &[u8], pcp: Option<u8>) {
+    pub fn handle_aes67(&mut self, dst: Ipv4Addr, dst_port: u16, payload_type: u8, l2_payload: &[u8], pcp: Option<u8>, now: Instant) {
         let key = format!("AES67 {}:{}", dst, dst_port);
         let sdp_match = self.find_sdp_media(dst, dst_port).map(|(name, m)| (name.to_string(), m.clone()));
         let stats = self.streams.entry(key).or_insert_with(|| {
@@ -948,13 +950,13 @@ impl CaptureState {
                 if stats.expected_pt.is_some_and(|exp| payload_type != exp) {
                     stats.pt_mismatches += 1;
                 }
-                stats.update(seq, ts, ssrc, udp.payload().len());
+                stats.update(seq, ts, ssrc, udp.payload().len(), now);
             }
         }
     }
 
     /// ST 2110 video/audio/ancillary.
-    pub fn handle_st2110(&mut self, dst: Ipv4Addr, dst_port: u16, stream_type: St2110Type, l2_payload: &[u8], pcp: Option<u8>) {
+    pub fn handle_st2110(&mut self, dst: Ipv4Addr, dst_port: u16, stream_type: St2110Type, l2_payload: &[u8], pcp: Option<u8>, now: Instant) {
         let label = match stream_type {
             St2110Type::Video   => "2110-20",
             St2110Type::Audio   => "2110-30",
@@ -998,7 +1000,7 @@ impl CaptureState {
                 if stats.expected_pt.is_some_and(|exp| rtp_pt != exp) {
                     stats.pt_mismatches += 1;
                 }
-                stats.update(seq, ts, ssrc, udp.payload().len());
+                stats.update(seq, ts, ssrc, udp.payload().len(), now);
             }
         }
     }
@@ -1085,7 +1087,7 @@ impl CaptureState {
                     let ttl = ip.get_ttl();
                     stats.min_ttl = Some(stats.min_ttl.map_or(ttl, |m| m.min(ttl)));
                     match parse_rtp(udp.payload()) {
-                        Some((seq, ts, ssrc)) => stats.update(seq, ts, ssrc, udp.payload().len()),
+                        Some((seq, ts, ssrc)) => stats.update(seq, ts, ssrc, udp.payload().len(), now),
                         // ATP framing (official ports 4321 / 14336–15359) is not RTP —
                         // track presence and bitrate; loss/jitter need RTP fields.
                         None => stats.update_non_rtp(udp.payload().len(), now),
@@ -1496,7 +1498,11 @@ impl CaptureState {
     /// Every periodic Alert/Diagnostic computed once per Window, bundled for the
     /// report layer to render and emit. Fields are grouped by the section that
     /// consumes them, not by call order.
-    pub fn end_of_window(&mut self, expanded: &[ProtocolChoice], is_offline: bool) -> WindowChecks {
+    /// `now`: the real clock live, or a pcap-timestamp-derived virtual clock in
+    /// offline replay (issue #35) — passed straight through to
+    /// `check_ptp_timeouts` so PTP clock-loss detection reflects capture-time
+    /// silence rather than however fast the replay loop actually executes.
+    pub fn end_of_window(&mut self, expanded: &[ProtocolChoice], is_offline: bool, now: Instant) -> WindowChecks {
         // ── Ordering invariant ────────────────────────────────────────────────
         // Every check below reads Window-scoped state that `reset_window` (called
         // last) clears or prunes — this method is the one place that enforces the
@@ -1505,7 +1511,7 @@ impl CaptureState {
         // do_report. `ts_refclk_alerts` is the one exception: it's read-only and
         // computed by the caller (main.rs) before this method is invoked, since
         // it needs `&CaptureState` immutably while other checks here need `&mut`.
-        let clock_alerts = self.ptp.check_ptp_timeouts();
+        let clock_alerts = self.ptp.check_ptp_timeouts(now);
         let (clock_alerts, clock_dropout_alert) = if let Some(combined) = self.check_clock_dropout_correlation() {
             self.clock_dropout_correlated = true;
             (Vec::new(), Some(combined))
@@ -1646,13 +1652,13 @@ pub fn dispatch(
             state.handle_sap(sdp);
             vec![]
         }
-        AvProtocol::Ptp { info } => state.handle_ptp(info),
+        AvProtocol::Ptp { info } => state.handle_ptp(info, now),
         AvProtocol::Aes67 { dst, dst_port, payload_type, .. } => {
-            state.handle_aes67(dst, dst_port, payload_type, l2_payload, pcp);
+            state.handle_aes67(dst, dst_port, payload_type, l2_payload, pcp, now);
             vec![]
         }
         AvProtocol::St2110 { dst, dst_port, stream_type, .. } => {
-            state.handle_st2110(dst, dst_port, stream_type, l2_payload, pcp);
+            state.handle_st2110(dst, dst_port, stream_type, l2_payload, pcp, now);
             vec![]
         }
         AvProtocol::Dante { kind, src, dst, dst_port } => {
@@ -1761,7 +1767,7 @@ mod tests {
         let mut state = CaptureState::new();
         state.sdp_cache.insert("1".to_string(), sdp_for_port(5004, 96, 48_000.0));
         let pkt = ip_udp_rtp(46 << 2, 5004, 96, 0, 0, 0xAAAA);
-        state.handle_aes67(Ipv4Addr::new(239, 69, 0, 1), 5004, 96, &pkt, None);
+        state.handle_aes67(Ipv4Addr::new(239, 69, 0, 1), 5004, 96, &pkt, None, Instant::now());
         let s = state.streams.get("AES67 239.69.0.1:5004").expect("stream created");
         assert_eq!(s.expected_pt, Some(96));
         assert!(s.clock_hz_confirmed, "SAP-confirmed clock should flip the flag");
@@ -1855,7 +1861,7 @@ mod tests {
 
         // Step 1: stream observed before any SAP arrives (no sdp_cache entry yet).
         let pkt = ip_udp_rtp(46 << 2, 5004, 96, 0, 0, 0xAAAA);
-        state.handle_aes67(Ipv4Addr::new(239, 69, 0, 1), 5004, 96, &pkt, None);
+        state.handle_aes67(Ipv4Addr::new(239, 69, 0, 1), 5004, 96, &pkt, None, Instant::now());
         assert_eq!(state.streams["AES67 239.69.0.1:5004"].sdp_name, None);
 
         // Step 2: first SAP — sets name AND technical fields.
@@ -1898,7 +1904,7 @@ mod tests {
     fn aes67_dscp_violation_incremented_when_not_ef() {
         let mut state = CaptureState::new();
         let pkt = ip_udp_rtp(0, 5004, 96, 0, 0, 0xAAAA); // DSCP=0
-        state.handle_aes67(Ipv4Addr::new(239, 69, 0, 1), 5004, 96, &pkt, None);
+        state.handle_aes67(Ipv4Addr::new(239, 69, 0, 1), 5004, 96, &pkt, None, Instant::now());
         let s = &state.streams["AES67 239.69.0.1:5004"];
         assert_eq!(s.dscp_violations, 1);
     }
@@ -1907,7 +1913,7 @@ mod tests {
     fn aes67_dscp_ef_does_not_violate() {
         let mut state = CaptureState::new();
         let pkt = ip_udp_rtp(46 << 2, 5004, 96, 0, 0, 0xAAAA);
-        state.handle_aes67(Ipv4Addr::new(239, 69, 0, 1), 5004, 96, &pkt, None);
+        state.handle_aes67(Ipv4Addr::new(239, 69, 0, 1), 5004, 96, &pkt, None, Instant::now());
         let s = &state.streams["AES67 239.69.0.1:5004"];
         assert_eq!(s.dscp_violations, 0);
     }
@@ -1918,7 +1924,7 @@ mod tests {
         state.sdp_cache.insert("1".to_string(), sdp_for_port(5004, 10, 48_000.0));
         // First packet establishes the stream with expected_pt=10
         let pkt0 = ip_udp_rtp(46 << 2, 5004, 11, 0, 0, 0xAAAA); // arrives with PT=11
-        state.handle_aes67(Ipv4Addr::new(239, 69, 0, 1), 5004, 11, &pkt0, None);
+        state.handle_aes67(Ipv4Addr::new(239, 69, 0, 1), 5004, 11, &pkt0, None, Instant::now());
         let s = &state.streams["AES67 239.69.0.1:5004"];
         assert_eq!(s.pt_mismatches, 1);
         assert_eq!(s.expected_pt, Some(10));
@@ -1928,7 +1934,7 @@ mod tests {
     fn aes67_ecn_ce_increments_network_health() {
         let mut state = CaptureState::new();
         let pkt = ip_udp_rtp((46 << 2) | 0b11, 5004, 96, 0, 0, 0xAAAA); // ECN=3 (CE)
-        state.handle_aes67(Ipv4Addr::new(239, 69, 0, 1), 5004, 96, &pkt, None);
+        state.handle_aes67(Ipv4Addr::new(239, 69, 0, 1), 5004, 96, &pkt, None, Instant::now());
         assert_eq!(state.network_health.ecn_congestion_marks, 1);
     }
 
@@ -1939,7 +1945,7 @@ mod tests {
         let mut state = CaptureState::new();
         // CS5 = 40
         let pkt = ip_udp_rtp(40 << 2, 5004, 96, 0, 0, 0xAAAA);
-        state.handle_st2110(Ipv4Addr::new(239, 1, 2, 3), 5004, St2110Type::Video, &pkt, None);
+        state.handle_st2110(Ipv4Addr::new(239, 1, 2, 3), 5004, St2110Type::Video, &pkt, None, Instant::now());
         let s = state.streams.values().find(|s| s.protocol == "2110-20").expect("video stream");
         assert_eq!(s.dscp_violations, 0, "CS5 is valid for ST2110-20 video");
     }
@@ -1948,7 +1954,7 @@ mod tests {
     fn st2110_audio_dscp_cs5_rejected() {
         let mut state = CaptureState::new();
         let pkt = ip_udp_rtp(40 << 2, 5004, 96, 0, 0, 0xAAAA);
-        state.handle_st2110(Ipv4Addr::new(239, 1, 2, 3), 5004, St2110Type::Audio, &pkt, None);
+        state.handle_st2110(Ipv4Addr::new(239, 1, 2, 3), 5004, St2110Type::Audio, &pkt, None, Instant::now());
         let s = state.streams.values().find(|s| s.protocol == "2110-30").expect("audio stream");
         assert_eq!(s.dscp_violations, 1, "audio requires EF only");
     }
@@ -1957,7 +1963,7 @@ mod tests {
     fn st2110_video_clock_confirmed_without_sdp() {
         let mut state = CaptureState::new();
         let pkt = ip_udp_rtp(46 << 2, 5004, 96, 0, 0, 0xAAAA);
-        state.handle_st2110(Ipv4Addr::new(239, 1, 2, 3), 5004, St2110Type::Video, &pkt, None);
+        state.handle_st2110(Ipv4Addr::new(239, 1, 2, 3), 5004, St2110Type::Video, &pkt, None, Instant::now());
         let s = state.streams.values().find(|s| s.protocol == "2110-20").unwrap();
         assert!(s.clock_hz_confirmed, "video uses 90 kHz by spec, no SDP needed");
     }
@@ -1970,7 +1976,7 @@ mod tests {
         let mut state = CaptureState::new();
         state.sdp_cache.insert("1".to_string(), sdp_for_port(5004, 96, 48_000.0));
         let pkt = ip_udp_rtp(46 << 2, 5004, 96, 0, 0, 0xAAAA);
-        state.handle_st2110(Ipv4Addr::new(239, 1, 2, 3), 5004, St2110Type::Audio, &pkt, None);
+        state.handle_st2110(Ipv4Addr::new(239, 1, 2, 3), 5004, St2110Type::Audio, &pkt, None, Instant::now());
         let s = state.streams.values().find(|s| s.protocol == "2110-30").unwrap();
         assert_eq!(s.channels, 2);
         assert_eq!(s.ptime_ms, 1.0);
@@ -3089,7 +3095,7 @@ mod tests {
     /// Drop an AES67 stream entry into state so the "observed" gate fires.
     fn seed_aes67_stream(state: &mut CaptureState) {
         let pkt = ip_udp_rtp(46 << 2, 5004, 96, 0, 0, 0xAAAA);
-        state.handle_aes67(Ipv4Addr::new(239, 69, 0, 1), 5004, 96, &pkt, None);
+        state.handle_aes67(Ipv4Addr::new(239, 69, 0, 1), 5004, 96, &pkt, None, Instant::now());
     }
 
     #[test]
@@ -3193,7 +3199,7 @@ mod tests {
         seed_aes67_stream(&mut state);
         // Seed an ST2110 stream too.
         let pkt = ip_udp_rtp(46 << 2, 5006, 96, 0, 0, 0xBBBB);
-        state.handle_st2110(Ipv4Addr::new(239, 1, 2, 3), 5006, St2110Type::Audio, &pkt, None);
+        state.handle_st2110(Ipv4Addr::new(239, 1, 2, 3), 5006, St2110Type::Audio, &pkt, None, Instant::now());
         let missing = state.missing_ptp_clocks(&[ProtocolChoice::AES67, ProtocolChoice::ST2110]);
         assert_eq!(missing.len(), 1);
         assert_eq!(missing[0].kind, MissingClockKind::Ptpv2);
@@ -3421,11 +3427,11 @@ mod tests {
         // report wording that distinguishes a real clock from a Pdelay-only node.
         let mut s = PtpStats::new(0, PTP_VERSION_V2);
         let kind = Some("AVB".to_string());
-        s.update(&ptp_msg(0x02, Some("d0:69:9e:ff:fe:11:86:3c")), &kind);
+        s.update(&ptp_msg(0x02, Some("d0:69:9e:ff:fe:11:86:3c")), &kind, Instant::now());
         assert!(s.last_clock_id.is_some());
         assert!(!s.seen_sync, "P_Delay_Req must not count as Sync");
 
-        s.update(&ptp_msg(0x00, Some("d0:69:9e:ff:fe:11:86:3c")), &kind);
+        s.update(&ptp_msg(0x00, Some("d0:69:9e:ff:fe:11:86:3c")), &kind, Instant::now());
         assert!(s.seen_sync, "a real Sync (0x00) sets seen_sync");
     }
 
@@ -3442,12 +3448,12 @@ mod tests {
         let mut gm_sync = ptp_msg(0x00, Some("00:00:00:01:00:1d"));
         gm_sync.grandmaster_id = Some("00:00:00:01:00:1d".to_string());
         gm_sync.src_ip = Some(gm_ip);
-        s.update(&gm_sync, &kind);
+        s.update(&gm_sync, &kind, Instant::now());
         assert_eq!(s.grandmaster_src_ip, Some(gm_ip));
 
         let mut follower = ptp_msg(0x01, Some("00:1d:c1:8e:b1:75"));
         follower.src_ip = Some(follower_ip);
-        s.update(&follower, &kind);
+        s.update(&follower, &kind, Instant::now());
         assert_eq!(s.last_src_ip, Some(follower_ip), "last_src_ip follows any sender");
         assert_eq!(s.grandmaster_src_ip, Some(gm_ip), "grandmaster IP stays the GM");
     }
@@ -3455,9 +3461,9 @@ mod tests {
     #[test]
     fn ptp_path_delay_min_max_track_observed_range() {
         let mut state = CaptureState::new();
-        state.handle_ptp(delay_resp(0, 500));
-        state.handle_ptp(delay_resp(0, 1200));
-        state.handle_ptp(delay_resp(0, 800));
+        state.handle_ptp(delay_resp(0, 500), Instant::now());
+        state.handle_ptp(delay_resp(0, 1200), Instant::now());
+        state.handle_ptp(delay_resp(0, 800), Instant::now());
         let stats = state.ptp.domains.get(&(0, PTP_VERSION_V2)).expect("entry created");
         assert_eq!(stats.min_path_delay_ns, Some(500));
         assert_eq!(stats.max_path_delay_ns, Some(1200));
@@ -3466,19 +3472,19 @@ mod tests {
     #[test]
     fn ptp_path_delay_resets_on_grandmaster_change() {
         let mut state = CaptureState::new();
-        state.handle_ptp(delay_resp(0, 1000));
+        state.handle_ptp(delay_resp(0, 1000), Instant::now());
         // Inject an Announce-like update that establishes a grandmaster, then
         // a second Announce with a different grandmaster to trigger reset.
         let mut announce = delay_resp(0, 500);
         announce.message_type = 0x0B; // Announce
         announce.grandmaster_id = Some("gm-A".to_string());
         announce.path_delay_ns = None; // Announce doesn't carry path delay
-        state.handle_ptp(announce.clone());
+        state.handle_ptp(announce.clone(), Instant::now());
         // Sanity: path delay still set from the earlier Delay_Resp.
         assert!(state.ptp.domains.get(&(0, PTP_VERSION_V2)).unwrap().min_path_delay_ns.is_some());
 
         announce.grandmaster_id = Some("gm-B".to_string());
-        state.handle_ptp(announce);
+        state.handle_ptp(announce, Instant::now());
         let stats = state.ptp.domains.get(&(0, PTP_VERSION_V2)).unwrap();
         assert_eq!(stats.min_path_delay_ns, None, "GM change should clear path-delay history");
         assert_eq!(stats.max_path_delay_ns, None);
@@ -3533,7 +3539,7 @@ mod tests {
     fn single_ptp_sync_sender_no_conflict_alert() {
         let mut state = CaptureState::new();
         let info = ptpv1_sync(Ipv4Addr::new(192, 168, 1, 10), 0, 0);
-        state.handle_ptp(info);
+        state.handle_ptp(info, Instant::now());
         let alerts = state.ptp.check_ptp_sync_conflict();
         assert!(alerts.is_empty(), "single Sync sender should produce no alert");
     }
@@ -3542,8 +3548,8 @@ mod tests {
     fn two_ptpv1_sync_senders_emits_warn() {
         let mut state = CaptureState::new();
         // Two devices, stratum 1 each — competing but neither is "preferred master"
-        state.handle_ptp(ptpv1_sync(Ipv4Addr::new(192, 168, 1, 10), 1, 0));
-        state.handle_ptp(ptpv1_sync(Ipv4Addr::new(192, 168, 1, 20), 1, 0));
+        state.handle_ptp(ptpv1_sync(Ipv4Addr::new(192, 168, 1, 10), 1, 0), Instant::now());
+        state.handle_ptp(ptpv1_sync(Ipv4Addr::new(192, 168, 1, 20), 1, 0), Instant::now());
         let alerts = state.ptp.check_ptp_sync_conflict();
         assert_eq!(alerts.len(), 1);
         assert_eq!(alerts[0].level, AlertLevel::Warn);
@@ -3554,8 +3560,8 @@ mod tests {
     fn two_preferred_masters_emits_error() {
         let mut state = CaptureState::new();
         // Two devices with stratum 0 = "preferred master" in Dante — misconfiguration
-        state.handle_ptp(ptpv1_sync(Ipv4Addr::new(192, 168, 1, 10), 0, 0));
-        state.handle_ptp(ptpv1_sync(Ipv4Addr::new(192, 168, 1, 20), 0, 0));
+        state.handle_ptp(ptpv1_sync(Ipv4Addr::new(192, 168, 1, 10), 0, 0), Instant::now());
+        state.handle_ptp(ptpv1_sync(Ipv4Addr::new(192, 168, 1, 20), 0, 0), Instant::now());
         let alerts = state.ptp.check_ptp_sync_conflict();
         assert_eq!(alerts.len(), 1);
         assert_eq!(alerts[0].level, AlertLevel::Error);
@@ -3565,8 +3571,8 @@ mod tests {
     #[test]
     fn sync_conflict_clears_after_reset_window() {
         let mut state = CaptureState::new();
-        state.handle_ptp(ptpv1_sync(Ipv4Addr::new(192, 168, 1, 10), 0, 0));
-        state.handle_ptp(ptpv1_sync(Ipv4Addr::new(192, 168, 1, 20), 0, 0));
+        state.handle_ptp(ptpv1_sync(Ipv4Addr::new(192, 168, 1, 10), 0, 0), Instant::now());
+        state.handle_ptp(ptpv1_sync(Ipv4Addr::new(192, 168, 1, 20), 0, 0), Instant::now());
         assert!(!state.ptp.check_ptp_sync_conflict().is_empty());
         state.reset_window();
         // After reset, no senders recorded → no conflict
@@ -3582,10 +3588,10 @@ mod tests {
     #[test]
     fn end_of_window_runs_checks_before_reset() {
         let mut state = CaptureState::new();
-        state.handle_ptp(ptpv1_sync(Ipv4Addr::new(192, 168, 1, 10), 0, 0));
-        state.handle_ptp(ptpv1_sync(Ipv4Addr::new(192, 168, 1, 20), 0, 0));
+        state.handle_ptp(ptpv1_sync(Ipv4Addr::new(192, 168, 1, 10), 0, 0), Instant::now());
+        state.handle_ptp(ptpv1_sync(Ipv4Addr::new(192, 168, 1, 20), 0, 0), Instant::now());
 
-        let checks = state.end_of_window(&[ProtocolChoice::Dante], false);
+        let checks = state.end_of_window(&[ProtocolChoice::Dante], false, Instant::now());
 
         assert_eq!(checks.ptp_sync_alerts.len(), 1, "conflict must be visible in the returned alerts");
         assert!(state.ptp.check_ptp_sync_conflict().is_empty(),
@@ -3825,7 +3831,7 @@ mod tests {
     fn pcp_advisory_fires_for_aes67_with_wrong_pcp() {
         let mut state = CaptureState::new();
         let pkt = ip_udp_rtp(46 << 2, 5004, 96, 0, 0, 0xAAAA);
-        state.handle_aes67(Ipv4Addr::new(239, 69, 0, 1), 5004, 96, &pkt, Some(0));
+        state.handle_aes67(Ipv4Addr::new(239, 69, 0, 1), 5004, 96, &pkt, Some(0), Instant::now());
         let s = &state.streams["AES67 239.69.0.1:5004"];
         assert_eq!(s.pcp_violations, 1);
         assert_eq!(s.observed_pcp, Some(0));
@@ -3835,7 +3841,7 @@ mod tests {
     fn pcp_no_advisory_for_aes67_with_pcp6() {
         let mut state = CaptureState::new();
         let pkt = ip_udp_rtp(46 << 2, 5004, 96, 0, 0, 0xAAAA);
-        state.handle_aes67(Ipv4Addr::new(239, 69, 0, 1), 5004, 96, &pkt, Some(6));
+        state.handle_aes67(Ipv4Addr::new(239, 69, 0, 1), 5004, 96, &pkt, Some(6), Instant::now());
         let s = &state.streams["AES67 239.69.0.1:5004"];
         assert_eq!(s.pcp_violations, 0);
     }
@@ -3844,7 +3850,7 @@ mod tests {
     fn pcp_advisory_fires_for_st2110_with_wrong_pcp() {
         let mut state = CaptureState::new();
         let pkt = ip_udp_rtp(46 << 2, 5004, 96, 0, 0, 0xAAAA);
-        state.handle_st2110(Ipv4Addr::new(239, 1, 2, 3), 5004, St2110Type::Audio, &pkt, Some(3));
+        state.handle_st2110(Ipv4Addr::new(239, 1, 2, 3), 5004, St2110Type::Audio, &pkt, Some(3), Instant::now());
         let s = state.streams.values().find(|s| s.protocol == "2110-30").expect("stream");
         assert_eq!(s.pcp_violations, 1);
         assert_eq!(s.observed_pcp, Some(3));
@@ -3854,7 +3860,7 @@ mod tests {
     fn pcp_no_advisory_for_untagged_aes67() {
         let mut state = CaptureState::new();
         let pkt = ip_udp_rtp(46 << 2, 5004, 96, 0, 0, 0xAAAA);
-        state.handle_aes67(Ipv4Addr::new(239, 69, 0, 1), 5004, 96, &pkt, None);
+        state.handle_aes67(Ipv4Addr::new(239, 69, 0, 1), 5004, 96, &pkt, None, Instant::now());
         let s = &state.streams["AES67 239.69.0.1:5004"];
         assert_eq!(s.pcp_violations, 0);
     }
