@@ -111,8 +111,14 @@ pub fn extract_dante_name(payload: &[u8]) -> Option<String> {
 }
 
 /// Extract the NDI source instance name from an mDNS payload.
+/// Tries the byte-search approach first (spontaneous uncompressed announcements),
+/// then falls back to proper DNS PTR parsing — the startup probe
+/// (`main::send_mdns_startup_probe`) queries `_ndi._tcp.local` alongside the
+/// Dante service names, so an NDI device's unicast reply can arrive in the same
+/// compressed-PTR-response shape a Dante device's does.
 pub fn extract_ndi_name(payload: &[u8]) -> Option<String> {
     extract_mdns_instance_name(payload, b"\x04_ndi")
+        .or_else(|| extract_instance_from_ptr_response(payload))
 }
 
 #[cfg(test)]
@@ -170,6 +176,13 @@ mod tests {
     ///   Answer:   _netaudio-arc._udp.local PTR  DeviceName._netaudio-arc._udp.local
     ///             RDATA uses compression pointer for the service part.
     fn build_ptr_response(instance: &str) -> Vec<u8> {
+        build_ptr_response_for_service(b"\x0d_netaudio-arc\x04_udp\x05local\x00", instance)
+    }
+
+    /// Same shape as `build_ptr_response`, parameterized on the service's
+    /// DNS-label-encoded question name so NDI (`_ndi._tcp.local`) and Dante
+    /// (`_netaudio-arc._udp.local`) responses can share one builder.
+    fn build_ptr_response_for_service(service_labels: &[u8], instance: &str) -> Vec<u8> {
         let mut p: Vec<u8> = Vec::new();
         // Header: ID=0, QR=1(response), QDCOUNT=1, ANCOUNT=1
         p.extend_from_slice(&[0x00, 0x00]); // ID
@@ -179,9 +192,9 @@ mod tests {
         p.extend_from_slice(&[0x00, 0x00]); // NSCOUNT=0
         p.extend_from_slice(&[0x00, 0x00]); // ARCOUNT=0
 
-        // Question name offset will be 12. Labels: _netaudio-arc._udp.local
+        // Question name offset will be 12.
         let qname_offset = p.len() as u16; // = 12
-        p.extend_from_slice(b"\x0d_netaudio-arc\x04_udp\x05local\x00");
+        p.extend_from_slice(service_labels);
         p.extend_from_slice(&[0x00, 0x0C]); // QTYPE=PTR
         p.extend_from_slice(&[0x00, 0x01]); // QCLASS=IN
 
@@ -216,6 +229,17 @@ mod tests {
         let name = "Y009-Yamaha-Rio3224-D2-19862a";
         let pkt = build_ptr_response(name);
         assert_eq!(extract_dante_name(&pkt), Some(name.to_string()));
+    }
+
+    /// The startup mDNS probe (`main::send_mdns_startup_probe`) queries
+    /// `_ndi._tcp.local` alongside the Dante service names, so an NDI device
+    /// can reply with the same compressed-PTR-response shape a Dante device
+    /// does. `extract_ndi_name` must fall back to the PTR parser too, the way
+    /// `extract_dante_name` already does.
+    #[test]
+    fn extract_ndi_name_from_compressed_ptr_response() {
+        let pkt = build_ptr_response_for_service(b"\x04_ndi\x04_tcp\x05local\x00", "Camera-1");
+        assert_eq!(extract_ndi_name(&pkt), Some("Camera-1".to_string()));
     }
 
     #[test]
