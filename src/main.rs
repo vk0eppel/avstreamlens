@@ -503,7 +503,7 @@ fn do_report(
     // `end_of_window`'s `&mut self` borrow (which needed the expanded protocol
     // list and computed the score) has already finished, so `state` and `checks`
     // can both be borrowed immutably here.
-    let snap = ReportSnapshot::from_state(state, &checks, pcap_stats);
+    let snap = ReportSnapshot::from_state(state, &checks, pcap_stats, now);
     print_report(&snap, session, logger);
 }
 

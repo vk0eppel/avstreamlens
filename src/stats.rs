@@ -437,7 +437,11 @@ impl StreamStats {
     /// had already drifted (Dante's combined loss/jitter check used different
     /// numbers than the generic jitter penalty). Order matches the previous
     /// inline checks in report.rs so rendered output is unchanged.
-    pub fn diagnostics(&self) -> Vec<StreamDiagnostic> {
+    /// `now`: the real clock live, or a pcap-timestamp-derived virtual clock in
+    /// offline replay (issue #35/#70) — dead-stream detection compares against
+    /// it instead of `.elapsed()`, so silence is measured in capture time, not
+    /// however fast the replay loop actually executes.
+    pub fn diagnostics(&self, now: Instant) -> Vec<StreamDiagnostic> {
         let mut d = Vec::new();
 
         if self.ts_discontinuities_this_window > 0 {
@@ -490,10 +494,11 @@ impl StreamStats {
         if self.gap_events >= 2 {
             d.push(StreamDiagnostic::SignalGap { window_count: self.gap_events, max_iat_ms: self.max_iat_ms });
         }
-        if let Some(last_time) = self.last_packet_time
-            && last_time.elapsed() > Duration::from_secs(crate::protocols::STREAM_TIMEOUT_SECS)
-        {
-            d.push(StreamDiagnostic::Dead { silent_secs: last_time.elapsed().as_secs_f64() });
+        if let Some(last_time) = self.last_packet_time {
+            let silent = now.saturating_duration_since(last_time);
+            if silent > Duration::from_secs(crate::protocols::STREAM_TIMEOUT_SECS) {
+                d.push(StreamDiagnostic::Dead { silent_secs: silent.as_secs_f64() });
+            }
         }
         // AVB PCP mismatch is scored/rendered straight off `AvtpStreamStats` (see
         // `NetworkHealth::collect_penalties` and `report.rs`'s AVTP render block) —
@@ -921,6 +926,7 @@ impl NetworkHealth {
     /// Collect every active penalty this Window. Both `calculate_score` and
     /// `build_health_summary` are thin consumers of this function, so the
     /// score and the summary are always derived from the same source of truth.
+    #[allow(clippy::too_many_arguments)]
     pub fn collect_penalties(
         &self,
         streams:     &HashMap<String, StreamStats>,
@@ -929,6 +935,7 @@ impl NetworkHealth {
         msrp_state:  &HashMap<[u8; 8], crate::protocols::MsrpDeclaration>,
         eee_ports:   &HashMap<(String, String), (u16, u16)>,
         avtp_streams: &HashMap<[u8; 8], AvtpStreamStats>,
+        now: Instant,
     ) -> Vec<ScorePenalty> {
         let mut p: Vec<ScorePenalty> = Vec::new();
 
@@ -948,7 +955,7 @@ impl NetworkHealth {
         for s in streams.values() {
             if s.is_multicast && s.packets > 0 { has_multicast = true; }
 
-            for diag in s.diagnostics() {
+            for diag in s.diagnostics(now) {
                 match diag {
                     StreamDiagnostic::PacketLoss { .. }      => { loss_count   += 1; loss_total   += diag.deduction(); loss_category   = diag.category(); }
                     StreamDiagnostic::HighJitter { .. }      => { jitter_count += 1; jitter_total += diag.deduction(); jitter_category = diag.category(); }
@@ -1103,6 +1110,7 @@ impl NetworkHealth {
         p
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn calculate_score(
         &mut self,
         streams: &std::collections::HashMap<String, StreamStats>,
@@ -1111,11 +1119,12 @@ impl NetworkHealth {
         msrp_state: &std::collections::HashMap<[u8; 8], crate::protocols::MsrpDeclaration>,
         eee_ports: &std::collections::HashMap<(String, String), (u16, u16)>,
         avtp_streams: &std::collections::HashMap<[u8; 8], AvtpStreamStats>,
+        now: Instant,
     ) {
         // Score = 100 − Σ penalties. The penalty table lives once in
         // `collect_penalties`; this is a thin consumer of it.
         let total: f64 = self
-            .collect_penalties(streams, tcp_streams, ptp_domains, msrp_state, eee_ports, avtp_streams)
+            .collect_penalties(streams, tcp_streams, ptp_domains, msrp_state, eee_ports, avtp_streams, now)
             .iter()
             .map(|p| p.deduction())
             .sum();
@@ -1135,6 +1144,7 @@ impl NetworkHealth {
     /// tool limitation, not a network fault, and live in Network Status only.
     /// Factors that carry no score penalty (PAUSE/PFC frames, AES67/ST2110 PCP
     /// advisories) likewise produce no bullet.
+    #[allow(clippy::too_many_arguments)]
     pub fn build_health_summary(
         &self,
         streams: &HashMap<String, StreamStats>,
@@ -1143,8 +1153,9 @@ impl NetworkHealth {
         msrp_state: &HashMap<[u8; 8], crate::protocols::MsrpDeclaration>,
         eee_ports: &HashMap<(String, String), (u16, u16)>,
         avtp_streams: &HashMap<[u8; 8], AvtpStreamStats>,
+        now: Instant,
     ) -> Vec<String> {
-        self.collect_penalties(streams, tcp_streams, ptp_domains, msrp_state, eee_ports, avtp_streams)
+        self.collect_penalties(streams, tcp_streams, ptp_domains, msrp_state, eee_ports, avtp_streams, now)
             .into_iter()
             .map(ScorePenalty::into_bullet)
             .collect()
@@ -1656,7 +1667,7 @@ mod tests {
         let mut s = aes67();
         s.update(0, 0,  1, 100, Instant::now());
         s.update(1, 48, 1, 100, Instant::now());
-        assert!(s.diagnostics().is_empty());
+        assert!(s.diagnostics(Instant::now()).is_empty());
     }
 
     #[test]
@@ -1667,7 +1678,7 @@ mod tests {
         s.packets_this_window = 100;
         s.lost_this_window = 0; // but nothing lost in the current window
         assert!(
-            s.diagnostics().is_empty(),
+            s.diagnostics(Instant::now()).is_empty(),
             "a stream that recovered this window must not still be flagged"
         );
     }
@@ -1679,7 +1690,7 @@ mod tests {
         s.lost_packets = 2;
         s.packets_this_window = 98;
         s.lost_this_window = 2;
-        let diags = s.diagnostics();
+        let diags = s.diagnostics(Instant::now());
         let loss = diags.iter().find(|d| matches!(d, StreamDiagnostic::PacketLoss { .. }));
         assert!(loss.is_some(), "got {diags:?}");
         assert!(loss.unwrap().deduction() > 0.0);
@@ -1692,7 +1703,7 @@ mod tests {
         // matches pre-deepening behaviour where this band had no inline alert.
         let mut s = aes67();
         s.jitter = 0.015; // 15 ms
-        let diags = s.diagnostics();
+        let diags = s.diagnostics(Instant::now());
         let jit = diags.iter().find(|d| matches!(d, StreamDiagnostic::HighJitter { .. })).unwrap();
         assert_eq!(jit.deduction(), 2.0);
         assert!(jit.message().is_none());
@@ -1702,7 +1713,7 @@ mod tests {
     fn diagnostics_jitter_above_20ms_renders_and_scores() {
         let mut s = aes67();
         s.jitter = 0.025; // 25 ms
-        let diags = s.diagnostics();
+        let diags = s.diagnostics(Instant::now());
         let jit = diags.iter().find(|d| matches!(d, StreamDiagnostic::HighJitter { .. })).unwrap();
         assert_eq!(jit.deduction(), 5.0);
         assert!(jit.message().unwrap().contains("High jitter"));
@@ -1712,7 +1723,7 @@ mod tests {
     fn diagnostics_aes67_jitter_hint_is_informational() {
         let mut s = aes67();
         s.jitter = 0.012; // 12 ms — above AES67's 10ms hint, below generic 20ms
-        let diags = s.diagnostics();
+        let diags = s.diagnostics(Instant::now());
         let hint = diags.iter().find(|d| matches!(d, StreamDiagnostic::Aes67PtpLockHint)).unwrap();
         assert_eq!(hint.deduction(), 0.0, "the hint itself carries no score weight");
         assert!(hint.message().unwrap().contains("check PTP lock"));
@@ -1725,10 +1736,39 @@ mod tests {
         // performance-counter headroom since boot.
         let Some(silent_since) = Instant::now().checked_sub(Duration::from_secs(crate::protocols::STREAM_TIMEOUT_SECS + 1)) else { return };
         s.last_packet_time = Some(silent_since);
-        let diags = s.diagnostics();
+        let diags = s.diagnostics(Instant::now());
         let dead = diags.iter().find(|d| matches!(d, StreamDiagnostic::Dead { .. })).unwrap();
         assert!(dead.is_critical());
         assert_eq!(dead.deduction(), 30.0);
+    }
+
+    /// Issue #70 (follow-up to #35): dead-stream detection must fire from the
+    /// caller-supplied `now`, not real elapsed wall-clock time — offline replay
+    /// processes packets far faster than the capture's own pace, so a stream
+    /// silent for the full timeout in capture-time must be flagged dead even
+    /// though almost no real time passed between packet arrival and the check.
+    #[test]
+    fn diagnostics_dead_stream_fires_on_synthetic_capture_time_gap() {
+        let mut s = aes67();
+        let t0 = Instant::now();
+        s.last_packet_time = Some(t0);
+        // No real wall-clock time has passed, but the synthetic gap exceeds
+        // STREAM_TIMEOUT_SECS — dead must fire from the synthetic `now`.
+        let now = t0 + Duration::from_secs(crate::protocols::STREAM_TIMEOUT_SECS + 1);
+        let diags = s.diagnostics(now);
+        assert!(diags.iter().any(|d| matches!(d, StreamDiagnostic::Dead { .. })),
+            "expected Dead diagnostic from the synthetic gap, got {diags:?}");
+    }
+
+    #[test]
+    fn diagnostics_stream_not_dead_before_synthetic_timeout_elapses() {
+        let mut s = aes67();
+        let t0 = Instant::now();
+        s.last_packet_time = Some(t0);
+        let now = t0 + Duration::from_secs(1); // well under the timeout
+        let diags = s.diagnostics(now);
+        assert!(!diags.iter().any(|d| matches!(d, StreamDiagnostic::Dead { .. })),
+            "must not be dead this soon, got {diags:?}");
     }
 
     // ── TS discontinuity sign fix ─────────────────────────────────────────────
@@ -1790,7 +1830,7 @@ mod tests {
         let health = NetworkHealth::new();
         let mut streams = empty_streams();
         streams.insert("s1".into(), live_stream(0));
-        let out = health.build_health_summary(&streams, &empty_tcp(), &empty_ptp(), &empty_msrp(), &empty_eee(), &empty_avtp());
+        let out = health.build_health_summary(&streams, &empty_tcp(), &empty_ptp(), &empty_msrp(), &empty_eee(), &empty_avtp(), Instant::now());
         assert!(out.is_empty(), "healthy state must yield no bullets, got {out:?}");
     }
 
@@ -1799,7 +1839,7 @@ mod tests {
         let health = NetworkHealth::new();
         let mut streams = empty_streams();
         streams.insert("s1".into(), live_stream(5));
-        let out = health.build_health_summary(&streams, &empty_tcp(), &empty_ptp(), &empty_msrp(), &empty_eee(), &empty_avtp());
+        let out = health.build_health_summary(&streams, &empty_tcp(), &empty_ptp(), &empty_msrp(), &empty_eee(), &empty_avtp(), Instant::now());
         assert_eq!(out.len(), 1);
         assert!(out[0].contains("1 stream(s) with packet loss"), "got {out:?}");
     }
@@ -1811,7 +1851,7 @@ mod tests {
         streams.insert("s1".into(), live_stream(5));
         streams.insert("s2".into(), live_stream(3));
         streams.insert("s3".into(), live_stream(1));
-        let out = health.build_health_summary(&streams, &empty_tcp(), &empty_ptp(), &empty_msrp(), &empty_eee(), &empty_avtp());
+        let out = health.build_health_summary(&streams, &empty_tcp(), &empty_ptp(), &empty_msrp(), &empty_eee(), &empty_avtp(), Instant::now());
         assert_eq!(out.len(), 1, "three lossy streams collapse to one bullet, got {out:?}");
         assert!(out[0].contains("3 stream(s) with packet loss"));
     }
@@ -1829,7 +1869,7 @@ mod tests {
         jittery.jitter = 0.015;                    // 15 ms > 10 ms threshold
         streams.insert("s2".into(), jittery);
 
-        let out = health.build_health_summary(&streams, &empty_tcp(), &empty_ptp(), &empty_msrp(), &empty_eee(), &empty_avtp());
+        let out = health.build_health_summary(&streams, &empty_tcp(), &empty_ptp(), &empty_msrp(), &empty_eee(), &empty_avtp(), Instant::now());
         // loss, jitter, DSCP — three distinct categories, one bullet each.
         assert_eq!(out.len(), 3, "got {out:?}");
         assert!(out.iter().any(|b| b.contains("packet loss")));
@@ -1853,7 +1893,7 @@ mod tests {
         let mut eee = empty_eee();
         eee.insert(("chassis".into(), "port3".into()), (10, 20));
 
-        let out = health.build_health_summary(&empty_streams(), &empty_tcp(), &ptp, &empty_msrp(), &eee, &empty_avtp());
+        let out = health.build_health_summary(&empty_streams(), &empty_tcp(), &ptp, &empty_msrp(), &eee, &empty_avtp(), Instant::now());
         assert!(out.iter().any(|b| b.contains("TCP retransmissions")), "got {out:?}");
         assert!(out.iter().any(|b| b.contains("ECN congestion")));
         assert!(out.iter().any(|b| b.contains("Multiple IGMP queriers")));
@@ -1868,7 +1908,7 @@ mod tests {
         let health = NetworkHealth::new();
         let mut unicast = empty_streams();
         unicast.insert("u1".into(), live_stream(0)); // is_multicast = false by default
-        let out = health.build_health_summary(&unicast, &empty_tcp(), &empty_ptp(), &empty_msrp(), &empty_eee(), &empty_avtp());
+        let out = health.build_health_summary(&unicast, &empty_tcp(), &empty_ptp(), &empty_msrp(), &empty_eee(), &empty_avtp(), Instant::now());
         assert!(out.is_empty(), "no multicast → no querier bullet, got {out:?}");
 
         // Same querier state, but now an active multicast stream → querier-absent bullet.
@@ -1876,7 +1916,7 @@ mod tests {
         let mut m = live_stream(0);
         m.is_multicast = true;
         mc.insert("m1".into(), m);
-        let out = health.build_health_summary(&mc, &empty_tcp(), &empty_ptp(), &empty_msrp(), &empty_eee(), &empty_avtp());
+        let out = health.build_health_summary(&mc, &empty_tcp(), &empty_ptp(), &empty_msrp(), &empty_eee(), &empty_avtp(), Instant::now());
         assert!(out.iter().any(|b| b.contains("IGMP querier absent")), "got {out:?}");
     }
 
@@ -1888,7 +1928,7 @@ mod tests {
         let health = NetworkHealth::new();
         let mut streams = empty_streams();
         streams.insert("s1".into(), live_stream(0));
-        let out = health.build_health_summary(&streams, &empty_tcp(), &empty_ptp(), &empty_msrp(), &empty_eee(), &empty_avtp());
+        let out = health.build_health_summary(&streams, &empty_tcp(), &empty_ptp(), &empty_msrp(), &empty_eee(), &empty_avtp(), Instant::now());
         assert!(out.is_empty());
     }
 
@@ -1902,7 +1942,7 @@ mod tests {
         let Some(silent_since) = Instant::now().checked_sub(Duration::from_secs(crate::protocols::STREAM_TIMEOUT_SECS + 5)) else { return };
         dead.last_packet_time = Some(silent_since);
         streams.insert("s1".into(), dead);
-        let out = health.build_health_summary(&streams, &empty_tcp(), &empty_ptp(), &empty_msrp(), &empty_eee(), &empty_avtp());
+        let out = health.build_health_summary(&streams, &empty_tcp(), &empty_ptp(), &empty_msrp(), &empty_eee(), &empty_avtp(), Instant::now());
         assert!(out.iter().any(|b| b.contains("dead stream")), "got {out:?}");
     }
 
@@ -1926,13 +1966,13 @@ mod tests {
         eee.insert(("chassis".into(), "port3".into()), (10, 20));
 
         let penalties = health.collect_penalties(
-            &streams, &empty_tcp(), &empty_ptp(), &empty_msrp(), &eee, &empty_avtp(),
+            &streams, &empty_tcp(), &empty_ptp(), &empty_msrp(), &eee, &empty_avtp(), Instant::now(),
         );
         let summary = health.build_health_summary(
-            &streams, &empty_tcp(), &empty_ptp(), &empty_msrp(), &eee, &empty_avtp(),
+            &streams, &empty_tcp(), &empty_ptp(), &empty_msrp(), &eee, &empty_avtp(), Instant::now(),
         );
         let expected: f64 = penalties.iter().map(|p| p.deduction()).sum();
-        health.calculate_score(&streams, &empty_tcp(), &empty_ptp(), &empty_msrp(), &eee, &empty_avtp());
+        health.calculate_score(&streams, &empty_tcp(), &empty_ptp(), &empty_msrp(), &eee, &empty_avtp(), Instant::now());
 
         // One bullet per penalty (biconditional), and the score is exactly the
         // complement of the summed deductions.
@@ -1980,10 +2020,10 @@ mod tests {
         streams.insert("s1".into(), s);
 
         let penalties = health.collect_penalties(
-            &streams, &empty_tcp(), &empty_ptp(), &empty_msrp(), &empty_eee(), &empty_avtp(),
+            &streams, &empty_tcp(), &empty_ptp(), &empty_msrp(), &empty_eee(), &empty_avtp(), Instant::now(),
         );
         let summary = health.build_health_summary(
-            &streams, &empty_tcp(), &empty_ptp(), &empty_msrp(), &empty_eee(), &empty_avtp(),
+            &streams, &empty_tcp(), &empty_ptp(), &empty_msrp(), &empty_eee(), &empty_avtp(), Instant::now(),
         );
 
         assert!(penalties.is_empty(), "informational-only diagnostics must add no penalty, got {} penalties", penalties.len());
@@ -2005,10 +2045,10 @@ mod tests {
         avtp.insert(s.stream_id, s);
 
         let penalties = health.collect_penalties(
-            &empty_streams(), &empty_tcp(), &empty_ptp(), &empty_msrp(), &empty_eee(), &avtp,
+            &empty_streams(), &empty_tcp(), &empty_ptp(), &empty_msrp(), &empty_eee(), &avtp, Instant::now(),
         );
         let summary = health.build_health_summary(
-            &empty_streams(), &empty_tcp(), &empty_ptp(), &empty_msrp(), &empty_eee(), &avtp,
+            &empty_streams(), &empty_tcp(), &empty_ptp(), &empty_msrp(), &empty_eee(), &avtp, Instant::now(),
         );
         let total: f64 = penalties.iter().map(|p| p.deduction()).sum();
 
@@ -2024,7 +2064,7 @@ mod tests {
         avtp.insert(s.stream_id, s);
 
         let out = health.build_health_summary(
-            &empty_streams(), &empty_tcp(), &empty_ptp(), &empty_msrp(), &empty_eee(), &avtp,
+            &empty_streams(), &empty_tcp(), &empty_ptp(), &empty_msrp(), &empty_eee(), &avtp, Instant::now(),
         );
         assert!(out.is_empty(), "got {out:?}");
     }

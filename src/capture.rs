@@ -1537,7 +1537,7 @@ impl CaptureState {
 
         self.network_health.calculate_score(
             &self.streams, &self.tcp_streams, &self.ptp.domains,
-            &self.avb.msrp_state, &self.eee_ports, &self.avb.avtp_streams,
+            &self.avb.msrp_state, &self.eee_ports, &self.avb.avtp_streams, now,
         );
         let missing_ptp = self.missing_ptp_clocks(expanded);
 
@@ -2960,14 +2960,14 @@ mod tests {
 
         state.network_health.calculate_score(
             &state.streams, &state.tcp_streams, &state.ptp.domains,
-            &state.avb.msrp_state, &state.eee_ports, &state.avb.avtp_streams);
+            &state.avb.msrp_state, &state.eee_ports, &state.avb.avtp_streams, Instant::now());
         assert!(state.network_health.network_score < 100.0,
             "retransmissions should dock the score this window");
 
         state.reset_window();
         state.network_health.calculate_score(
             &state.streams, &state.tcp_streams, &state.ptp.domains,
-            &state.avb.msrp_state, &state.eee_ports, &state.avb.avtp_streams);
+            &state.avb.msrp_state, &state.eee_ports, &state.avb.avtp_streams, Instant::now());
         assert_eq!(state.network_health.network_score, 100.0,
             "score must recover after a clean window");
     }

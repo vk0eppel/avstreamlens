@@ -147,6 +147,11 @@ pub struct ReportSnapshot<'a> {
     // so the combined dropout alert (already emitted by emit_periodic_alerts)
     // dominates.
     pub clock_dropout_correlated: bool,
+    // The real clock live, or a pcap-timestamp-derived virtual clock in offline
+    // replay (issue #35/#70) — re-derives the same per-stream Diagnostics
+    // (dead-stream detection) that were already computed once for the score in
+    // `end_of_window`, so it must be the same `now` used there.
+    pub now: std::time::Instant,
 }
 
 impl<'a> ReportSnapshot<'a> {
@@ -160,6 +165,7 @@ impl<'a> ReportSnapshot<'a> {
         state: &'a crate::capture::CaptureState,
         checks: &'a crate::capture::WindowChecks,
         pcap_stats: Option<(u32, u32, u32)>,
+        now: std::time::Instant,
     ) -> Self {
         ReportSnapshot {
             streams: &state.streams,
@@ -194,6 +200,7 @@ impl<'a> ReportSnapshot<'a> {
                 ptp_sync: &checks.ptp_sync_alerts,
             },
             clock_dropout_correlated: state.clock_dropout_correlated,
+            now,
         }
     }
 }
@@ -640,6 +647,7 @@ fn render_streams(
     msrp_state: &HashMap<[u8; 8], MsrpDeclaration>,
     mvrp_vlans: &HashSet<u16>,
     clock_dropout_correlated: bool,
+    now: std::time::Instant,
 ) -> Vec<RenderedLine> {
     let mut lines = Vec::new();
 
@@ -725,7 +733,7 @@ fn render_streams(
             ))));
         }
 
-        for diag in s.diagnostics() {
+        for diag in s.diagnostics(now) {
             // Suppress PacketLoss for clock-dependent protocols when the combined
             // clock-dropout alert already fired — avoids double-reporting.
             let clock_proto = crate::capture::stream_clock_kind(&s.protocol).is_some();
@@ -931,7 +939,7 @@ pub fn print_report(snap: &ReportSnapshot, session: &mut ReportSession, logger: 
         streams, tcp_streams, ptp_domains, missing_ptp, health, bytes_this_window,
         eee_ports, dante, avb, ndi_sources, ndi_names,
         pause_frames, pfc_frames, pcap_stats, packets_dispatched,
-        periodic_alerts, clock_dropout_correlated,
+        periodic_alerts, clock_dropout_correlated, now: capture_now,
     } = *snap;
     let DanteSnapshot { sources: dante_sources, names: dante_names, conmon: dante_conmon, unverified: dante_unverified } = dante;
     let AvbSnapshot { avtp_streams, msrp_state, mvrp_vlans, avdecc_entities } = avb;
@@ -981,7 +989,7 @@ pub fn print_report(snap: &ReportSnapshot, session: &mut ReportSession, logger: 
     // the scoring table exactly (NetworkHealth::build_health_summary). Empty when
     // the score is 100%.
     let health_summary =
-        health.build_health_summary(streams, tcp_streams, ptp_domains, msrp_state, eee_ports, avtp_streams);
+        health.build_health_summary(streams, tcp_streams, ptp_domains, msrp_state, eee_ports, avtp_streams, capture_now);
 
     // ── Quiet mode: suppress stdout only, never the log ─────────────────────
     // A quiet cycle prints nothing to stdout when the report is fully healthy —
@@ -1067,7 +1075,7 @@ pub fn print_report(snap: &ReportSnapshot, session: &mut ReportSession, logger: 
     section_header(logger, "Streams:", "📡 Streams:");
     let stream_lines = render_streams(
         streams, tcp_streams, dante_sources, dante_names, avtp_streams, msrp_state, mvrp_vlans,
-        clock_dropout_correlated,
+        clock_dropout_correlated, capture_now,
     );
     emit_lines(&stream_lines, logger);
 
@@ -1302,6 +1310,7 @@ mod tests {
             packets_dispatched: 0,
             periodic_alerts: PeriodicAlerts { ip_config: &[], conmon_bridge: &[], follower_census: &[], ptp_sync: &[] },
             clock_dropout_correlated: false,
+            now: std::time::Instant::now(),
         };
         let tmp = std::env::temp_dir().join(format!("avsl_quiet_{}.log", std::process::id()));
         let file = std::fs::File::options().read(true).write(true).create(true).truncate(true)
@@ -1377,7 +1386,7 @@ mod tests {
 
         let lines = render_streams(
             &HashMap::new(), &HashMap::new(), &HashSet::new(), &HashMap::new(),
-            &avtp_streams, &HashMap::new(), &HashSet::new(), false,
+            &avtp_streams, &HashMap::new(), &HashSet::new(), false, std::time::Instant::now(),
         );
 
         assert!(
@@ -1397,7 +1406,7 @@ mod tests {
 
         let lines = render_streams(
             &HashMap::new(), &HashMap::new(), &HashSet::new(), &HashMap::new(),
-            &avtp_streams, &HashMap::new(), &HashSet::new(), false,
+            &avtp_streams, &HashMap::new(), &HashSet::new(), false, std::time::Instant::now(),
         );
 
         assert!(!lines.iter().any(|l| l.text.contains("PCP")));
@@ -1519,7 +1528,7 @@ mod tests {
         state.dante.sources.insert(Ipv4Addr::new(169, 254, 1, 1));
 
         let checks = state.end_of_window(&[], false, std::time::Instant::now());
-        let snap = ReportSnapshot::from_state(&state, &checks, Some((100, 2, 0)));
+        let snap = ReportSnapshot::from_state(&state, &checks, Some((100, 2, 0)), std::time::Instant::now());
 
         assert_eq!(snap.streams.len(), 1, "streams must come from state.streams");
         assert_eq!(snap.dante.sources.len(), 1, "dante.sources must come from state.dante.sources");
