@@ -560,6 +560,32 @@ impl StreamDiagnostic {
     /// `true` for the one variant rendered in red (💀) rather than yellow (⚠).
     pub fn is_critical(&self) -> bool { matches!(self, StreamDiagnostic::Dead { .. }) }
 
+    /// Short human-facing category name — the one place a Diagnostic's name is
+    /// written. `NetworkHealth::collect_penalties`'s aggregate Health Summary
+    /// bullet builds from this instead of independently re-authoring the same
+    /// name; `message()`'s per-stream prose is free to phrase it differently
+    /// but both trace back to the same variant here, not two hand-written
+    /// strings that can silently drift apart.
+    pub fn category(&self) -> &'static str {
+        match self {
+            StreamDiagnostic::PacketLoss { .. } => "packet loss",
+            StreamDiagnostic::HighJitter { .. } => "high jitter",
+            StreamDiagnostic::TsDiscontinuity { .. } => "timestamp discontinuities",
+            StreamDiagnostic::SsrcChange { .. } => "SSRC changes",
+            StreamDiagnostic::SignalGap { .. } => "signal gaps",
+            StreamDiagnostic::DscpViolation { .. } => "incorrect DSCP",
+            StreamDiagnostic::Dead { .. } => "silent",
+            StreamDiagnostic::Reorder { .. } => "packet reorder",
+            StreamDiagnostic::TtlRouted { .. } => "routed traffic (TTL)",
+            StreamDiagnostic::PtMismatch { .. } => "payload type mismatch",
+            StreamDiagnostic::NotAnnounced => "no SAP announcement",
+            StreamDiagnostic::UnknownStreamType => "unknown stream type",
+            StreamDiagnostic::Aes67PtpLockHint => "PTP lock",
+            StreamDiagnostic::DanteClockOrSubscriptionHint => "clock or subscription issue",
+            StreamDiagnostic::PcpAdvisory { .. } => "PCP advisory",
+        }
+    }
+
     /// Full report line, including leading indent and glyph — matches the
     /// pre-deepening report.rs text exactly so output is unchanged. `None` for
     /// `HighJitter` in the 10–20ms band: scored (2.0, see `deduction`) but, as
@@ -908,26 +934,26 @@ impl NetworkHealth {
         // the Streams section renders from, so score and inline alert text can no
         // longer drift apart the way the old, independently-authored copies did.
         let mut has_multicast       = false;
-        let mut loss_count          = 0usize; let mut loss_total          = 0.0f64;
-        let mut jitter_count        = 0usize; let mut jitter_total        = 0.0f64;
-        let mut tsd_count           = 0usize; let mut tsd_total           = 0.0f64;
-        let mut ssrc_count          = 0usize; let mut ssrc_total          = 0.0f64;
-        let mut dead_count          = 0usize;
-        let mut gap_count           = 0usize;
-        let mut dscp_count          = 0usize;
+        let mut loss_count          = 0usize; let mut loss_total          = 0.0f64; let mut loss_category   = "";
+        let mut jitter_count        = 0usize; let mut jitter_total        = 0.0f64; let mut jitter_category = "";
+        let mut tsd_count           = 0usize; let mut tsd_total           = 0.0f64; let mut tsd_category    = "";
+        let mut ssrc_count          = 0usize; let mut ssrc_total          = 0.0f64; let mut ssrc_category   = "";
+        let mut dead_count          = 0usize; let mut dead_category      = "";
+        let mut gap_count           = 0usize; let mut gap_category       = "";
+        let mut dscp_count          = 0usize; let mut dscp_category      = "";
 
         for s in streams.values() {
             if s.is_multicast && s.packets > 0 { has_multicast = true; }
 
             for diag in s.diagnostics() {
                 match diag {
-                    StreamDiagnostic::PacketLoss { .. }      => { loss_count   += 1; loss_total   += diag.deduction(); }
-                    StreamDiagnostic::HighJitter { .. }      => { jitter_count += 1; jitter_total += diag.deduction(); }
-                    StreamDiagnostic::TsDiscontinuity { .. } => { tsd_count    += 1; tsd_total    += diag.deduction(); }
-                    StreamDiagnostic::SsrcChange { .. }      => { ssrc_count   += 1; ssrc_total   += diag.deduction(); }
-                    StreamDiagnostic::Dead { .. }            => { dead_count   += 1; }
-                    StreamDiagnostic::SignalGap { .. }       => { gap_count    += 1; }
-                    StreamDiagnostic::DscpViolation { .. }   => { dscp_count   += 1; }
+                    StreamDiagnostic::PacketLoss { .. }      => { loss_count   += 1; loss_total   += diag.deduction(); loss_category   = diag.category(); }
+                    StreamDiagnostic::HighJitter { .. }      => { jitter_count += 1; jitter_total += diag.deduction(); jitter_category = diag.category(); }
+                    StreamDiagnostic::TsDiscontinuity { .. } => { tsd_count    += 1; tsd_total    += diag.deduction(); tsd_category    = diag.category(); }
+                    StreamDiagnostic::SsrcChange { .. }      => { ssrc_count   += 1; ssrc_total   += diag.deduction(); ssrc_category   = diag.category(); }
+                    StreamDiagnostic::Dead { .. }            => { dead_count   += 1; dead_category = diag.category(); }
+                    StreamDiagnostic::SignalGap { .. }       => { gap_count    += 1; gap_category  = diag.category(); }
+                    StreamDiagnostic::DscpViolation { .. }   => { dscp_count   += 1; dscp_category = diag.category(); }
                     // Informational-only: deduction() is 0.0, no score/bullet contribution.
                     // Listed explicitly (no wildcard) so a future StreamDiagnostic variant
                     // with a nonzero deduction() can't compile in silently unhandled here.
@@ -944,30 +970,36 @@ impl NetworkHealth {
         }
 
         macro_rules! per_stream {
-            ($count:expr, $deduction:expr, $fmt:expr) => {
+            ($count:expr, $deduction:expr, $bullet:expr) => {
                 if $count > 0 {
                     p.push(ScorePenalty::PerStream {
                         total_deduction: $deduction,
-                        bullet: format!($fmt, $count),
+                        bullet: $bullet,
                     });
                 }
             };
         }
-        per_stream!(loss_count,   loss_total,                    "⚠  {} stream(s) with packet loss");
-        per_stream!(jitter_count, jitter_total,                   "⚠  {} stream(s) with high jitter");
-        per_stream!(tsd_count,    tsd_total,                      "⚠  {} stream(s) with timestamp discontinuities");
-        per_stream!(ssrc_count,   ssrc_total,                     "⚠  {} stream(s) with SSRC changes");
-        per_stream!(dead_count,   dead_count as f64 * 30.0,       "⚠  {} dead stream(s) (silent)");
-        per_stream!(gap_count,    gap_count  as f64 * 10.0,       "⚠  {} stream(s) with signal gaps");
-        per_stream!(dscp_count,   (dscp_count as f64 * 5.0).min(20.0), "⚠  {} stream(s) with incorrect DSCP");
+        // Bullet text is built from `StreamDiagnostic::category()` — the same
+        // name `message()` traces back to — rather than an independently
+        // hand-written string per category, which used to carry different
+        // wording than the per-stream alert (see `category()`'s doc comment).
+        per_stream!(loss_count,   loss_total,              format!("⚠  {} stream(s) with {}", loss_count, loss_category));
+        per_stream!(jitter_count, jitter_total,             format!("⚠  {} stream(s) with {}", jitter_count, jitter_category));
+        per_stream!(tsd_count,    tsd_total,                format!("⚠  {} stream(s) with {}", tsd_count, tsd_category));
+        per_stream!(ssrc_count,   ssrc_total,                format!("⚠  {} stream(s) with {}", ssrc_count, ssrc_category));
+        per_stream!(dead_count,   dead_count as f64 * 30.0, format!("⚠  {} dead stream(s) ({})", dead_count, dead_category));
+        per_stream!(gap_count,    gap_count  as f64 * 10.0, format!("⚠  {} stream(s) with {}", gap_count, gap_category));
+        per_stream!(dscp_count,   (dscp_count as f64 * 5.0).min(20.0), format!("⚠  {} stream(s) with {}", dscp_count, dscp_category));
 
         // ── AVB PCP mismatch (per stream_id, on AvtpStreamStats) ───────────────
         // AVB media is tracked on `avtp_streams`, not `streams` — this is the one
         // per-stream penalty category collect_penalties sources from a map other
         // than `streams`/`tcp_streams`. AES67/ST2110 PcpAdvisory is informational
         // only (deduction 0.0) and already flows through the `streams` loop above.
+        // Not StreamDiagnostic-derived (AvtpStreamStats has no diagnostics() of its
+        // own), so it keeps its own literal bullet text rather than category().
         let pcp_count = avtp_streams.values().filter(|s| s.pcp_violations > 0).count();
-        per_stream!(pcp_count, pcp_count as f64 * 15.0, "⚠  {} AVB stream(s) with PCP mismatch");
+        per_stream!(pcp_count, pcp_count as f64 * 15.0, format!("⚠  {} AVB stream(s) with PCP mismatch", pcp_count));
 
         // ── TCP quality ───────────────────────────────────────────────────────
         let mut tcp_count = 0usize; let mut tcp_total = 0.0f64;
@@ -980,7 +1012,7 @@ impl NetworkHealth {
             };
             if d > 0.0 { tcp_count += 1; tcp_total += d; }
         }
-        per_stream!(tcp_count, tcp_total, "⚠  {} TCP stream(s) with degraded quality");
+        per_stream!(tcp_count, tcp_total, format!("⚠  {} TCP stream(s) with degraded quality", tcp_count));
 
         let retrans = (self.tcp_retransmissions as f64 * 0.5).min(10.0);
         if retrans > 0.0 {
@@ -1840,6 +1872,23 @@ mod tests {
         assert!(expected > 0.0, "test state must produce penalties");
         assert!((health.network_score - (100.0 - expected)).abs() < 1e-9,
             "score {} != 100 - {}", health.network_score, expected);
+    }
+
+    /// `category()` is the one place a Diagnostic's short human-facing name is
+    /// written — `collect_penalties`'s aggregate Health Summary bullet builds
+    /// from it instead of independently re-authoring the same name a fifth time
+    /// (detection in `diagnostics()`, scoring in `deduction()`, per-stream text
+    /// in `message()`, and the old separately-worded aggregate bullet were the
+    /// other four).
+    #[test]
+    fn category_names_match_existing_aggregate_bullet_wording() {
+        assert_eq!(StreamDiagnostic::PacketLoss { window_count: 1, window_pct: 1.0, lifetime_pct: 1.0 }.category(), "packet loss");
+        assert_eq!(StreamDiagnostic::HighJitter { jitter_ms: 25.0 }.category(), "high jitter");
+        assert_eq!(StreamDiagnostic::TsDiscontinuity { window_count: 1 }.category(), "timestamp discontinuities");
+        assert_eq!(StreamDiagnostic::SsrcChange { count: 1 }.category(), "SSRC changes");
+        assert_eq!(StreamDiagnostic::SignalGap { window_count: 1, max_iat_ms: 1.0 }.category(), "signal gaps");
+        assert_eq!(StreamDiagnostic::DscpViolation { count: 1, expected: "EF (46)" }.category(), "incorrect DSCP");
+        assert_eq!(StreamDiagnostic::Dead { silent_secs: 1.0 }.category(), "silent");
     }
 
     /// `collect_penalties`'s per-stream match must be exhaustive over
