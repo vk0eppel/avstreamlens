@@ -149,6 +149,55 @@ pub struct ReportSnapshot<'a> {
     pub clock_dropout_correlated: bool,
 }
 
+impl<'a> ReportSnapshot<'a> {
+    /// Assemble the snapshot from `&CaptureState` plus the `WindowChecks` bundle
+    /// `CaptureState::end_of_window` returns and the one value neither can supply
+    /// (`pcap_stats`, read from `cap.stats()` by the caller). Previously `do_report`
+    /// hand-built the ~35-line struct literal itself, which had to be kept in sync
+    /// with this struct's field list by hand — this constructor is the one place
+    /// that assembly logic lives now.
+    pub fn from_state(
+        state: &'a crate::capture::CaptureState,
+        checks: &'a crate::capture::WindowChecks,
+        pcap_stats: Option<(u32, u32, u32)>,
+    ) -> Self {
+        ReportSnapshot {
+            streams: &state.streams,
+            tcp_streams: &state.tcp_streams,
+            ptp_domains: &state.ptp.domains,
+            missing_ptp: &checks.missing_ptp,
+            health: &state.network_health,
+            bytes_this_window: state.bytes_this_window,
+            eee_ports: &state.eee_ports,
+            dante: DanteSnapshot {
+                sources: &state.dante.sources,
+                names: &state.dante.names,
+                conmon: &state.dante.conmon,
+                unverified: &checks.dante_unverified,
+            },
+            avb: AvbSnapshot {
+                avtp_streams: &state.avb.avtp_streams,
+                msrp_state: &state.avb.msrp_state,
+                mvrp_vlans: &state.avb.mvrp_vlans,
+                avdecc_entities: &state.avb.avdecc_entities,
+            },
+            ndi_sources: &state.ndi.sources,
+            ndi_names: &state.ndi.names,
+            pause_frames: state.pause_frames_this_window,
+            pfc_frames: state.pfc_frames_this_window,
+            pcap_stats,
+            packets_dispatched: state.packets_dispatched,
+            periodic_alerts: PeriodicAlerts {
+                ip_config: &checks.ip_config_alerts,
+                conmon_bridge: &checks.conmon_bridge_alerts,
+                follower_census: &checks.follower_census_alerts,
+                ptp_sync: &checks.ptp_sync_alerts,
+            },
+            clock_dropout_correlated: state.clock_dropout_correlated,
+        }
+    }
+}
+
 /// Dante-only fields, mirroring `CaptureState`'s `dante: DanteState` substate
 /// (see CLAUDE.md Capture Module section) — the report-side view of the same
 /// grouping, rather than 4 fields flattened into `ReportSnapshot` alongside
@@ -1451,5 +1500,25 @@ mod tests {
         assert!(line.text.contains("192.168.1.1"), "got {}", line.text);
         assert!(line.text.contains("00:1a:2b:3c:4d:5e"), "got {}", line.text);
         assert!(line.text.contains("interval 125s"), "got {}", line.text);
+    }
+
+    // ── ReportSnapshot::from_state — self-assembling constructor ─────────────
+
+    #[test]
+    fn from_state_assembles_snapshot_from_capture_state_and_window_checks() {
+        use crate::capture::CaptureState;
+
+        let mut state = CaptureState::new();
+        state.streams.insert("s1".into(), StreamStats::new("AES67", 48_000.0));
+        state.dante.sources.insert(Ipv4Addr::new(169, 254, 1, 1));
+
+        let checks = state.end_of_window(&[], false);
+        let snap = ReportSnapshot::from_state(&state, &checks, Some((100, 2, 0)));
+
+        assert_eq!(snap.streams.len(), 1, "streams must come from state.streams");
+        assert_eq!(snap.dante.sources.len(), 1, "dante.sources must come from state.dante.sources");
+        assert_eq!(snap.pcap_stats, Some((100, 2, 0)), "pcap_stats is the caller-supplied value");
+        assert_eq!(snap.missing_ptp.len(), checks.missing_ptp.len(),
+            "missing_ptp must come from the WindowChecks bundle, not be recomputed");
     }
 }

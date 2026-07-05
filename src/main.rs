@@ -441,8 +441,8 @@ fn do_report(
     let ts_refclk = ts_refclk_alerts(state);
     let checks = state.end_of_window(expanded_protocols, is_offline);
 
-    if let Some(combined) = checks.clock_dropout_alert {
-        capture::emit(&[combined], logger);
+    if let Some(ref combined) = checks.clock_dropout_alert {
+        capture::emit(std::slice::from_ref(combined), logger);
     } else {
         capture::emit(&checks.clock_alerts, logger);
     }
@@ -455,51 +455,10 @@ fn do_report(
     capture::emit(&checks.igmp_snooping_ptp_alerts, logger);
     capture::emit(&ts_refclk, logger);
 
-    let ip_config_alerts       = checks.ip_config_alerts;
-    let conmon_bridge_alerts   = checks.conmon_bridge_alerts;
-    let follower_census_alerts = checks.follower_census_alerts;
-    let ptp_sync_alerts        = checks.ptp_sync_alerts;
-    let dante_unverified       = checks.dante_unverified;
-    let missing_ptp            = checks.missing_ptp;
-
-    // Gather everything this Window needs behind one borrow. Built here (not in
-    // print_report) so `end_of_window`'s `&mut self` borrow (which needed the
-    // expanded protocol list and computed the score) finishes before the
-    // immutable snapshot borrows take hold.
-    let snap = ReportSnapshot {
-        streams: &state.streams,
-        tcp_streams: &state.tcp_streams,
-        ptp_domains: &state.ptp.domains,
-        missing_ptp: &missing_ptp,
-        health: &state.network_health,
-        bytes_this_window: state.bytes_this_window,
-        eee_ports: &state.eee_ports,
-        dante: crate::report::DanteSnapshot {
-            sources: &state.dante.sources,
-            names: &state.dante.names,
-            conmon: &state.dante.conmon,
-            unverified: &dante_unverified,
-        },
-        avb: crate::report::AvbSnapshot {
-            avtp_streams: &state.avb.avtp_streams,
-            msrp_state: &state.avb.msrp_state,
-            mvrp_vlans: &state.avb.mvrp_vlans,
-            avdecc_entities: &state.avb.avdecc_entities,
-        },
-        ndi_sources: &state.ndi.sources,
-        ndi_names: &state.ndi.names,
-        pause_frames: state.pause_frames_this_window,
-        pfc_frames: state.pfc_frames_this_window,
-        pcap_stats,
-        packets_dispatched: state.packets_dispatched,
-        periodic_alerts: crate::report::PeriodicAlerts {
-            ip_config: &ip_config_alerts,
-            conmon_bridge: &conmon_bridge_alerts,
-            follower_census: &follower_census_alerts,
-            ptp_sync: &ptp_sync_alerts,
-        },
-        clock_dropout_correlated: state.clock_dropout_correlated,
-    };
+    // `end_of_window`'s `&mut self` borrow (which needed the expanded protocol
+    // list and computed the score) has already finished, so `state` and `checks`
+    // can both be borrowed immutably here.
+    let snap = ReportSnapshot::from_state(state, &checks, pcap_stats);
     print_report(&snap, session, logger);
 }
 
