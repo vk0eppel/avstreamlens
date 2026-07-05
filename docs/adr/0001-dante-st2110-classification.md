@@ -48,3 +48,27 @@ A future reader will see `dante_sources` consulted in one narrow port/IP zone an
 nowhere else, and may assume it's an oversight — it is deliberate. The tool never
 goes blind waiting on discovery, and the residual false positive is confined to
 the one zone where an independent signal can correct it.
+
+## Implementation status (2026-07-05)
+
+**Deferred — the "downgrade" half cannot be implemented against any existing
+signal.** `detect_protocol_unwrapped` (`src/parser.rs`) does not consult
+`dante_sources` at all: the collision zone (`239.255/16` dst, even dst port
+5000–6000) unconditionally classifies as Dante today, before the ST2110
+catch-all ever runs. The "upgrade toward Dante" half of this decision is
+therefore a no-op if implemented as stated — the zone already defaults to
+Dante with no tie-break needed. The "downgrade toward ST2110 on a
+known-ST2110-device match" half needs an ST2110 device-identity signal (e.g.
+NMOS IS-04 discovery) that does not exist anywhere in this codebase; nothing
+currently tells the tool "this source IP is a known ST2110 device."
+
+Making `dante_sources` do anything observable would require flipping the
+zone's default — require a confirmed `dante_sources` match to stay Dante,
+falling through to ST2110 for unconfirmed sources — which is a live
+protocol-classification behavior change with field consequences (a genuine
+Dante flow from a source not yet seen via mDNS/ConMon would misclassify as
+ST2110 until discovery catches up). That's a real tradeoff decision, not a
+refactor, and per this project's convention of not shipping unverified
+wire-behavior changes, it needs a live-network verification pass and an
+explicit maintainer call before it ships. Revisit this ADR if/when an
+ST2110-identity signal is added, or if the field-verification work happens.
