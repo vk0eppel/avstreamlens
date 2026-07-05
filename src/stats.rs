@@ -928,9 +928,17 @@ impl NetworkHealth {
                     StreamDiagnostic::Dead { .. }            => { dead_count   += 1; }
                     StreamDiagnostic::SignalGap { .. }       => { gap_count    += 1; }
                     StreamDiagnostic::DscpViolation { .. }   => { dscp_count   += 1; }
-                    // Informational-only — Reorder, TtlRouted, PtMismatch, NotAnnounced,
-                    // UnknownStreamType, the AES67/Dante jitter hints: deduction() is 0.0.
-                    _ => {}
+                    // Informational-only: deduction() is 0.0, no score/bullet contribution.
+                    // Listed explicitly (no wildcard) so a future StreamDiagnostic variant
+                    // with a nonzero deduction() can't compile in silently unhandled here.
+                    StreamDiagnostic::Reorder { .. }
+                    | StreamDiagnostic::TtlRouted { .. }
+                    | StreamDiagnostic::PtMismatch { .. }
+                    | StreamDiagnostic::NotAnnounced
+                    | StreamDiagnostic::UnknownStreamType
+                    | StreamDiagnostic::Aes67PtpLockHint
+                    | StreamDiagnostic::DanteClockOrSubscriptionHint
+                    | StreamDiagnostic::PcpAdvisory { .. } => {}
                 }
             }
         }
@@ -1832,6 +1840,37 @@ mod tests {
         assert!(expected > 0.0, "test state must produce penalties");
         assert!((health.network_score - (100.0 - expected)).abs() < 1e-9,
             "score {} != 100 - {}", health.network_score, expected);
+    }
+
+    /// `collect_penalties`'s per-stream match must be exhaustive over
+    /// `StreamDiagnostic` — no wildcard arm — so a future variant with a
+    /// nonzero `deduction()` can't compile in while silently never reaching
+    /// the Health Score. This pins the current informational-only variants
+    /// (Reorder, PtMismatch, UnknownStreamType, NotAnnounced) as contributing
+    /// zero deduction and zero bullets, matching `deduction() == 0.0` for each.
+    #[test]
+    fn informational_only_diagnostics_produce_no_penalty() {
+        let health = NetworkHealth::new();
+        let mut s = StreamStats::new("2110-??", 90_000.0); // UnknownStreamType
+        s.packets = 100;
+        s.packets_this_window = 100;
+        s.last_packet_time = Some(Instant::now());
+        s.rtp_seen = true;             // + NotAnnounced (no SDP, packets > 10)
+        s.pt_mismatches = 3;           // + PtMismatch
+        s.reorders_this_window = 5;    // + Reorder (5% > 1% threshold)
+
+        let mut streams = empty_streams();
+        streams.insert("s1".into(), s);
+
+        let penalties = health.collect_penalties(
+            &streams, &empty_tcp(), &empty_ptp(), &empty_msrp(), &empty_eee(), &empty_avtp(),
+        );
+        let summary = health.build_health_summary(
+            &streams, &empty_tcp(), &empty_ptp(), &empty_msrp(), &empty_eee(), &empty_avtp(),
+        );
+
+        assert!(penalties.is_empty(), "informational-only diagnostics must add no penalty, got {} penalties", penalties.len());
+        assert!(summary.is_empty(), "informational-only diagnostics must add no bullet, got {summary:?}");
     }
 
     #[test]
