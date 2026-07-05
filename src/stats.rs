@@ -730,7 +730,10 @@ impl AvtpStreamStats {
 
     pub fn update_bitrate(&mut self, frame_bytes: u64, now: Instant) {
         self.bytes_total += frame_bytes;
-        let elapsed = self.last_bitrate_check.elapsed();
+        // now.saturating_duration_since, not .elapsed() — see StreamStats::update
+        // for why (issue #35/#70): .elapsed() measures real wall-clock time,
+        // wrong at offline-replay speed.
+        let elapsed = now.saturating_duration_since(self.last_bitrate_check);
         if elapsed > Duration::from_secs(1) {
             let delta = self.bytes_total.saturating_sub(self.bytes_at_check);
             self.bitrate_bps = (delta as f64 * 8.0 / elapsed.as_secs_f64()) as u64;
@@ -818,13 +821,16 @@ impl TcpStreamStats {
         }
     }
 
-    pub fn update_bitrate(&mut self) {
-        let elapsed = self.last_bitrate_check.elapsed();
+    pub fn update_bitrate(&mut self, now: Instant) {
+        // now.saturating_duration_since, not .elapsed() — see StreamStats::update
+        // for why (issue #35/#70): .elapsed() measures real wall-clock time,
+        // wrong at offline-replay speed.
+        let elapsed = now.saturating_duration_since(self.last_bitrate_check);
         if elapsed > Duration::from_secs(1) {
             let bytes_delta = self.bytes.saturating_sub(self.bytes_at_check);
             self.bitrate_bps = (bytes_delta as f64 * 8.0 / elapsed.as_secs_f64()) as u64;
             self.bytes_at_check = self.bytes;
-            self.last_bitrate_check = Instant::now();
+            self.last_bitrate_check = now;
         }
     }
 
@@ -1045,7 +1051,7 @@ impl NetworkHealth {
         if has_multicast {
             let absent = match self.last_igmp_query {
                 None    => true,
-                Some(t) => t.elapsed().as_secs() > self.querier_silent_after_secs(),
+                Some(t) => now.saturating_duration_since(t).as_secs() > self.querier_silent_after_secs(),
             };
             if absent {
                 p.push(ScorePenalty::Infrastructure {
@@ -2258,19 +2264,24 @@ mod tests {
     fn tcp_bitrate_not_recalculated_within_one_second_window() {
         let mut t = ndi_tcp();
         t.bytes = 125_000; // 1 Mbit
-        t.update_bitrate();
+        let now = t.last_bitrate_check; // no time elapsed at all
+        t.update_bitrate(now);
         assert_eq!(t.bitrate_bps, 0, "no recalculation until the 1s window elapses");
     }
 
+    /// Issue #70: bitrate must reflect the caller-supplied `now`, not real
+    /// elapsed wall-clock time — same fix as StreamStats::update (#35), applied
+    /// here to TcpStreamStats (NDI).
     #[test]
-    fn tcp_bitrate_recalculated_after_window_elapses() {
+    fn tcp_bitrate_recalculated_after_synthetic_window_elapses() {
         let mut t = ndi_tcp();
         t.bytes = 125_000; // 1 Mbit of bytes accumulated over the window
-        // checked_sub — see diagnostics_dead_stream_is_critical for why not `-`.
-        let Some(check_since) = Instant::now().checked_sub(Duration::from_secs(2)) else { return };
-        t.last_bitrate_check = check_since;
-        t.update_bitrate();
-        assert!(t.bitrate_bps > 0, "bitrate must be computed once the window has elapsed");
+        let t0 = t.last_bitrate_check;
+        // No real wall-clock time has passed, but the synthetic gap (2s)
+        // exceeds the 1s recalculation window.
+        let now = t0 + Duration::from_secs(2);
+        t.update_bitrate(now);
+        assert!(t.bitrate_bps > 0, "bitrate must be computed once the synthetic window has elapsed");
         assert_eq!(t.bytes_at_check, 125_000, "checkpoint must advance to the current byte count");
     }
 

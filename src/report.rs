@@ -754,7 +754,10 @@ fn render_streams(
         let mut sorted: Vec<&AvtpStreamStats> = avtp_streams.values().collect();
         sorted.sort_by_key(|s| s.stream_id);
         for avtp in sorted {
-            let dead = avtp.last_seen.elapsed() > Duration::from_secs(STREAM_TIMEOUT_SECS);
+            // now.saturating_duration_since, not .elapsed() — see StreamStats::update
+            // for why (issue #35/#70).
+            let silent = now.saturating_duration_since(avtp.last_seen);
+            let dead = silent > Duration::from_secs(STREAM_TIMEOUT_SECS);
             lines.push(RenderedLine::plain(status_entry(&format!("▸ AVB  {}  —  {}",
                 avtp_subtype_name(avtp.subtype), avtp.stream_id_str()))));
 
@@ -801,7 +804,7 @@ fn render_streams(
             }
 
             if dead {
-                lines.push(RenderedLine::colored("31", status_detail(&format!("💀 No signal for {:.0}s", avtp.last_seen.elapsed().as_secs_f64()))));
+                lines.push(RenderedLine::colored("31", status_detail(&format!("💀 No signal for {:.0}s", silent.as_secs_f64()))));
             }
         }
     }
@@ -821,11 +824,12 @@ struct NetworkStatusInputs<'a> {
     eee_ports: &'a HashMap<(String, String), (u16, u16)>,
     pcap_stats: Option<(u32, u32, u32)>,
     packets_dispatched: u64,
+    now: std::time::Instant,
 }
 
 fn render_network_status(inputs: &NetworkStatusInputs) -> Vec<RenderedLine> {
     let NetworkStatusInputs {
-        mbps, streams, health, pause_frames, pfc_frames, eee_ports, pcap_stats, packets_dispatched,
+        mbps, streams, health, pause_frames, pfc_frames, eee_ports, pcap_stats, packets_dispatched, now,
     } = *inputs;
     let mut lines = Vec::new();
 
@@ -845,7 +849,9 @@ fn render_network_status(inputs: &NetworkStatusInputs) -> Vec<RenderedLine> {
     let querier_str = match health.last_igmp_query {
         None => "IGMP: – (no querier seen)".to_string(),
         Some(t) => {
-            let secs = t.elapsed().as_secs();
+            // now.saturating_duration_since, not .elapsed() — see StreamStats::update
+            // for why (issue #35/#70).
+            let secs = now.saturating_duration_since(t).as_secs();
             if secs > health.querier_silent_after_secs() {
                 format!("IGMP: ⚠ querier silent {}s", secs)
             } else {
@@ -1083,6 +1089,7 @@ pub fn print_report(snap: &ReportSnapshot, session: &mut ReportSession, logger: 
     section_header(logger, "Network Status:", "📊 Network Status:");
     let network_status_lines = render_network_status(&NetworkStatusInputs {
         mbps, streams, health, pause_frames, pfc_frames, eee_ports, pcap_stats, packets_dispatched,
+        now: capture_now,
     });
     emit_lines(&network_status_lines, logger);
 
@@ -1412,6 +1419,33 @@ mod tests {
         assert!(!lines.iter().any(|l| l.text.contains("PCP")));
     }
 
+    /// Issue #70: AVB dead-stream detection must use the caller-supplied `now`,
+    /// not real elapsed wall-clock time, same as the StreamStats::diagnostics()
+    /// fix — AvtpStreamStats has its own inline dead-check in render_streams
+    /// rather than going through StreamStats::diagnostics().
+    #[test]
+    fn avb_stream_dead_fires_on_synthetic_capture_time_gap() {
+        use crate::stats::AvtpStreamStats;
+        let sid = [1u8, 2, 3, 4, 5, 6, 7, 8];
+        let t0 = std::time::Instant::now();
+        let mut avtp = AvtpStreamStats::new(sid, 0x00);
+        avtp.last_seen = t0;
+        let mut avtp_streams = HashMap::new();
+        avtp_streams.insert(sid, avtp);
+
+        // No real wall-clock time has passed, but the synthetic gap exceeds
+        // STREAM_TIMEOUT_SECS.
+        let now = t0 + Duration::from_secs(STREAM_TIMEOUT_SECS + 1);
+        let lines = render_streams(
+            &HashMap::new(), &HashMap::new(), &HashSet::new(), &HashMap::new(),
+            &avtp_streams, &HashMap::new(), &HashSet::new(), false, now,
+        );
+
+        assert!(lines.iter().any(|l| l.text.contains("No signal")),
+            "expected a dead-stream line from the synthetic gap, got {:?}",
+            lines.iter().map(|l| &l.text).collect::<Vec<_>>());
+    }
+
     // ── render_network_status — QoS / IGMP querier status strings ────────────
 
     fn network_status_inputs<'a>(
@@ -1428,6 +1462,7 @@ mod tests {
             eee_ports,
             pcap_stats: None,
             packets_dispatched: 0,
+            now: std::time::Instant::now(),
         }
     }
 
@@ -1481,20 +1516,23 @@ mod tests {
             "got {:?}", lines.iter().map(|l| &l.text).collect::<Vec<_>>());
     }
 
+    /// Issue #35/#70: silence is measured against the caller-supplied `now`, not
+    /// real elapsed wall-clock time — using an added (not subtracted) synthetic
+    /// gap also sidesteps the Windows CI panic raw `Instant::now() - Duration`
+    /// subtraction can hit when the performance counter has little headroom.
     #[test]
     fn igmp_status_reads_querier_silent_past_threshold() {
         let streams: HashMap<String, StreamStats> = HashMap::new();
         let mut health = NetworkHealth::new();
         // Default querier_silent_after_secs() is 260s with no interval established.
-        // checked_sub (not raw `-`) — Instant::now() minus a few hundred seconds
-        // can panic on Windows CI runners whose performance counter doesn't have
-        // that much headroom since boot; falling back to `now()` just means this
-        // assertion is skipped in that pathological case instead of crashing the
-        // whole test binary.
-        let Some(silent_since) = std::time::Instant::now().checked_sub(Duration::from_secs(300)) else { return };
-        health.last_igmp_query = Some(silent_since);
+        let t0 = std::time::Instant::now();
+        health.last_igmp_query = Some(t0);
+        let now = t0 + Duration::from_secs(300);
 
-        let lines = render_network_status(&network_status_inputs(&streams, &health, &HashMap::new()));
+        let lines = render_network_status(&NetworkStatusInputs {
+            mbps: 0.0, streams: &streams, health: &health, pause_frames: 0, pfc_frames: 0,
+            eee_ports: &HashMap::new(), pcap_stats: None, packets_dispatched: 0, now,
+        });
 
         assert!(lines.iter().any(|l| l.text.contains("IGMP: ⚠ querier silent")),
             "got {:?}", lines.iter().map(|l| &l.text).collect::<Vec<_>>());

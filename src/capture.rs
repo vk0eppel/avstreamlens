@@ -176,9 +176,11 @@ impl DanteState {
 
     /// Prune stale ConMon entries and update the mDNS-only verification counters.
     /// Must be called after report checks (check_conmon_bridge etc.) but before
-    /// the next capture window begins.
-    pub fn reset_window(&mut self, streams: &HashMap<String, StreamStats>) {
-        self.conmon.retain(|_, d| d.last_seen.elapsed().as_secs() < CONMON_PRUNE_SECS);
+    /// the next capture window begins. `now`: real clock live, capture-time
+    /// virtual clock in offline replay (issue #35/#70) — see
+    /// `StreamStats::update` for why `.elapsed()` is wrong here.
+    pub fn reset_window(&mut self, streams: &HashMap<String, StreamStats>, now: Instant) {
+        self.conmon.retain(|_, d| now.saturating_duration_since(d.last_seen).as_secs() < CONMON_PRUNE_SECS);
         for ip in &self.sources {
             let has_stream = streams.values().any(|s| s.src_ip == Some(*ip));
             let has_conmon = self.conmon.contains_key(ip);
@@ -422,11 +424,12 @@ impl IgmpState {
     /// Reset per-window IGMP tracking and prune the Join dedup map.
     /// Must run AFTER `check_multiple_queriers()` (which reads
     /// `querier_ips_this_window`) and before the next capture window begins.
-    pub fn reset_window(&mut self) {
+    /// `now`: see `DanteState::reset_window` for why not `.elapsed()`.
+    pub fn reset_window(&mut self, now: Instant) {
         self.querier_ips_this_window.clear();
         self.v3_report_seen_this_window = false;
         // Drop IGMP Join entries from hosts that vanished without sending a Leave.
-        self.joins_seen.retain(|_, t| t.elapsed() < Duration::from_secs(IGMP_JOIN_DEDUP_TTL_SECS));
+        self.joins_seen.retain(|_, t| now.saturating_duration_since(*t) < Duration::from_secs(IGMP_JOIN_DEDUP_TTL_SECS));
     }
 
     /// Multiple IGMP queriers on the same LAN cause multicast group lists to
@@ -504,16 +507,17 @@ impl AvbState {
     /// MVRP VLAN registrations are cleared when no AVTP stream remains (MVRP is
     /// periodic — the switch re-registers within seconds when AVB resumes); and
     /// AVDECC entities expire once past their advertised valid_time (+10s grace).
-    pub fn reset_window(&mut self) {
+    /// `now`: see `DanteState::reset_window` for why not `.elapsed()`.
+    pub fn reset_window(&mut self, now: Instant) {
         self.avtp_streams.retain(|_, s| {
-            s.last_seen.elapsed().as_secs() < STREAM_PRUNE_SECS
+            now.saturating_duration_since(s.last_seen).as_secs() < STREAM_PRUNE_SECS
         });
         self.msrp_state.retain(|sid, _| self.avtp_streams.contains_key(sid));
         if self.avtp_streams.is_empty() {
             self.mvrp_vlans.clear();
         }
         self.avdecc_entities.retain(|_, e| {
-            e.last_seen.elapsed().as_secs() < e.valid_time_secs.max(10) + 10
+            now.saturating_duration_since(e.last_seen).as_secs() < e.valid_time_secs.max(10) + 10
         });
     }
 }
@@ -539,13 +543,14 @@ impl PtpState {
     /// Clear per-window PTPv1 Sync sender census and prune stale followers.
     /// Must run AFTER `check_ptp_sync_conflict()`, which reads
     /// `sync_senders_this_window` — enforced by `CaptureState::end_of_window`.
-    pub fn reset_window(&mut self) {
+    /// `now`: see `DanteState::reset_window` for why not `.elapsed()`.
+    pub fn reset_window(&mut self, now: Instant) {
         for ptp in self.domains.values_mut() {
             ptp.sync_senders_this_window.clear();
         }
         // PTPv1 followers: Delay_Req rate is ~1/s; prune after 15s to survive
         // inter-cycle gaps without false-positive census drops.
-        self.v1_followers.retain(|_, t| t.elapsed().as_secs() < 15);
+        self.v1_followers.retain(|_, t| now.saturating_duration_since(*t).as_secs() < 15);
     }
 
     /// Periodic clock-loss check, called from the report cycle. `now` is the
@@ -695,9 +700,12 @@ impl CaptureState {
         }
     }
 
-    /// Reset per-5s-window counters and prune silent streams.
-    /// Call after each report is printed.
-    pub fn reset_window(&mut self) {
+    /// Reset per-5s-window counters and prune silent streams. Call after each
+    /// report is printed. `now`: see `DanteState::reset_window` for why not
+    /// `.elapsed()` — matters here because every `retain` below is pruning by
+    /// elapsed silence, which must be measured in capture time during offline
+    /// replay (issue #35/#70), not real processing time.
+    pub fn reset_window(&mut self, now: Instant) {
         self.bytes_this_window = 0;
         self.pause_frames_this_window = 0;
         self.pfc_frames_this_window   = 0;
@@ -720,29 +728,29 @@ impl CaptureState {
         }
         self.streams.retain(|_, s| {
             s.last_packet_time
-                .is_none_or(|t| t.elapsed().as_secs() < STREAM_PRUNE_SECS)
+                .is_none_or(|t| now.saturating_duration_since(t).as_secs() < STREAM_PRUNE_SECS)
         });
         self.tcp_streams.retain(|_, s| {
-            s.last_seen.elapsed().as_secs() < STREAM_PRUNE_SECS
+            now.saturating_duration_since(s.last_seen).as_secs() < STREAM_PRUNE_SECS
                 && !matches!(s.stream_quality, StreamQuality::Terminated)
         });
         // AVB substate: AVTP prune + dependent MSRP/MVRP/AVDECC pruning.
-        self.avb.reset_window();
+        self.avb.reset_window(now);
         // PTP substate: clear per-window Sync sender census + prune stale
         // followers. Must happen AFTER check_ptp_sync_conflict() — this method
         // is called last inside `end_of_window`, which enforces that order.
-        self.ptp.reset_window();
+        self.ptp.reset_window(now);
         // Dante substate: ConMon pruning + unverified-windows update.
         // Must run after check_conmon_bridge / check_follower_census (they read
         // the pre-reset data) — guaranteed by `end_of_window` calling this
         // method (`reset_window`) last.
-        self.dante.reset_window(&self.streams);
+        self.dante.reset_window(&self.streams, now);
         // IGMP substate: per-window querier/report reset + Join-dedup pruning.
         // Must run AFTER check_multiple_queriers() (which reads
         // querier_ips_this_window) — same `end_of_window` ordering guarantee.
         // The network_health flag is reset here because it lives on
         // NetworkHealth, not IgmpState.
-        self.igmp.reset_window();
+        self.igmp.reset_window(now);
         self.network_health.multiple_queriers_this_window = false;
         self.multicast_bytes_this_window = 0;
         self.clock_dropout_correlated = false;
@@ -1181,7 +1189,7 @@ impl CaptureState {
             tcp_stat.last_seq = Some(seq);
         }
         tcp_stat.last_ack = Some(ack);
-        tcp_stat.update_bitrate();
+        tcp_stat.update_bitrate(now);
         tcp_stat.update_quality();
     }
 
@@ -1300,7 +1308,8 @@ impl CaptureState {
                 if is_general_query {
                     // Track interval between consecutive General Queries (RFC 3376 default 125s).
                     if let Some(last) = self.network_health.last_igmp_query {
-                        self.network_health.igmp_query_interval_secs = Some(last.elapsed().as_secs());
+                        self.network_health.igmp_query_interval_secs =
+                            Some(now.saturating_duration_since(last).as_secs());
                     }
                     self.network_health.last_igmp_query = Some(now);
                     self.network_health.igmp_querier_ip = Some(src);
@@ -1541,7 +1550,7 @@ impl CaptureState {
         );
         let missing_ptp = self.missing_ptp_clocks(expanded);
 
-        self.reset_window();
+        self.reset_window(now);
 
         WindowChecks {
             clock_alerts,
@@ -2379,8 +2388,8 @@ mod tests {
         let src = Ipv4Addr::new(192, 168, 1, 50);
         state.dante.sources.insert(src);
         // Two silent windows — one below the 3-window threshold.
-        state.dante.reset_window(&state.streams);
-        state.dante.reset_window(&state.streams);
+        state.dante.reset_window(&state.streams, Instant::now());
+        state.dante.reset_window(&state.streams, Instant::now());
         assert!(state.dante.unverified().is_empty());
     }
 
@@ -2390,7 +2399,7 @@ mod tests {
         let src = Ipv4Addr::new(192, 168, 1, 50);
         state.dante.sources.insert(src);
         for _ in 0..3 {
-            state.dante.reset_window(&state.streams);
+            state.dante.reset_window(&state.streams, Instant::now());
         }
         assert!(state.dante.unverified().contains(&src));
     }
@@ -2400,14 +2409,14 @@ mod tests {
         let mut state = CaptureState::new();
         let src = Ipv4Addr::new(192, 168, 1, 50);
         state.dante.sources.insert(src);
-        state.dante.reset_window(&state.streams);
-        state.dante.reset_window(&state.streams);
+        state.dante.reset_window(&state.streams, Instant::now());
+        state.dante.reset_window(&state.streams, Instant::now());
         // A stream from this source appears before the third silent window —
         // the counter must clear, not just stop incrementing.
         let mut s = StreamStats::new_with_info("Dante", 48_000.0, false, Ipv4Addr::new(239,255,1,1), 5004);
         s.src_ip = Some(src);
         state.streams.insert("Dante test".to_string(), s);
-        state.dante.reset_window(&state.streams);
+        state.dante.reset_window(&state.streams, Instant::now());
         assert!(state.dante.unverified().is_empty());
     }
 
@@ -2477,7 +2486,7 @@ mod tests {
         let mc = state.has_active_multicast();
         state.igmp.check_multiple_queriers(&mut state.network_health, mc);
         assert!(state.network_health.multiple_queriers_this_window);
-        state.reset_window();
+        state.reset_window(Instant::now());
         assert!(!state.network_health.multiple_queriers_this_window);
         assert!(state.igmp.querier_ips_this_window.is_empty());
     }
@@ -2574,7 +2583,7 @@ mod tests {
         igmp.querier_ips_this_window.insert(Ipv4Addr::new(10, 0, 0, 1));
         igmp.v3_report_seen_this_window = true;
         igmp.querier_version = Some(3); // retained across windows
-        igmp.reset_window();
+        igmp.reset_window(Instant::now());
         assert!(igmp.querier_ips_this_window.is_empty());
         assert!(!igmp.v3_report_seen_this_window);
         assert_eq!(igmp.querier_version, Some(3));
@@ -2585,7 +2594,7 @@ mod tests {
         let mut avb = AvbState::new();
         avb.mvrp_vlans.insert(2);
         // No AVTP streams present — MVRP registrations are cleared on reset.
-        avb.reset_window();
+        avb.reset_window(Instant::now());
         assert!(avb.mvrp_vlans.is_empty());
     }
 
@@ -2605,7 +2614,7 @@ mod tests {
             failure_code:        None,
             listener_state:      None,
         });
-        avb.reset_window();
+        avb.reset_window(Instant::now());
         assert!(avb.msrp_state.is_empty());
     }
 
@@ -2964,7 +2973,7 @@ mod tests {
         assert!(state.network_health.network_score < 100.0,
             "retransmissions should dock the score this window");
 
-        state.reset_window();
+        state.reset_window(Instant::now());
         state.network_health.calculate_score(
             &state.streams, &state.tcp_streams, &state.ptp.domains,
             &state.avb.msrp_state, &state.eee_ports, &state.avb.avtp_streams, Instant::now());
@@ -3303,7 +3312,7 @@ mod tests {
         let mut state = CaptureState::new();
         state.handle_flow_control(FlowControlKind::Pause);
         state.handle_flow_control(FlowControlKind::PriorityFlowControl);
-        state.reset_window();
+        state.reset_window(Instant::now());
         assert_eq!(state.pause_frames_this_window, 0);
         assert_eq!(state.pfc_frames_this_window,   0);
     }
@@ -3574,7 +3583,7 @@ mod tests {
         state.handle_ptp(ptpv1_sync(Ipv4Addr::new(192, 168, 1, 10), 0, 0), Instant::now());
         state.handle_ptp(ptpv1_sync(Ipv4Addr::new(192, 168, 1, 20), 0, 0), Instant::now());
         assert!(!state.ptp.check_ptp_sync_conflict().is_empty());
-        state.reset_window();
+        state.reset_window(Instant::now());
         // After reset, no senders recorded → no conflict
         assert!(state.ptp.check_ptp_sync_conflict().is_empty(), "conflict must clear after reset_window");
     }
@@ -3596,6 +3605,27 @@ mod tests {
         assert_eq!(checks.ptp_sync_alerts.len(), 1, "conflict must be visible in the returned alerts");
         assert!(state.ptp.check_ptp_sync_conflict().is_empty(),
             "reset_window must have already run inside end_of_window");
+    }
+
+    /// Issue #70: stream/PTPv1-follower/ConMon pruning must be driven by the
+    /// caller-supplied `now`, not real elapsed wall-clock time — offline replay
+    /// processes packets far faster than the capture's own pace, so a stream
+    /// silent for the full prune window in capture-time must be pruned even
+    /// though almost no real time passed.
+    #[test]
+    fn reset_window_prunes_streams_by_synthetic_capture_time_gap() {
+        let mut state = CaptureState::new();
+        let t0 = Instant::now();
+        let mut s = StreamStats::new("AES67", 48_000.0);
+        s.last_packet_time = Some(t0);
+        state.streams.insert("s1".into(), s);
+
+        // No real wall-clock time has passed, but the synthetic gap exceeds
+        // STREAM_PRUNE_SECS — the stream must be pruned from the synthetic `now`.
+        let now = t0 + Duration::from_secs(STREAM_PRUNE_SECS + 1);
+        state.reset_window(now);
+
+        assert!(state.streams.is_empty(), "stream silent for the synthetic gap must be pruned");
     }
 
     // ── Dante TTL routing detection ──────────────────────────────────────────
