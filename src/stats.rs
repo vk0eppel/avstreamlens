@@ -1721,7 +1721,10 @@ mod tests {
     #[test]
     fn diagnostics_dead_stream_is_critical() {
         let mut s = aes67();
-        s.last_packet_time = Some(Instant::now() - Duration::from_secs(crate::protocols::STREAM_TIMEOUT_SECS + 1));
+        // checked_sub — raw `-` can panic on Windows CI runners with insufficient
+        // performance-counter headroom since boot.
+        let Some(silent_since) = Instant::now().checked_sub(Duration::from_secs(crate::protocols::STREAM_TIMEOUT_SECS + 1)) else { return };
+        s.last_packet_time = Some(silent_since);
         let diags = s.diagnostics();
         let dead = diags.iter().find(|d| matches!(d, StreamDiagnostic::Dead { .. })).unwrap();
         assert!(dead.is_critical());
@@ -1895,7 +1898,9 @@ mod tests {
         let mut streams = empty_streams();
         let mut dead = aes67();
         dead.packets = 100;
-        dead.last_packet_time = Some(Instant::now() - Duration::from_secs(crate::protocols::STREAM_TIMEOUT_SECS + 5));
+        // checked_sub — see diagnostics_dead_stream_is_critical for why not `-`.
+        let Some(silent_since) = Instant::now().checked_sub(Duration::from_secs(crate::protocols::STREAM_TIMEOUT_SECS + 5)) else { return };
+        dead.last_packet_time = Some(silent_since);
         streams.insert("s1".into(), dead);
         let out = health.build_health_summary(&streams, &empty_tcp(), &empty_ptp(), &empty_msrp(), &empty_eee(), &empty_avtp());
         assert!(out.iter().any(|b| b.contains("dead stream")), "got {out:?}");
@@ -2221,7 +2226,9 @@ mod tests {
     fn tcp_bitrate_recalculated_after_window_elapses() {
         let mut t = ndi_tcp();
         t.bytes = 125_000; // 1 Mbit of bytes accumulated over the window
-        t.last_bitrate_check = Instant::now() - Duration::from_secs(2);
+        // checked_sub — see diagnostics_dead_stream_is_critical for why not `-`.
+        let Some(check_since) = Instant::now().checked_sub(Duration::from_secs(2)) else { return };
+        t.last_bitrate_check = check_since;
         t.update_bitrate();
         assert!(t.bitrate_bps > 0, "bitrate must be computed once the window has elapsed");
         assert_eq!(t.bytes_at_check, 125_000, "checkpoint must advance to the current byte count");

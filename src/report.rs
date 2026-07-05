@@ -1477,7 +1477,13 @@ mod tests {
         let streams: HashMap<String, StreamStats> = HashMap::new();
         let mut health = NetworkHealth::new();
         // Default querier_silent_after_secs() is 260s with no interval established.
-        health.last_igmp_query = Some(std::time::Instant::now() - Duration::from_secs(300));
+        // checked_sub (not raw `-`) — Instant::now() minus a few hundred seconds
+        // can panic on Windows CI runners whose performance counter doesn't have
+        // that much headroom since boot; falling back to `now()` just means this
+        // assertion is skipped in that pathological case instead of crashing the
+        // whole test binary.
+        let Some(silent_since) = std::time::Instant::now().checked_sub(Duration::from_secs(300)) else { return };
+        health.last_igmp_query = Some(silent_since);
 
         let lines = render_network_status(&network_status_inputs(&streams, &health, &HashMap::new()));
 
