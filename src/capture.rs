@@ -51,6 +51,23 @@ pub enum MissingClockKind {
     Gptp,   // needed by AVB — L2 gPTP only
 }
 
+/// Which Clock Source family a stream's protocol requires, if any. The single
+/// source of truth for this rule — previously re-derived independently in
+/// `missing_ptp_clocks`, `check_clock_dropout_correlation`, and the report
+/// layer's per-stream diagnostic suppression, which could silently drift out
+/// of sync with each other. AVB is deliberately not handled here: its gPTP
+/// requirement is derived from `avb.avtp_streams` presence, not a `StreamStats`
+/// protocol label (AVB frames never populate `CaptureState::streams`).
+pub fn stream_clock_kind(protocol: &str) -> Option<MissingClockKind> {
+    if protocol == "AES67" || protocol.starts_with("2110-") {
+        Some(MissingClockKind::Ptpv2)
+    } else if protocol == "Dante" {
+        Some(MissingClockKind::Ptp)
+    } else {
+        None
+    }
+}
+
 /// A clock requirement that is not satisfied: names the missing clock type
 /// and the protocol families currently affected. Built by
 /// `CaptureState::missing_ptp_clocks` and consumed by the report layer.
@@ -1406,10 +1423,14 @@ impl CaptureState {
         let mut missing = Vec::new();
 
         // ── PTPv2 (AES67, ST2110) ────────────────────────────────────────────
+        let ptpv2_streams: Vec<&str> = self.streams.values()
+            .filter(|s| stream_clock_kind(&s.protocol) == Some(MissingClockKind::Ptpv2))
+            .map(|s| s.protocol.as_str())
+            .collect();
         let aes67_active  = expanded.iter().any(|c| matches!(c, ProtocolChoice::AES67))
-            && self.streams.values().any(|s| s.protocol == "AES67");
+            && ptpv2_streams.contains(&"AES67");
         let st2110_active = expanded.iter().any(|c| matches!(c, ProtocolChoice::ST2110))
-            && self.streams.values().any(|s| s.protocol.starts_with("2110-"));
+            && ptpv2_streams.iter().any(|p| *p != "AES67");
         let has_ptpv2 = self.ptp.domains.values().any(|s|
             s.clock_valid && s.version == PTP_VERSION_V2 && s.is_ip_ptp_domain());
         if (aes67_active || st2110_active) && !has_ptpv2 {
@@ -1421,7 +1442,7 @@ impl CaptureState {
 
         // ── PTPv1 or PTPv2 (Dante) ───────────────────────────────────────────
         let dante_active = expanded.iter().any(|c| matches!(c, ProtocolChoice::Dante))
-            && self.streams.values().any(|s| s.protocol == "Dante");
+            && self.streams.values().any(|s| stream_clock_kind(&s.protocol) == Some(MissingClockKind::Ptp));
         // Dante needs PTPv1/PTPv2 on the IP network — an L2 gPTP (AVB) clock does
         // not satisfy it, so exclude AVB domains just like the PTPv2 check above.
         let has_ptp = self.ptp.domains.values().any(|s| s.clock_valid && s.is_ip_ptp_domain());
@@ -1459,8 +1480,8 @@ impl CaptureState {
 
         let stream_loss = self.streams.values().any(|s| {
             s.lost_this_window > 0 && (
-                (ptpv1_lost && s.protocol == "Dante")
-                || (ptpv2_lost && (s.protocol == "AES67" || s.protocol.starts_with("2110-")))
+                (ptpv1_lost && stream_clock_kind(&s.protocol) == Some(MissingClockKind::Ptp))
+                || (ptpv2_lost && stream_clock_kind(&s.protocol) == Some(MissingClockKind::Ptpv2))
             )
         });
 
@@ -3117,6 +3138,20 @@ mod tests {
         assert_eq!(missing.len(), 1);
         assert_eq!(missing[0].kind, MissingClockKind::Gptp);
         assert_eq!(missing[0].affected, vec!["AVB"]);
+    }
+
+    // ── stream_clock_kind — single source of truth for Clock Source family ───
+
+    #[test]
+    fn stream_clock_kind_matches_protocol_family() {
+        assert_eq!(stream_clock_kind("AES67"), Some(MissingClockKind::Ptpv2));
+        assert_eq!(stream_clock_kind("2110-20"), Some(MissingClockKind::Ptpv2));
+        assert_eq!(stream_clock_kind("2110-30"), Some(MissingClockKind::Ptpv2));
+        assert_eq!(stream_clock_kind("Dante"), Some(MissingClockKind::Ptp));
+        assert_eq!(stream_clock_kind("NDI"), None);
+        // AVB's gPTP requirement is derived from avtp_streams presence, not a
+        // StreamStats protocol label — AVB frames never populate `self.streams`.
+        assert_eq!(stream_clock_kind("AVB"), None);
     }
 
     // ── handle_avb — sv=0 control frames must not become phantom streams ─────

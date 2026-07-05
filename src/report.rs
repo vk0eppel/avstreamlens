@@ -679,9 +679,7 @@ fn render_streams(
         for diag in s.diagnostics() {
             // Suppress PacketLoss for clock-dependent protocols when the combined
             // clock-dropout alert already fired — avoids double-reporting.
-            let clock_proto = s.protocol == "AES67"
-                || s.protocol == "Dante"
-                || s.protocol.starts_with("2110-");
+            let clock_proto = crate::capture::stream_clock_kind(&s.protocol).is_some();
             if clock_dropout_correlated
                 && clock_proto
                 && matches!(diag, StreamDiagnostic::PacketLoss { .. })
