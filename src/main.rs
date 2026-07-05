@@ -382,8 +382,7 @@ fn run_loop<T: Activated>(
         // ── Live: report at TOP so it fires even when next_packet() times out ─
         if !is_offline && last_report.elapsed() > Duration::from_secs(5) {
             let pcap_stats = cap.stats().ok().map(|s| (s.received, s.dropped, s.if_dropped));
-            emit_periodic_alerts(state, is_offline, logger);
-            do_report(state, expanded_protocols, pcap_stats, &mut session, logger);
+            do_report(state, expanded_protocols, is_offline, pcap_stats, &mut session, logger);
             last_report = Instant::now();
 
             if let Some(secs) = live.as_ref().and_then(|l| l.duration_secs)
@@ -399,8 +398,7 @@ fn run_loop<T: Activated>(
             Err(pcap::Error::TimeoutExpired) => continue,
             Err(pcap::Error::NoMorePackets)  => {
                 // EOF — print whatever accumulated in the last partial window.
-                emit_periodic_alerts(state, is_offline, logger);
-                do_report(state, expanded_protocols, None, &mut session, logger);
+                do_report(state, expanded_protocols, is_offline, None, &mut session, logger);
                 let healthy = state.network_health.network_score >= 100.0;
                 std::process::exit(if healthy { 0 } else { 1 });
             }
@@ -423,60 +421,54 @@ fn run_loop<T: Activated>(
         // eth/outer_ip are no longer used past this point — NLL ends their borrows
         // of packet.data before we access pkt_ts (which was copied earlier).
         if is_offline && offline_clock.should_report(pkt_ts) {
-            emit_periodic_alerts(state, is_offline, logger);
-            do_report(state, expanded_protocols, None, &mut session, logger);
+            do_report(state, expanded_protocols, is_offline, None, &mut session, logger);
         }
     }
 }
 
-/// Periodic check helpers called before every report cycle.
-/// The four Discovered/Clock Sources diagnostics are computed in do_report and
-/// rendered inline in print_report instead of emitted here as free-standing output.
-fn emit_periodic_alerts(state: &mut CaptureState, is_offline: bool, logger: &mut crate::report::Logger) {
-    let clock_alerts = state.ptp.check_ptp_timeouts();
-    if let Some(combined) = state.check_clock_dropout_correlation() {
-        capture::emit(&[combined], logger);
-        state.clock_dropout_correlated = true;
-    } else {
-        capture::emit(&clock_alerts, logger);
-    }
-    capture::emit(&state.check_stream_count_anomaly(), logger);
-    capture::emit(&state.check_igmp_query_interval(),      logger);
-    let has_active_multicast = state.has_active_multicast();
-    capture::emit(&state.igmp.check_multiple_queriers(&mut state.network_health, has_active_multicast), logger);
-    capture::emit(&state.igmp.check_version_mismatch(),    logger);
-    capture::emit(&state.check_filter_unregistered_multicast(), logger);
-    capture::emit(&state.check_high_multicast_bandwidth(), logger);
-    capture::emit(&state.check_igmp_snooping_blocking_ptp(is_offline), logger);
-    capture::emit(&ts_refclk_alerts(state),           logger);
-    state.aggregate_ndi_bitrate();
-}
-
-/// Score, render, and reset a 5s report window.
+/// Score, render, and reset a 5s report window. `CaptureState::end_of_window`
+/// owns the ordering invariant (every check before `reset_window`) — this
+/// function's job is just to emit what it returns and build the snapshot.
+/// `ts_refclk_alerts` is computed here rather than inside `end_of_window`
+/// because it needs `&CaptureState` immutably while `end_of_window` needs
+/// `&mut self` throughout; it must run before `end_of_window` so the streams/
+/// domains it reads haven't been pruned yet.
 fn do_report(
     state: &mut CaptureState,
     expanded_protocols: &[protocols::ProtocolChoice],
+    is_offline: bool,
     pcap_stats: Option<(u32, u32, u32)>,
     session: &mut ReportSession,
     logger: &mut crate::report::Logger,
 ) {
-    // Compute the four section-level diagnostics before borrowing state fields.
-    let ip_config_alerts     = state.dante.check_ip_config();
-    let conmon_bridge_alerts = state.dante.check_conmon_bridge();
-    let follower_census_alerts = state.dante.check_follower_census(&state.ptp);
-    let ptp_sync_alerts      = state.ptp.check_ptp_sync_conflict();
-    let dante_unverified     = state.dante.unverified();
+    let ts_refclk = ts_refclk_alerts(state);
+    let checks = state.end_of_window(expanded_protocols, is_offline);
 
-    state.network_health.calculate_score(
-        &state.streams, &state.tcp_streams, &state.ptp.domains,
-        &state.avb.msrp_state, &state.eee_ports, &state.avb.avtp_streams,
-    );
-    let missing_ptp = state.missing_ptp_clocks(expanded_protocols);
+    if let Some(combined) = checks.clock_dropout_alert {
+        capture::emit(&[combined], logger);
+    } else {
+        capture::emit(&checks.clock_alerts, logger);
+    }
+    capture::emit(&checks.stream_count_alerts, logger);
+    capture::emit(&checks.igmp_query_interval_alerts, logger);
+    capture::emit(&checks.multiple_queriers_alerts, logger);
+    capture::emit(&checks.version_mismatch_alerts, logger);
+    capture::emit(&checks.filter_unregistered_alerts, logger);
+    capture::emit(&checks.high_bandwidth_alerts, logger);
+    capture::emit(&checks.igmp_snooping_ptp_alerts, logger);
+    capture::emit(&ts_refclk, logger);
+
+    let ip_config_alerts       = checks.ip_config_alerts;
+    let conmon_bridge_alerts   = checks.conmon_bridge_alerts;
+    let follower_census_alerts = checks.follower_census_alerts;
+    let ptp_sync_alerts        = checks.ptp_sync_alerts;
+    let dante_unverified       = checks.dante_unverified;
+    let missing_ptp            = checks.missing_ptp;
 
     // Gather everything this Window needs behind one borrow. Built here (not in
-    // print_report) so the score and missing-clock computations above — which
-    // need &mut access to network_health and the expanded protocol list — finish
-    // before the immutable snapshot borrows take hold.
+    // print_report) so `end_of_window`'s `&mut self` borrow (which needed the
+    // expanded protocol list and computed the score) finishes before the
+    // immutable snapshot borrows take hold.
     let snap = ReportSnapshot {
         streams: &state.streams,
         tcp_streams: &state.tcp_streams,
@@ -512,7 +504,6 @@ fn do_report(
         clock_dropout_correlated: state.clock_dropout_correlated,
     };
     print_report(&snap, session, logger);
-    state.reset_window();
 }
 
 /// Send mDNS PTR queries for Dante (and optionally NDI) service types at startup.

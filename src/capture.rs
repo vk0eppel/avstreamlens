@@ -77,6 +77,28 @@ pub struct MissingClock {
     pub affected: Vec<&'static str>,
 }
 
+/// Every periodic Alert/Diagnostic produced by `CaptureState::end_of_window`,
+/// bundled for main.rs to emit and the report layer to render. Building this
+/// struct is the interface — see `end_of_window`'s doc comment for the
+/// ordering invariant it exists to enforce.
+pub struct WindowChecks {
+    pub clock_alerts: Vec<Alert>,
+    pub clock_dropout_alert: Option<Alert>,
+    pub stream_count_alerts: Vec<Alert>,
+    pub igmp_query_interval_alerts: Vec<Alert>,
+    pub multiple_queriers_alerts: Vec<Alert>,
+    pub version_mismatch_alerts: Vec<Alert>,
+    pub filter_unregistered_alerts: Vec<Alert>,
+    pub high_bandwidth_alerts: Vec<Alert>,
+    pub igmp_snooping_ptp_alerts: Vec<Alert>,
+    pub ip_config_alerts: Vec<Alert>,
+    pub conmon_bridge_alerts: Vec<Alert>,
+    pub follower_census_alerts: Vec<Alert>,
+    pub ptp_sync_alerts: Vec<Alert>,
+    pub dante_unverified: HashSet<Ipv4Addr>,
+    pub missing_ptp: Vec<MissingClock>,
+}
+
 /// Severity of an alert emitted by a handler. The dispatch layer maps each
 /// variant to an ANSI color and logs the plain text.
 #[derive(Debug, Clone, PartialEq)]
@@ -507,8 +529,8 @@ impl PtpState {
     }
 
     /// Clear per-window PTPv1 Sync sender census and prune stale followers.
-    /// Must run AFTER `check_ptp_sync_conflict()` (called by main.rs before
-    /// `reset_window`), which reads `sync_senders_this_window`.
+    /// Must run AFTER `check_ptp_sync_conflict()`, which reads
+    /// `sync_senders_this_window` — enforced by `CaptureState::end_of_window`.
     pub fn reset_window(&mut self) {
         for ptp in self.domains.values_mut() {
             ptp.sync_senders_this_window.clear();
@@ -697,17 +719,19 @@ impl CaptureState {
         // AVB substate: AVTP prune + dependent MSRP/MVRP/AVDECC pruning.
         self.avb.reset_window();
         // PTP substate: clear per-window Sync sender census + prune stale
-        // followers. Must happen AFTER check_ptp_sync_conflict() (called by
-        // main.rs before reset_window).
+        // followers. Must happen AFTER check_ptp_sync_conflict() — this method
+        // is called last inside `end_of_window`, which enforces that order.
         self.ptp.reset_window();
         // Dante substate: ConMon pruning + unverified-windows update.
         // Must run after check_conmon_bridge / check_follower_census (they read
-        // the pre-reset data) and before the next capture window begins.
+        // the pre-reset data) — guaranteed by `end_of_window` calling this
+        // method (`reset_window`) last.
         self.dante.reset_window(&self.streams);
         // IGMP substate: per-window querier/report reset + Join-dedup pruning.
         // Must run AFTER check_multiple_queriers() (which reads
-        // querier_ips_this_window). The network_health flag is reset here
-        // because it lives on NetworkHealth, not IgmpState.
+        // querier_ips_this_window) — same `end_of_window` ordering guarantee.
+        // The network_health flag is reset here because it lives on
+        // NetworkHealth, not IgmpState.
         self.igmp.reset_window();
         self.network_health.multiple_queriers_this_window = false;
         self.multicast_bytes_this_window = 0;
@@ -1459,6 +1483,69 @@ impl CaptureState {
         }
 
         missing
+    }
+
+    /// Every periodic Alert/Diagnostic computed once per Window, bundled for the
+    /// report layer to render and emit. Fields are grouped by the section that
+    /// consumes them, not by call order.
+    pub fn end_of_window(&mut self, expanded: &[ProtocolChoice], is_offline: bool) -> WindowChecks {
+        // ── Ordering invariant ────────────────────────────────────────────────
+        // Every check below reads Window-scoped state that `reset_window` (called
+        // last) clears or prunes — this method is the one place that enforces the
+        // order, replacing nine-plus separately-ordered calls previously
+        // sequenced only by their position in main.rs's emit_periodic_alerts/
+        // do_report. `ts_refclk_alerts` is the one exception: it's read-only and
+        // computed by the caller (main.rs) before this method is invoked, since
+        // it needs `&CaptureState` immutably while other checks here need `&mut`.
+        let clock_alerts = self.ptp.check_ptp_timeouts();
+        let (clock_alerts, clock_dropout_alert) = if let Some(combined) = self.check_clock_dropout_correlation() {
+            self.clock_dropout_correlated = true;
+            (Vec::new(), Some(combined))
+        } else {
+            (clock_alerts, None)
+        };
+        let stream_count_alerts = self.check_stream_count_anomaly();
+        let igmp_query_interval_alerts = self.check_igmp_query_interval();
+        let has_active_multicast = self.has_active_multicast();
+        let multiple_queriers_alerts =
+            self.igmp.check_multiple_queriers(&mut self.network_health, has_active_multicast);
+        let version_mismatch_alerts = self.igmp.check_version_mismatch();
+        let filter_unregistered_alerts = self.check_filter_unregistered_multicast();
+        let high_bandwidth_alerts = self.check_high_multicast_bandwidth();
+        let igmp_snooping_ptp_alerts = self.check_igmp_snooping_blocking_ptp(is_offline);
+        self.aggregate_ndi_bitrate();
+
+        let ip_config_alerts = self.dante.check_ip_config();
+        let conmon_bridge_alerts = self.dante.check_conmon_bridge();
+        let follower_census_alerts = self.dante.check_follower_census(&self.ptp);
+        let ptp_sync_alerts = self.ptp.check_ptp_sync_conflict();
+        let dante_unverified = self.dante.unverified();
+
+        self.network_health.calculate_score(
+            &self.streams, &self.tcp_streams, &self.ptp.domains,
+            &self.avb.msrp_state, &self.eee_ports, &self.avb.avtp_streams,
+        );
+        let missing_ptp = self.missing_ptp_clocks(expanded);
+
+        self.reset_window();
+
+        WindowChecks {
+            clock_alerts,
+            clock_dropout_alert,
+            stream_count_alerts,
+            igmp_query_interval_alerts,
+            multiple_queriers_alerts,
+            version_mismatch_alerts,
+            filter_unregistered_alerts,
+            high_bandwidth_alerts,
+            igmp_snooping_ptp_alerts,
+            ip_config_alerts,
+            conmon_bridge_alerts,
+            follower_census_alerts,
+            ptp_sync_alerts,
+            dante_unverified,
+            missing_ptp,
+        }
     }
 
     /// When a PTP clock is confirmed lost AND at least one stream in the affected
@@ -3476,6 +3563,25 @@ mod tests {
         state.reset_window();
         // After reset, no senders recorded → no conflict
         assert!(state.ptp.check_ptp_sync_conflict().is_empty(), "conflict must clear after reset_window");
+    }
+
+    /// `end_of_window` must run every periodic check BEFORE resetting the Window
+    /// state those checks read from — the same ordering invariant previously
+    /// enforced only by call-site position across emit_periodic_alerts/do_report
+    /// in main.rs. This pins it via the single new public method: the sync
+    /// conflict must be visible in the returned alerts, and gone from state
+    /// immediately after the call (proving reset_window ran, and ran last).
+    #[test]
+    fn end_of_window_runs_checks_before_reset() {
+        let mut state = CaptureState::new();
+        state.handle_ptp(ptpv1_sync(Ipv4Addr::new(192, 168, 1, 10), 0, 0));
+        state.handle_ptp(ptpv1_sync(Ipv4Addr::new(192, 168, 1, 20), 0, 0));
+
+        let checks = state.end_of_window(&[ProtocolChoice::Dante], false);
+
+        assert_eq!(checks.ptp_sync_alerts.len(), 1, "conflict must be visible in the returned alerts");
+        assert!(state.ptp.check_ptp_sync_conflict().is_empty(),
+            "reset_window must have already run inside end_of_window");
     }
 
     // ── Dante TTL routing detection ──────────────────────────────────────────
