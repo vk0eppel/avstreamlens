@@ -373,34 +373,69 @@ pub fn detect_protocol_unwrapped(eth: &EthernetPacket, raw_et: u16, l2_payload: 
     if (payload[0] >> 6) & 0b11 != 2 { return None; }
 
     let payload_type = payload[1] & 0x7F;
+    let ctx = AudioClassifyCtx { src_ip, dst_ip, src_port, dst_port, payload_type };
+    AUDIO_CLASSIFICATION_RULES.iter().find_map(|rule| rule(&ctx))
+}
 
-    // Dante port check first — takes priority over IP-based multicast classification.
-    // Dante multicast uses 239.x.x.x addresses (typically 239.255.*) which would otherwise
-    // be misclassified as ST2110. Both src AND dst must be in 5000–6000 (even).
-    if is_likely_dante_audio(src_port, dst_port, payload_type) {
-        return Some(AvProtocol::Dante { kind: DanteKind::AudioStream, src: src_ip, dst: dst_ip, dst_port });
-    }
-    // Multicast Dante (239.255.0.0/16): the strict both-ports rule above can miss
-    // transmit flows whose source port isn't in range. For Dante's dedicated
-    // multicast block, require only the destination port to be in the Dante range —
-    // enough to stop the ST2110 239.x catch-all below from stealing the stream.
-    // A 239.255.x.x flow on a non-Dante port still falls through to ST2110.
-    if is_dante_multicast(dst_ip)
-        && (5000..=6000).contains(&dst_port) && dst_port.is_multiple_of(2)
-    {
-        return Some(AvProtocol::Dante { kind: DanteKind::AudioStream, src: src_ip, dst: dst_ip, dst_port });
-    }
-    if is_aes67_multicast(dst_ip) {
-        return Some(AvProtocol::Aes67 { src: src_ip, dst: dst_ip, dst_port, payload_type });
-    }
-    if is_st2110_multicast(dst_ip) {
-        return Some(AvProtocol::St2110 {
-            src: src_ip, dst: dst_ip, dst_port,
-            stream_type: classify_st2110(payload_type, dst_port),
-        });
-    }
+/// Inputs needed to classify an RTP-bearing flow as Dante Audio Flow, AES67,
+/// or ST2110 — used only by `AUDIO_CLASSIFICATION_RULES` below, not by the
+/// earlier ATP/PTP/ConMon checks, which have unambiguous wire signatures of
+/// their own and never reach this stage.
+struct AudioClassifyCtx {
+    src_ip: Ipv4Addr,
+    dst_ip: Ipv4Addr,
+    src_port: u16,
+    dst_port: u16,
+    payload_type: u8,
+}
 
-    None
+/// Dante/AES67/ST2110 classification precedence, evaluated top-to-bottom by
+/// `detect_protocol_unwrapped`. This list's *order* is the ADR-0001 invariant
+/// made explicit: Dante must be checked before the ST2110 catch-all, or a
+/// Dante multicast flow in 239.255/16 gets stolen by `classify_st2110_stream`
+/// (see docs/adr/0001-dante-st2110-classification.md). Previously this
+/// precedence lived only in the position of four `if` statements in a function
+/// body, protected by a single regression test and prose comments — this list
+/// is now the one place the precedence itself lives; the pinning test
+/// (`st2110_catch_all_is_the_last_classification_rule`) checks the list
+/// directly rather than only inferring the order from behavior.
+const AUDIO_CLASSIFICATION_RULES: &[fn(&AudioClassifyCtx) -> Option<AvProtocol>] = &[
+    classify_dante_strict_ports,
+    classify_dante_multicast_block,
+    classify_aes67_stream,
+    classify_st2110_stream,
+];
+
+/// Dante port check first — takes priority over IP-based multicast classification.
+/// Dante multicast uses 239.x.x.x addresses (typically 239.255.*) which would otherwise
+/// be misclassified as ST2110. Both src AND dst must be in 5000–6000 (even).
+fn classify_dante_strict_ports(ctx: &AudioClassifyCtx) -> Option<AvProtocol> {
+    is_likely_dante_audio(ctx.src_port, ctx.dst_port, ctx.payload_type).then_some(AvProtocol::Dante {
+        kind: DanteKind::AudioStream, src: ctx.src_ip, dst: ctx.dst_ip, dst_port: ctx.dst_port,
+    })
+}
+
+/// Multicast Dante (239.255.0.0/16): the strict both-ports rule above can miss
+/// transmit flows whose source port isn't in range. For Dante's dedicated
+/// multicast block, require only the destination port to be in the Dante range —
+/// enough to stop the ST2110 239.x catch-all below from stealing the stream.
+/// A 239.255.x.x flow on a non-Dante port still falls through to ST2110.
+fn classify_dante_multicast_block(ctx: &AudioClassifyCtx) -> Option<AvProtocol> {
+    (is_dante_multicast(ctx.dst_ip) && (5000..=6000).contains(&ctx.dst_port) && ctx.dst_port.is_multiple_of(2))
+        .then_some(AvProtocol::Dante { kind: DanteKind::AudioStream, src: ctx.src_ip, dst: ctx.dst_ip, dst_port: ctx.dst_port })
+}
+
+fn classify_aes67_stream(ctx: &AudioClassifyCtx) -> Option<AvProtocol> {
+    is_aes67_multicast(ctx.dst_ip).then_some(AvProtocol::Aes67 {
+        src: ctx.src_ip, dst: ctx.dst_ip, dst_port: ctx.dst_port, payload_type: ctx.payload_type,
+    })
+}
+
+fn classify_st2110_stream(ctx: &AudioClassifyCtx) -> Option<AvProtocol> {
+    is_st2110_multicast(ctx.dst_ip).then(|| AvProtocol::St2110 {
+        src: ctx.src_ip, dst: ctx.dst_ip, dst_port: ctx.dst_port,
+        stream_type: classify_st2110(ctx.payload_type, ctx.dst_port),
+    })
 }
 
 // ═════════════════════════════════════════════════════════════════
@@ -662,6 +697,18 @@ mod tests {
         assert!(matches!(detect_protocol(&eth),
             Some(AvProtocol::Dante { kind: DanteKind::AudioStream, .. })),
             "Dante's port-only heuristic takes priority over the AES67 IP block");
+    }
+
+    /// The Dante/AES67/ST2110 precedence lives in `AUDIO_CLASSIFICATION_RULES`'s
+    /// order, not in if-statement position — pins the invariant structurally
+    /// (the ST2110 catch-all is last) rather than only behaviorally, so a
+    /// future reorder that happens to preserve today's specific test cases
+    /// still gets caught if it moves the catch-all out of last place.
+    #[test]
+    fn st2110_catch_all_is_the_last_classification_rule() {
+        let last = *AUDIO_CLASSIFICATION_RULES.last().expect("rule list must not be empty");
+        assert_eq!(last as *const (), classify_st2110_stream as *const (),
+            "the ST2110 catch-all must stay last — see docs/adr/0001-dante-st2110-classification.md");
     }
 
     #[test]
