@@ -226,6 +226,14 @@ mod bpf_tests {
 
 /// Resolve a device by exact pcap name (e.g. `en0`).
 /// Exits with a clear error if the name is not found.
+///
+/// Deliberately does not apply `select_interface`'s skip-list (loopback,
+/// `utun`/`awdl`/`bridge`/etc., disconnected adapters) — that list exists only
+/// to declutter the interactive menu of choices nobody would pick, not to
+/// forbid a choice. A user who explicitly names an interface with `--interface`
+/// has already made the decision the skip-list exists to help with; honoring
+/// an unusual explicit request (e.g. a disconnected adapter for testing) is
+/// more useful here than silently reproducing the interactive filter.
 pub fn resolve_interface_by_name(name: &str) -> Device {
     let devices = Device::list().expect("Unable to list interfaces");
     devices.into_iter()

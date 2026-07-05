@@ -355,6 +355,14 @@ impl Default for DanteState {
 /// symmetry with the other protocol-family substates; carries no per-window
 /// logic of its own. Bitrate aggregation lives on `CaptureState` because it
 /// reads the shared `streams`/`tcp_streams` maps, not these fields.
+///
+/// This is a genuinely shallow module — two maps and one bounded-insert
+/// method, interface nearly as large as the implementation — reviewed and
+/// kept anyway: inlining `sources`/`names` onto `CaptureState` directly would
+/// save one level of indirection but break the naming symmetry every other
+/// protocol-family substate (`dante`, `avb`, `igmp`, `ptp`) establishes, and
+/// every call site (`main.rs`, `report.rs`, tests) already reads through
+/// `state.ndi.*`. Not worth the churn for a substate this small.
 pub struct NdiState {
     pub sources: HashSet<Ipv4Addr>,
     pub names:   HashMap<Ipv4Addr, String>,

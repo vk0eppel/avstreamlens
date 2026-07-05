@@ -11,6 +11,34 @@ pub fn parse_avtp_stream_id(payload: &[u8]) -> Option<[u8; 8]> {
     payload[4..12].try_into().ok()
 }
 
+/// Fields shared by TalkerAdvertise and TalkerFailed FirstValue bodies (IEEE
+/// 802.1Qat) — TalkerFailed's FirstValue literally is a TalkerAdvertise body
+/// plus FailureInformation appended, so the two attribute types read this
+/// prefix identically. One extraction site instead of two identical copies.
+struct TalkerCommon {
+    stream_id:  [u8; 8],
+    dest_mac:   [u8; 6],
+    vlan_id:    u16,
+    max_frame:  u16,
+    max_frames: u16,
+    priority:   u8,
+}
+
+impl TalkerCommon {
+    /// `first_value` must be at least 25 bytes (checked by the `attr_len >= 25`
+    /// guard at both call sites before this is called).
+    fn parse(first_value: &[u8]) -> Self {
+        TalkerCommon {
+            stream_id:  first_value[0..8].try_into().unwrap_or([0u8; 8]),
+            dest_mac:   first_value[8..14].try_into().unwrap_or([0u8; 6]),
+            vlan_id:    u16::from_be_bytes([first_value[14], first_value[15]]) & 0x0FFF,
+            max_frame:  u16::from_be_bytes([first_value[16], first_value[17]]),
+            max_frames: u16::from_be_bytes([first_value[18], first_value[19]]),
+            priority:   (first_value[20] >> 5) & 0x07,
+        }
+    }
+}
+
 /// Parse an MSRP PDU (IEEE 802.1Qat, EtherType 0x22EA).
 /// Returns a vec of Talker Advertise, Talker Failed, and Listener declarations.
 /// Ignores Domain messages (type 4) and unknown types.
@@ -34,42 +62,32 @@ pub fn parse_msrp(payload: &[u8]) -> Vec<MsrpDeclaration> {
 
         match attr_type {
             1 if attr_len >= 25 => { // TalkerAdvertise
-                let stream_id: [u8; 8] = first_value[0..8].try_into().unwrap_or([0u8; 8]);
-                let dest_mac:  [u8; 6] = first_value[8..14].try_into().unwrap_or([0u8; 6]);
-                let vlan_id    = u16::from_be_bytes([first_value[14], first_value[15]]) & 0x0FFF;
-                let max_frame  = u16::from_be_bytes([first_value[16], first_value[17]]);
-                let max_frames = u16::from_be_bytes([first_value[18], first_value[19]]);
-                let priority   = (first_value[20] >> 5) & 0x07;
+                let common = TalkerCommon::parse(first_value);
                 decls.push(MsrpDeclaration {
                     decl_type: MsrpDeclType::TalkerAdvertise,
-                    stream_id,
-                    dest_mac: Some(dest_mac),
-                    vlan_id: Some(vlan_id),
-                    max_frame_size: Some(max_frame),
-                    max_interval_frames: Some(max_frames),
-                    priority: Some(priority),
+                    stream_id: common.stream_id,
+                    dest_mac: Some(common.dest_mac),
+                    vlan_id: Some(common.vlan_id),
+                    max_frame_size: Some(common.max_frame),
+                    max_interval_frames: Some(common.max_frames),
+                    priority: Some(common.priority),
                     failure_code: None,
                     listener_state: None,
                 });
             }
             2 if attr_len >= 34 => { // TalkerFailed
-                let stream_id: [u8; 8] = first_value[0..8].try_into().unwrap_or([0u8; 8]);
-                let dest_mac:  [u8; 6] = first_value[8..14].try_into().unwrap_or([0u8; 6]);
-                let vlan_id    = u16::from_be_bytes([first_value[14], first_value[15]]) & 0x0FFF;
-                let max_frame  = u16::from_be_bytes([first_value[16], first_value[17]]);
-                let max_frames = u16::from_be_bytes([first_value[18], first_value[19]]);
-                let priority   = (first_value[20] >> 5) & 0x07;
+                let common = TalkerCommon::parse(first_value);
                 // TalkerFailed FirstValue = 25-byte TalkerAdvertise body + FailureInformation
                 // (FailureBridgeId 8 bytes at 25-32, FailureCode at 33).
-                let failure    = first_value[33];
+                let failure = first_value[33];
                 decls.push(MsrpDeclaration {
                     decl_type: MsrpDeclType::TalkerFailed,
-                    stream_id,
-                    dest_mac: Some(dest_mac),
-                    vlan_id: Some(vlan_id),
-                    max_frame_size: Some(max_frame),
-                    max_interval_frames: Some(max_frames),
-                    priority: Some(priority),
+                    stream_id: common.stream_id,
+                    dest_mac: Some(common.dest_mac),
+                    vlan_id: Some(common.vlan_id),
+                    max_frame_size: Some(common.max_frame),
+                    max_interval_frames: Some(common.max_frames),
+                    priority: Some(common.priority),
                     failure_code: Some(failure),
                     listener_state: None,
                 });

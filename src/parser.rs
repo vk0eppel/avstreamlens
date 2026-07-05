@@ -54,6 +54,25 @@ pub fn is_st2110_multicast(ip: Ipv4Addr) -> bool {
     octets[0] == 239 && octets[1] != 69
 }
 
+/// "Dante audio" at the wire level is the union of three independent
+/// heuristics, added incrementally as field cases turned up (see TODO.md's
+/// open Dante port-range verification items) — no single function decides it:
+///   1. **ATP official ports** (`detect_protocol_unwrapped`'s pre-RTP-gate
+///      check): `239.255/16` dst port 4321 (multicast), or both src+dst in
+///      14336–15359 (unicast). Non-RTP framing, so it's checked before the
+///      RTP version gate.
+///   2. **`is_likely_dante_audio`** (below): strict, RTP-framed — both src
+///      AND dst ports even in 5000–6000. Catches unicast and unambiguous
+///      multicast transmit flows.
+///   3. **`is_dante_multicast`**: RTP-framed, dst-port-only — `239.255/16`
+///      with an even dst port in 5000–6000. Exists because (2) misses
+///      multicast transmit flows whose source port is outside 5000–6000; this
+///      is also what stops `is_st2110_multicast`'s catch-all from stealing
+///      those flows (see `AUDIO_CLASSIFICATION_RULES`).
+///
+/// A reader auditing "does this tool recognize Dante audio on port X" needs
+/// all three, not just the one nearest their diff.
+///
 /// Detect Dante's default multicast block (239.255.0.0/16). Dante multicast audio
 /// flows are addressed here; the generic `is_st2110_multicast` catch-all would
 /// otherwise claim them, so detection consults this block before falling through.
