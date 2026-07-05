@@ -234,6 +234,31 @@ impl ProtocolChoice {
     pub fn needs_sap(&self) -> bool {
         matches!(self, ProtocolChoice::AES67 | ProtocolChoice::ST2110)
     }
+
+    /// Parse a single selection token — a protocol name (case-insensitive) or a
+    /// 1-based numeric index into `all_choices()` (0 or "all" meaning `All`) —
+    /// into a `ProtocolChoice`. The single seam shared by `cli::parse_protocol_str`
+    /// (the `--protocol` flag, comma-separated names or numbers) and
+    /// `cli::prompt_protocol_selection` (the interactive prompt, numbers only).
+    /// They used to implement name-matching and numeric-index-matching as two
+    /// independent, partially-overlapping parsers.
+    pub fn parse(token: &str) -> Option<ProtocolChoice> {
+        let token = token.trim();
+        match token.to_lowercase().as_str() {
+            "all"    => return Some(ProtocolChoice::All),
+            "audio"  => return Some(ProtocolChoice::Audio),
+            "video"  => return Some(ProtocolChoice::Video),
+            "aes67"  => return Some(ProtocolChoice::AES67),
+            "avb"    => return Some(ProtocolChoice::AVB),
+            "dante"  => return Some(ProtocolChoice::Dante),
+            "ndi"    => return Some(ProtocolChoice::NDI),
+            "st2110" => return Some(ProtocolChoice::ST2110),
+            _ => {}
+        }
+        let n: usize = token.parse().ok()?;
+        if n == 0 { return Some(ProtocolChoice::All); }
+        ProtocolChoice::all_choices().get(n - 1).cloned()
+    }
 }
 
 impl AvProtocol {
@@ -287,6 +312,35 @@ mod gating_rules_tests {
         }
         assert!(!ProtocolChoice::AVB.needs_igmp(), "AVB is L2-only, no IP multicast");
         assert!(!ProtocolChoice::NDI.needs_igmp());
+    }
+
+    #[test]
+    fn parse_matches_name_case_insensitively() {
+        assert_eq!(ProtocolChoice::parse("aes67"), Some(ProtocolChoice::AES67));
+        assert_eq!(ProtocolChoice::parse("AES67"), Some(ProtocolChoice::AES67));
+        assert_eq!(ProtocolChoice::parse("Dante"), Some(ProtocolChoice::Dante));
+        assert_eq!(ProtocolChoice::parse("st2110"), Some(ProtocolChoice::ST2110));
+    }
+
+    #[test]
+    fn parse_matches_all_by_name_or_zero() {
+        assert_eq!(ProtocolChoice::parse("all"), Some(ProtocolChoice::All));
+        assert_eq!(ProtocolChoice::parse("ALL"), Some(ProtocolChoice::All));
+        assert_eq!(ProtocolChoice::parse("0"), Some(ProtocolChoice::All));
+    }
+
+    #[test]
+    fn parse_matches_numeric_index_into_all_choices() {
+        // 1-based index into ProtocolChoice::all_choices(), matching the
+        // interactive prompt's numbering.
+        let first = ProtocolChoice::all_choices()[0].clone();
+        assert_eq!(ProtocolChoice::parse("1"), Some(first));
+    }
+
+    #[test]
+    fn parse_returns_none_for_unknown_token() {
+        assert_eq!(ProtocolChoice::parse("not-a-protocol"), None);
+        assert_eq!(ProtocolChoice::parse("999"), None);
     }
 
     #[test]

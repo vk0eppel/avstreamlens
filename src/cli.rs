@@ -143,6 +143,40 @@ mod color_tests {
 }
 
 #[cfg(test)]
+mod protocol_flag_tests {
+    use super::parse_protocol_str;
+    use crate::protocols::ProtocolChoice;
+
+    #[test]
+    fn accepts_comma_separated_names() {
+        assert_eq!(parse_protocol_str("aes67,dante"), vec![ProtocolChoice::AES67, ProtocolChoice::Dante]);
+    }
+
+    #[test]
+    fn accepts_numeric_indices() {
+        // Numeric fallback still works now that name-matching is shared with
+        // ProtocolChoice::parse rather than reimplemented inline.
+        let first = ProtocolChoice::all_choices()[0].clone();
+        assert_eq!(parse_protocol_str("1"), vec![first]);
+    }
+
+    #[test]
+    fn all_short_circuits_to_all() {
+        assert_eq!(parse_protocol_str("aes67,all,dante"), vec![ProtocolChoice::All]);
+    }
+
+    #[test]
+    fn unknown_token_ignored_falls_back_to_all_when_nothing_else_selected() {
+        assert_eq!(parse_protocol_str("not-a-protocol"), vec![ProtocolChoice::All]);
+    }
+
+    #[test]
+    fn unknown_token_ignored_alongside_valid_ones() {
+        assert_eq!(parse_protocol_str("aes67,bogus"), vec![ProtocolChoice::AES67]);
+    }
+}
+
+#[cfg(test)]
 mod bpf_tests {
     use super::build_bpf_filter;
     use crate::protocols::ProtocolChoice;
@@ -213,30 +247,14 @@ fn parse_protocol_str(s: &str) -> Vec<ProtocolChoice> {
     let mut selected = Vec::new();
     for part in s.split(',') {
         let part = part.trim();
-        let choice: Option<ProtocolChoice> = match part.to_lowercase().as_str() {
-            "all"    => return vec![ProtocolChoice::All],
-            "audio"  => Some(ProtocolChoice::Audio),
-            "video"  => Some(ProtocolChoice::Video),
-            "aes67"  => Some(ProtocolChoice::AES67),
-            "avb"    => Some(ProtocolChoice::AVB),
-            "dante"  => Some(ProtocolChoice::Dante),
-            "ndi"    => Some(ProtocolChoice::NDI),
-            "st2110" => Some(ProtocolChoice::ST2110),
-            _ => {
-                // Also accept the interactive-mode numbers (0-7) for scripting convenience.
-                if let Ok(n) = part.parse::<usize>() {
-                    if n == 0 { return vec![ProtocolChoice::All]; }
-                    ProtocolChoice::all_choices().get(n.saturating_sub(1)).cloned()
-                } else {
-                    eprintln!("⚠  Unknown protocol '{}' — ignored", part);
-                    eprintln!("   Valid names: all, audio, video, aes67, avb, dante, ndi, st2110");
-                    None
-                }
+        match ProtocolChoice::parse(part) {
+            Some(ProtocolChoice::All) => return vec![ProtocolChoice::All],
+            Some(c) if !selected.contains(&c) => selected.push(c),
+            Some(_) => {}
+            None => {
+                eprintln!("⚠  Unknown protocol '{}' — ignored", part);
+                eprintln!("   Valid names: all, audio, video, aes67, avb, dante, ndi, st2110");
             }
-        };
-        if let Some(c) = choice
-            && !selected.contains(&c) {
-            selected.push(c);
         }
     }
     if selected.is_empty() { vec![ProtocolChoice::All] } else { selected }
@@ -362,13 +380,10 @@ pub fn prompt_protocol_selection() -> Vec<ProtocolChoice> {
 
     let mut selected = Vec::new();
     for part in input.split(',') {
-        if let Ok(idx) = part.trim().parse::<usize>() {
-            if idx == 0 {
-                return vec![ProtocolChoice::All];
-            }
-            if let Some(choice) = ProtocolChoice::all_choices().get(idx.saturating_sub(1)) {
-                selected.push(choice.clone());
-            }
+        match ProtocolChoice::parse(part.trim()) {
+            Some(ProtocolChoice::All) => return vec![ProtocolChoice::All],
+            Some(c) if !selected.contains(&c) => selected.push(c),
+            _ => {}
         }
     }
 
