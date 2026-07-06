@@ -317,7 +317,7 @@ pub fn select_interface() -> Device {
     }
 
     let port_names = macos_port_names();
-    let windows_ips = windows_ip_lookup();
+    let windows_adapters = windows_adapter_info();
 
     println!("📡 Available interfaces:\n");
     for (i, d) in filtered.iter().enumerate() {
@@ -332,17 +332,25 @@ pub fn select_interface() -> Device {
             })
             .collect::<Vec<_>>()
             .join(", ");
+        let adapter_info = d.desc.as_deref().and_then(|desc| windows_adapters.get(desc));
         // On Windows, Npcap's Device::list() doesn't always populate addresses — fall
-        // back to ipconfig's view of the same adapter (matched by description).
+        // back to Get-NetIPConfiguration's view of the same adapter.
         if ipv4.is_empty()
-            && let Some(ip) = d.desc.as_deref().and_then(|desc| windows_ips.get(desc))
+            && let Some(info) = adapter_info
+            && !info.ipv4.is_empty()
         {
-            ipv4 = ip.clone();
+            ipv4 = info.ipv4.clone();
         }
         // On Windows, Npcap names are \Device\NPF_{GUID} — show the description as
-        // the primary label and suppress the GUID from the display entirely.
+        // the primary label, plus the Windows connection name (e.g. "Ethernet",
+        // "Wi-Fi") when known, and suppress the GUID from the display entirely.
         if d.name.starts_with(r"\Device\NPF_") {
-            let label = if desc.is_empty() { d.name.as_str() } else { desc };
+            let mut label = if desc.is_empty() { d.name.clone() } else { desc.to_string() };
+            if let Some(info) = adapter_info
+                && !info.connection_name.is_empty()
+            {
+                label = format!("{}  [{}]", label, info.connection_name);
+            }
             let ip_part = if ipv4.is_empty() {
                 "  (no IPv4)".to_string()
             } else {
@@ -492,43 +500,48 @@ pub fn selected_protocol_names(selected: &[ProtocolChoice]) -> String {
     }
 }
 
-/// Query Windows for IPv4 addresses keyed by adapter description, as a fallback for
-/// interfaces where Npcap's `Device::list()` doesn't populate `addresses` (a known gap —
-/// unlike Unix's getifaddrs-backed pcap, Npcap's address population can lag or omit
-/// entries for some adapter types). Matches on adapter description since that's the
-/// field common to both `ipconfig /all` output and Npcap's `desc`.
-/// Returns an empty map on macOS/Linux or if `ipconfig` is unavailable.
-fn windows_ip_lookup() -> std::collections::HashMap<String, String> {
+/// The Windows connection name (e.g. "Ethernet", "Wi-Fi 2" — what Control Panel and
+/// `ipconfig`'s header lines call the adapter) and IPv4 address(es), as reported by
+/// `Get-NetIPConfiguration`.
+struct WindowsAdapterInfo {
+    connection_name: String,
+    ipv4: String,
+}
+
+/// Query Windows for each adapter's connection name and IPv4 address(es), keyed by
+/// adapter description. Serves two purposes: (1) a fallback for interfaces where
+/// Npcap's `Device::list()` doesn't populate `addresses` (a known gap — unlike Unix's
+/// getifaddrs-backed pcap, Npcap's address population can lag or omit entries for some
+/// adapter types), and (2) surfacing the Windows-assigned connection name, which
+/// Npcap's `Device::list()` doesn't expose at all (only the low-level driver
+/// description and the opaque `\Device\NPF_{GUID}` name).
+///
+/// Uses `Get-NetIPConfiguration`'s `InterfaceDescription` as the join key rather than
+/// parsing `ipconfig /all` text: it's the same driver-reported description string
+/// Npcap surfaces as `desc`, so it matches more reliably than ipconfig's free-text
+/// "Description" line (wording/truncation can differ between the two tools).
+/// Returns an empty map on macOS/Linux or if PowerShell is unavailable.
+fn windows_adapter_info() -> std::collections::HashMap<String, WindowsAdapterInfo> {
     let mut map = std::collections::HashMap::new();
-    let Ok(out) = std::process::Command::new("ipconfig").arg("/all").output() else {
+    let script = "Get-NetIPConfiguration | ForEach-Object { \
+        $ip = ($_.IPv4Address.IPAddress -join ','); \
+        \"$($_.InterfaceDescription)|$($_.InterfaceAlias)|$ip\" }";
+    let Ok(out) = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", script])
+        .output()
+    else {
         return map;
     };
     let text = String::from_utf8_lossy(&out.stdout);
-    let mut current_desc: Option<String> = None;
     for line in text.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            current_desc = None;
-            continue;
-        }
-        let Some((key, value)) = trimmed.split_once(':') else { continue };
-        let key = key.trim_end_matches(['.', ' ']).trim();
-        let value = value.trim();
-        match key {
-            "Description" => current_desc = Some(value.to_string()),
-            "IPv4 Address" | "Autoconfiguration IPv4 Address" => {
-                if let Some(desc) = &current_desc {
-                    let ip = value.trim_end_matches("(Preferred)").trim();
-                    map.entry(desc.clone())
-                        .and_modify(|existing: &mut String| {
-                            existing.push_str(", ");
-                            existing.push_str(ip);
-                        })
-                        .or_insert_with(|| ip.to_string());
-                }
-            }
-            _ => {}
-        }
+        let mut parts = line.splitn(3, '|');
+        let (Some(desc), Some(name), Some(ip)) = (parts.next(), parts.next(), parts.next()) else { continue };
+        let desc = desc.trim();
+        if desc.is_empty() { continue; }
+        map.insert(desc.to_string(), WindowsAdapterInfo {
+            connection_name: name.trim().to_string(),
+            ipv4: ip.trim().replace(',', ", "),
+        });
     }
     map
 }
