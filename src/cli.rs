@@ -332,7 +332,14 @@ pub fn select_interface() -> Device {
             })
             .collect::<Vec<_>>()
             .join(", ");
-        let adapter_info = d.desc.as_deref().and_then(|desc| windows_adapters.get(desc));
+        // Join on the adapter GUID embedded in Npcap's device name, not the
+        // description — Windows commonly presents several adapter instances
+        // (Wi-Fi Direct virtual adapters, teamed/virtual NICs) sharing the exact
+        // same driver-reported description text, which collapsed them onto one
+        // map entry and made every such interface show the same connection name.
+        let adapter_guid = d.name.strip_prefix(r"\Device\NPF_")
+            .map(|g| g.trim_matches(['{', '}']).to_lowercase());
+        let adapter_info = adapter_guid.as_deref().and_then(|g| windows_adapters.get(g));
         // On Windows, Npcap's Device::list() doesn't always populate addresses — fall
         // back to Get-NetIPConfiguration's view of the same adapter.
         if ipv4.is_empty()
@@ -502,30 +509,34 @@ pub fn selected_protocol_names(selected: &[ProtocolChoice]) -> String {
 
 /// The Windows connection name (e.g. "Ethernet", "Wi-Fi 2" — what Control Panel and
 /// `ipconfig`'s header lines call the adapter) and IPv4 address(es), as reported by
-/// `Get-NetIPConfiguration`.
+/// `Get-NetAdapter`/`Get-NetIPAddress`.
 struct WindowsAdapterInfo {
     connection_name: String,
     ipv4: String,
 }
 
 /// Query Windows for each adapter's connection name and IPv4 address(es), keyed by
-/// adapter description. Serves two purposes: (1) a fallback for interfaces where
-/// Npcap's `Device::list()` doesn't populate `addresses` (a known gap — unlike Unix's
-/// getifaddrs-backed pcap, Npcap's address population can lag or omit entries for some
-/// adapter types), and (2) surfacing the Windows-assigned connection name, which
-/// Npcap's `Device::list()` doesn't expose at all (only the low-level driver
-/// description and the opaque `\Device\NPF_{GUID}` name).
+/// adapter GUID (lowercased, braces stripped — matches the GUID embedded in Npcap's
+/// `\Device\NPF_{GUID}` device name). Serves two purposes: (1) a fallback for
+/// interfaces where Npcap's `Device::list()` doesn't populate `addresses` (a known
+/// gap — unlike Unix's getifaddrs-backed pcap, Npcap's address population can lag or
+/// omit entries for some adapter types), and (2) surfacing the Windows-assigned
+/// connection name, which Npcap's `Device::list()` doesn't expose at all (only the
+/// low-level driver description and the opaque `\Device\NPF_{GUID}` name).
 ///
-/// Uses `Get-NetIPConfiguration`'s `InterfaceDescription` as the join key rather than
-/// parsing `ipconfig /all` text: it's the same driver-reported description string
-/// Npcap surfaces as `desc`, so it matches more reliably than ipconfig's free-text
-/// "Description" line (wording/truncation can differ between the two tools).
+/// GUID is the only reliable join key — adapter *description* text is not unique:
+/// Windows commonly presents several adapter instances (Wi-Fi Direct virtual
+/// adapters, teamed/virtual NICs) that share the identical driver-reported
+/// description, which (in an earlier version of this function, keyed by
+/// `Get-NetIPConfiguration`'s `InterfaceDescription`) collapsed them onto a single
+/// map entry and made every such interface display the same connection name.
+/// `Get-NetAdapter`'s `InterfaceGuid` has no such collision risk.
 /// Returns an empty map on macOS/Linux or if PowerShell is unavailable.
 fn windows_adapter_info() -> std::collections::HashMap<String, WindowsAdapterInfo> {
     let mut map = std::collections::HashMap::new();
-    let script = "Get-NetIPConfiguration | ForEach-Object { \
-        $ip = ($_.IPv4Address.IPAddress -join ','); \
-        \"$($_.InterfaceDescription)|$($_.InterfaceAlias)|$ip\" }";
+    let script = "Get-NetAdapter | ForEach-Object { \
+        $ips = (Get-NetIPAddress -InterfaceIndex $_.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue).IPAddress -join ','; \
+        \"$($_.InterfaceGuid)|$($_.Name)|$ips\" }";
     let Ok(out) = std::process::Command::new("powershell")
         .args(["-NoProfile", "-NonInteractive", "-Command", script])
         .output()
@@ -535,10 +546,10 @@ fn windows_adapter_info() -> std::collections::HashMap<String, WindowsAdapterInf
     let text = String::from_utf8_lossy(&out.stdout);
     for line in text.lines() {
         let mut parts = line.splitn(3, '|');
-        let (Some(desc), Some(name), Some(ip)) = (parts.next(), parts.next(), parts.next()) else { continue };
-        let desc = desc.trim();
-        if desc.is_empty() { continue; }
-        map.insert(desc.to_string(), WindowsAdapterInfo {
+        let (Some(guid), Some(name), Some(ip)) = (parts.next(), parts.next(), parts.next()) else { continue };
+        let guid = guid.trim().trim_matches(['{', '}']).to_lowercase();
+        if guid.is_empty() { continue; }
+        map.insert(guid, WindowsAdapterInfo {
             connection_name: name.trim().to_string(),
             ipv4: ip.trim().replace(',', ", "),
         });
