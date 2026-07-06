@@ -58,9 +58,10 @@ pub fn is_st2110_multicast(ip: Ipv4Addr) -> bool {
 /// heuristics, added incrementally as field cases turned up (see TODO.md's
 /// open Dante port-range verification items) — no single function decides it:
 ///   1. **ATP official ports** (`detect_protocol_unwrapped`'s pre-RTP-gate
-///      check): `239.255/16` dst port 4321 (multicast), or both src+dst in
-///      14336–15359 (unicast). Non-RTP framing, so it's checked before the
-///      RTP version gate.
+///      check): `239.255/16` dst port 4321 (multicast), or either src or dst
+///      in 14336–15359 (unicast — field-confirmed asymmetric, e.g. a
+///      software DVS's ephemeral port talking to a hardware peer's fixed
+///      port). Non-RTP framing, so it's checked before the RTP version gate.
 ///   2. **`is_likely_dante_audio`** (below): strict, RTP-framed — both src
 ///      AND dst ports even in 5000–6000. Catches unicast and unambiguous
 ///      multicast transmit flows.
@@ -376,13 +377,19 @@ pub fn detect_protocol_unwrapped(eth: &EthernetPacket, raw_et: u16, l2_payload: 
 
     // ── Dante ATP audio (official Audinate port allocations) ─────────────
     // Per Audinate's port list: multicast ATP audio = 239.255.0.0/16 dst port
-    // 4321; unicast audio/video flows = UDP 14336–15359 (both endpoints
-    // allocate from this range). ATP framing is not RTP, so this must run
-    // BEFORE the RTP version gate below. The legacy RTP-gated 5000–6000
-    // heuristic further down is retained alongside — field verification of
-    // which range real devices use is pending (TODO.md).
+    // 4321; unicast audio/video flows allocate from UDP 14336–15359. ATP
+    // framing is not RTP, so this must run BEFORE the RTP version gate below.
+    // The legacy RTP-gated 5000–6000 heuristic further down is retained
+    // alongside. Field-confirmed (2026-07-06, DVS-to-hardware capture): only
+    // ONE endpoint of a real unicast flow uses this range — a software
+    // Dante Virtual Soundcard picks an arbitrary ephemeral port for its own
+    // socket while the hardware peer uses a fixed in-range port (e.g.
+    // 49158 → 14337). Requiring both ports in range silently dropped the
+    // entire stream, so only one side is required — same tolerance
+    // `is_dante_multicast` already applies to an out-of-range source port.
     if (is_dante_multicast(dst_ip) && dst_port == 4321)
-        || ((14336..=15359).contains(&dst_port) && (14336..=15359).contains(&src_port))
+        || (14336..=15359).contains(&dst_port)
+        || (14336..=15359).contains(&src_port)
     {
         return Some(AvProtocol::Dante { kind: DanteKind::AudioStream, src: src_ip, dst: dst_ip, dst_port });
     }
@@ -867,12 +874,39 @@ mod tests {
     }
 
     #[test]
-    fn atp_unicast_requires_both_ports_in_range() {
-        // Ephemeral source port outside 14336–15359 → not claimed as Dante;
+    fn atp_unicast_classified_when_only_dst_port_in_range() {
+        // Field-confirmed (2026-07-06): a Dante Virtual Soundcard uses an
+        // arbitrary ephemeral source port while the hardware peer uses a
+        // fixed in-range port — e.g. 49158 → 14337 in a real capture.
+        let frame = eth_ip_udp(
+            Ipv4Addr::new(169, 254, 123, 52), Ipv4Addr::new(169, 254, 52, 47),
+            49158, 14337, &[0u8; 64],
+        );
+        let eth = EthernetPacket::new(&frame).unwrap();
+        assert!(matches!(detect_protocol(&eth),
+            Some(AvProtocol::Dante { kind: DanteKind::AudioStream, .. })));
+    }
+
+    #[test]
+    fn atp_unicast_classified_when_only_src_port_in_range() {
+        // The reverse direction of the same real flow: fixed in-range source
+        // port replying to the ephemeral destination port.
+        let frame = eth_ip_udp(
+            Ipv4Addr::new(169, 254, 52, 47), Ipv4Addr::new(169, 254, 123, 52),
+            14337, 49158, &[0u8; 64],
+        );
+        let eth = EthernetPacket::new(&frame).unwrap();
+        assert!(matches!(detect_protocol(&eth),
+            Some(AvProtocol::Dante { kind: DanteKind::AudioStream, .. })));
+    }
+
+    #[test]
+    fn atp_unicast_neither_port_in_range_falls_through() {
+        // Neither endpoint in 14336–15359 → not claimed as Dante ATP;
         // non-RTP payload then falls through to None.
         let frame = eth_ip_udp(
             Ipv4Addr::new(192, 168, 1, 50), Ipv4Addr::new(192, 168, 1, 60),
-            40000, 15000, &[0u8; 64],
+            40000, 40001, &[0u8; 64],
         );
         let eth = EthernetPacket::new(&frame).unwrap();
         assert!(detect_protocol(&eth).is_none());
