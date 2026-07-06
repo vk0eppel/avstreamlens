@@ -97,6 +97,13 @@ pub struct WindowChecks {
     pub ptp_sync_alerts: Vec<Alert>,
     pub dante_unverified: HashSet<Ipv4Addr>,
     pub missing_ptp: Vec<MissingClock>,
+    // Captured before `end_of_window` calls `reset_window` (which zeroes them) —
+    // the report must show what happened *during* the window, not the
+    // post-reset value. See the `end_of_window` ordering-invariant comment.
+    pub bytes_this_window: u64,
+    pub packets_dispatched: u64,
+    pub pause_frames_this_window: u64,
+    pub pfc_frames_this_window: u64,
 }
 
 /// Severity of an alert emitted by a handler. The dispatch layer maps each
@@ -1550,6 +1557,13 @@ impl CaptureState {
         );
         let missing_ptp = self.missing_ptp_clocks(expanded);
 
+        // Snapshot the per-window counters `reset_window` is about to zero —
+        // the report reads these from `WindowChecks`, not `state`, afterward.
+        let bytes_this_window = self.bytes_this_window;
+        let packets_dispatched = self.packets_dispatched;
+        let pause_frames_this_window = self.pause_frames_this_window;
+        let pfc_frames_this_window = self.pfc_frames_this_window;
+
         self.reset_window(now);
 
         WindowChecks {
@@ -1568,6 +1582,10 @@ impl CaptureState {
             ptp_sync_alerts,
             dante_unverified,
             missing_ptp,
+            bytes_this_window,
+            packets_dispatched,
+            pause_frames_this_window,
+            pfc_frames_this_window,
         }
     }
 
@@ -3605,6 +3623,32 @@ mod tests {
         assert_eq!(checks.ptp_sync_alerts.len(), 1, "conflict must be visible in the returned alerts");
         assert!(state.ptp.check_ptp_sync_conflict().is_empty(),
             "reset_window must have already run inside end_of_window");
+    }
+
+    /// Regression: `end_of_window` zeroes `bytes_this_window`/`packets_dispatched`/
+    /// `pause_frames_this_window`/`pfc_frames_this_window` via `reset_window` before
+    /// returning — `WindowChecks` must carry the pre-reset values captured a moment
+    /// earlier, or every report shows 0 for Bandwidth/parsed-packets/PAUSE/PFC no
+    /// matter how much traffic actually flowed in the window (a real bug: on a live
+    /// DVS/Dante capture the report showed "Bandwidth: 0.0 Mbps" and "0 parsed" on
+    /// every single 5s window even while streams kept accumulating packets).
+    #[test]
+    fn end_of_window_reports_pre_reset_window_counters() {
+        let mut state = CaptureState::new();
+        state.bytes_this_window = 12_345;
+        state.packets_dispatched = 42;
+        state.pause_frames_this_window = 3;
+        state.pfc_frames_this_window = 7;
+
+        let checks = state.end_of_window(&[], false, Instant::now());
+
+        assert_eq!(checks.bytes_this_window, 12_345);
+        assert_eq!(checks.packets_dispatched, 42);
+        assert_eq!(checks.pause_frames_this_window, 3);
+        assert_eq!(checks.pfc_frames_this_window, 7);
+        // reset_window really did run — state itself is zeroed afterward.
+        assert_eq!(state.bytes_this_window, 0);
+        assert_eq!(state.packets_dispatched, 0);
     }
 
     /// Issue #70: stream/PTPv1-follower/ConMon pruning must be driven by the

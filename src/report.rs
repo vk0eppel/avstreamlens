@@ -173,7 +173,7 @@ impl<'a> ReportSnapshot<'a> {
             ptp_domains: &state.ptp.domains,
             missing_ptp: &checks.missing_ptp,
             health: &state.network_health,
-            bytes_this_window: state.bytes_this_window,
+            bytes_this_window: checks.bytes_this_window,
             eee_ports: &state.eee_ports,
             dante: DanteSnapshot {
                 sources: &state.dante.sources,
@@ -189,10 +189,10 @@ impl<'a> ReportSnapshot<'a> {
             },
             ndi_sources: &state.ndi.sources,
             ndi_names: &state.ndi.names,
-            pause_frames: state.pause_frames_this_window,
-            pfc_frames: state.pfc_frames_this_window,
+            pause_frames: checks.pause_frames_this_window,
+            pfc_frames: checks.pfc_frames_this_window,
             pcap_stats,
-            packets_dispatched: state.packets_dispatched,
+            packets_dispatched: checks.packets_dispatched,
             periodic_alerts: PeriodicAlerts {
                 ip_config: &checks.ip_config_alerts,
                 conmon_bridge: &checks.conmon_bridge_alerts,
