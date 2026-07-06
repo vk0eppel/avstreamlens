@@ -317,6 +317,7 @@ pub fn select_interface() -> Device {
     }
 
     let port_names = macos_port_names();
+    let windows_ips = windows_ip_lookup();
 
     println!("📡 Available interfaces:\n");
     for (i, d) in filtered.iter().enumerate() {
@@ -324,18 +325,29 @@ pub fn select_interface() -> Device {
             .map(|s| s.as_str())
             .or(d.desc.as_deref())
             .unwrap_or("");
-        let ipv4 = d.addresses.iter()
+        let mut ipv4 = d.addresses.iter()
             .filter_map(|a| match a.addr {
                 std::net::IpAddr::V4(ip) if !ip.is_unspecified() => Some(ip.to_string()),
                 _ => None,
             })
             .collect::<Vec<_>>()
             .join(", ");
+        // On Windows, Npcap's Device::list() doesn't always populate addresses — fall
+        // back to ipconfig's view of the same adapter (matched by description).
+        if ipv4.is_empty()
+            && let Some(ip) = d.desc.as_deref().and_then(|desc| windows_ips.get(desc))
+        {
+            ipv4 = ip.clone();
+        }
         // On Windows, Npcap names are \Device\NPF_{GUID} — show the description as
         // the primary label and suppress the GUID from the display entirely.
         if d.name.starts_with(r"\Device\NPF_") {
             let label = if desc.is_empty() { d.name.as_str() } else { desc };
-            let ip_part = if ipv4.is_empty() { String::new() } else { format!("  ({})", ipv4) };
+            let ip_part = if ipv4.is_empty() {
+                "  (no IPv4)".to_string()
+            } else {
+                format!("  ({})", ipv4)
+            };
             println!("  {}: {}{}", i, label, ip_part);
         } else {
             let info = match (desc.is_empty(), ipv4.is_empty()) {
@@ -478,6 +490,47 @@ pub fn selected_protocol_names(selected: &[ProtocolChoice]) -> String {
             .collect::<Vec<_>>()
             .join("_")
     }
+}
+
+/// Query Windows for IPv4 addresses keyed by adapter description, as a fallback for
+/// interfaces where Npcap's `Device::list()` doesn't populate `addresses` (a known gap —
+/// unlike Unix's getifaddrs-backed pcap, Npcap's address population can lag or omit
+/// entries for some adapter types). Matches on adapter description since that's the
+/// field common to both `ipconfig /all` output and Npcap's `desc`.
+/// Returns an empty map on macOS/Linux or if `ipconfig` is unavailable.
+fn windows_ip_lookup() -> std::collections::HashMap<String, String> {
+    let mut map = std::collections::HashMap::new();
+    let Ok(out) = std::process::Command::new("ipconfig").arg("/all").output() else {
+        return map;
+    };
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut current_desc: Option<String> = None;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            current_desc = None;
+            continue;
+        }
+        let Some((key, value)) = trimmed.split_once(':') else { continue };
+        let key = key.trim_end_matches(['.', ' ']).trim();
+        let value = value.trim();
+        match key {
+            "Description" => current_desc = Some(value.to_string()),
+            "IPv4 Address" | "Autoconfiguration IPv4 Address" => {
+                if let Some(desc) = &current_desc {
+                    let ip = value.trim_end_matches("(Preferred)").trim();
+                    map.entry(desc.clone())
+                        .and_modify(|existing: &mut String| {
+                            existing.push_str(", ");
+                            existing.push_str(ip);
+                        })
+                        .or_insert_with(|| ip.to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    map
 }
 
 /// Query macOS for human-readable hardware port names (e.g. "Wi-Fi", "Thunderbolt Ethernet Slot 1").
