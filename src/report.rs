@@ -705,20 +705,36 @@ fn render_streams(
         lines.push(RenderedLine::plain(status_entry(&format!("▸ {}{}{}{}{}{}", proto_label, multicast_tag, name_str, codec_str, addr_str, tx_tag))));
 
         if s.protocol == "NDI" {
-            let tcp = s.dst_ip.and_then(|ip| {
-                tcp_streams.values().find(|t| t.src_ip == ip || t.dst_ip == ip)
-            });
-            let metrics = if let Some(t) = tcp {
-                let quality_str = match t.stream_quality {
+            // Aggregate across ALL of this source's TCP connections: the
+            // bitrate is already summed onto the stream entry by
+            // aggregate_ndi_bitrate; retransmissions are summed here; quality
+            // is the worst connection's (a single critical connection matters
+            // even when the others are healthy).
+            let conns: Vec<&TcpStreamStats> = s.dst_ip.map(|ip| {
+                tcp_streams.values().filter(|t| t.src_ip == ip || t.dst_ip == ip).collect()
+            }).unwrap_or_default();
+            let metrics = if conns.is_empty() {
+                status_detail(&format!("{:.1} Mbps", s.bitrate_bps as f64 / 1_000_000.0))
+            } else {
+                let quality_rank = |q: &StreamQuality| match q {
+                    StreamQuality::Healthy    => 0,
+                    StreamQuality::Degrading  => 1,
+                    StreamQuality::Critical   => 2,
+                    StreamQuality::Terminated => 3,
+                };
+                let worst = conns.iter()
+                    .max_by_key(|t| quality_rank(&t.stream_quality))
+                    .map(|t| &t.stream_quality)
+                    .unwrap_or(&StreamQuality::Healthy);
+                let quality_str = match worst {
                     StreamQuality::Healthy    => "healthy",
                     StreamQuality::Degrading  => "degrading",
                     StreamQuality::Critical   => "critical",
                     StreamQuality::Terminated => "terminated",
                 };
+                let retrans: u64 = conns.iter().map(|t| t.retransmissions).sum();
                 status_detail(&format!("{}  |  {:.1} Mbps  |  retrans: {}",
-                    quality_str, t.bitrate_bps as f64 / 1_000_000.0, t.retransmissions))
-            } else {
-                status_detail(&format!("{:.1} Mbps", s.bitrate_bps as f64 / 1_000_000.0))
+                    quality_str, s.bitrate_bps as f64 / 1_000_000.0, retrans))
             };
             lines.push(RenderedLine::plain(metrics));
         } else if s.protocol == "Dante" && !s.rtp_seen {
@@ -1351,6 +1367,48 @@ mod tests {
         let lines = render_clock_sources(&domains, &[], &HashMap::new(), false).unwrap();
         assert!(!lines.iter().any(|l| l.text.contains("Dante latency should be")),
             "PTPv1 must not render the hops latency advisory");
+    }
+
+    // ── NDI stream metrics aggregate across TCP connections ─────────────────
+
+    #[test]
+    fn ndi_stream_metrics_aggregate_across_tcp_connections() {
+        // An NDI source normally carries several TCP connections. The stream
+        // line must show the aggregated bitrate (already summed onto the stream
+        // entry by aggregate_ndi_bitrate), the summed retransmissions, and the
+        // WORST quality — not whichever single connection the map yields first.
+        let ndi_ip = Ipv4Addr::new(192, 168, 1, 60);
+        let peer = Ipv4Addr::new(192, 168, 1, 5);
+        let mut streams = HashMap::new();
+        let mut s = StreamStats::new_with_info("NDI", 0.0, false, ndi_ip, 0);
+        s.bitrate_bps = 3_500_000; // aggregate_ndi_bitrate's sum of both connections
+        s.last_packet_time = Some(std::time::Instant::now());
+        streams.insert("NDI x".into(), s);
+
+        let mut tcp_streams = HashMap::new();
+        let mut t1 = TcpStreamStats::new(ndi_ip, peer);
+        t1.bitrate_bps = 1_000_000;
+        t1.retransmissions = 2; // quality stays Healthy
+        tcp_streams.insert("t1".into(), t1);
+        let mut t2 = TcpStreamStats::new(peer, ndi_ip);
+        t2.bitrate_bps = 2_500_000;
+        t2.retransmissions = 5;
+        t2.stream_quality = StreamQuality::Critical;
+        tcp_streams.insert("t2".into(), t2);
+
+        let lines = render_streams(
+            &streams, &tcp_streams, &HashSet::new(), &HashMap::new(),
+            &HashMap::new(), &HashMap::new(), &HashSet::new(), false,
+            std::time::Instant::now(),
+        );
+        let metrics = lines.iter().find(|l| l.text.contains("Mbps"))
+            .expect("NDI stream must render a metrics line");
+        assert!(metrics.text.contains("3.5 Mbps"),
+            "must show the aggregated bitrate, got: {}", metrics.text);
+        assert!(metrics.text.contains("retrans: 7"),
+            "must sum retransmissions across connections, got: {}", metrics.text);
+        assert!(metrics.text.contains("critical"),
+            "must show the worst quality across connections, got: {}", metrics.text);
     }
 
     // ── shared indent constants (Network Status alignment) ───────────────────

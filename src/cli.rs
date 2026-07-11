@@ -531,7 +531,8 @@ struct WindowsAdapterInfo {
 /// `Get-NetIPConfiguration`'s `InterfaceDescription`) collapsed them onto a single
 /// map entry and made every such interface display the same connection name.
 /// `Get-NetAdapter`'s `InterfaceGuid` has no such collision risk.
-/// Returns an empty map on macOS/Linux or if PowerShell is unavailable.
+/// Returns an empty map if PowerShell is unavailable.
+#[cfg(windows)]
 fn windows_adapter_info() -> std::collections::HashMap<String, WindowsAdapterInfo> {
     let mut map = std::collections::HashMap::new();
     let script = "Get-NetAdapter | ForEach-Object { \
@@ -555,6 +556,13 @@ fn windows_adapter_info() -> std::collections::HashMap<String, WindowsAdapterInf
         });
     }
     map
+}
+
+/// Non-Windows: there is no PowerShell to query — return an empty map instead
+/// of spawning a doomed process on every interactive interface selection.
+#[cfg(not(windows))]
+fn windows_adapter_info() -> std::collections::HashMap<String, WindowsAdapterInfo> {
+    std::collections::HashMap::new()
 }
 
 /// Query macOS for human-readable hardware port names (e.g. "Wi-Fi", "Thunderbolt Ethernet Slot 1").

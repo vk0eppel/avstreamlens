@@ -455,7 +455,9 @@ impl StreamStats {
             });
         }
         if self.reorders_this_window > 0 {
-            let total = (self.packets + self.lost_packets).max(1);
+            // Window-scoped rate, like the PacketLoss deduction — a lifetime
+            // denominator makes the 1% threshold unreachable as `packets` grows.
+            let total = (self.packets_this_window + self.lost_this_window).max(1);
             let pct = 100.0 * self.reorders_this_window as f64 / total as f64;
             if pct > 1.0 {
                 d.push(StreamDiagnostic::Reorder { window_count: self.reorders_this_window, pct });
@@ -1485,6 +1487,33 @@ mod tests {
         s.update(10, 0, 1, 100, Instant::now());
         s.update(5,  0, 1, 100, Instant::now()); // backward
         assert_eq!(s.lost_packets, 0);
+    }
+
+    #[test]
+    fn reorder_diagnostic_rate_is_window_scoped_not_lifetime() {
+        // A long-lived stream must still fire the reorder Diagnostic when the
+        // CURRENT window's reorder rate exceeds 1% — the old lifetime denominator
+        // made the threshold unreachable as `packets` grew.
+        let mut s = aes67();
+        s.packets = 1_000_000; // long lifetime
+        s.packets_this_window = 100;
+        s.reorders_this_window = 5; // 5% of this window, 0.0005% of lifetime
+        s.last_packet_time = Some(Instant::now());
+        let diags = s.diagnostics(Instant::now());
+        assert!(diags.iter().any(|d| matches!(d, StreamDiagnostic::Reorder { .. })),
+            "5% window reorder rate must fire regardless of lifetime totals, got {diags:?}");
+    }
+
+    #[test]
+    fn reorder_diagnostic_silent_below_window_threshold() {
+        let mut s = aes67();
+        s.packets = 10_000;
+        s.packets_this_window = 1_000;
+        s.reorders_this_window = 5; // 0.5% of this window — under the 1% threshold
+        s.last_packet_time = Some(Instant::now());
+        let diags = s.diagnostics(Instant::now());
+        assert!(!diags.iter().any(|d| matches!(d, StreamDiagnostic::Reorder { .. })),
+            "sub-1% window reorder rate must not fire, got {diags:?}");
     }
 
     #[test]

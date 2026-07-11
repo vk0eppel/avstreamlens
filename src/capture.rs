@@ -1047,7 +1047,6 @@ impl CaptureState {
             DanteKind::Control => vec![],
             DanteKind::ConMon { device_mac, channels } => {
                 if self.local_ips.contains(&src) { return vec![]; }
-                let _is_new = !self.dante.conmon.contains_key(&src);
                 let entry = self.dante.conmon.entry(src).or_insert_with(|| ConmonDevice {
                     mac: device_mac, channels: None, packets: 0, last_seen: now,
                 });
@@ -1136,9 +1135,15 @@ impl CaptureState {
     /// NDI mDNS discovery — registers the source IP and emits a discovery line.
     pub fn handle_ndi_discovery(&mut self, src: Ipv4Addr, source_name: Option<String>) -> Vec<Alert> {
         if self.local_ips.contains(&src) { return vec![]; }
-        self.ndi.record_source(src, source_name.as_deref());
-        let label = source_name.as_deref().unwrap_or("unknown source");
-        vec![Alert::info(format!("🔍 NDI source: {}  \"{}\"", src, label))]
+        // Alert only on first sighting — NDI re-announces frequently, and the
+        // Dante discovery arm applies the same dedup rule.
+        let is_new = self.ndi.record_source(src, source_name.as_deref());
+        if is_new {
+            let label = source_name.as_deref().unwrap_or("unknown source");
+            vec![Alert::info(format!("🔍 NDI source: {}  \"{}\"", src, label))]
+        } else {
+            vec![]
+        }
     }
 
     /// Any TCP segment — NDI is the only protocol carried over TCP. Narrows to
@@ -2852,6 +2857,29 @@ mod tests {
         let alerts = state.handle_ndi_discovery(src, Some("Studio Cam".to_string()));
         assert_eq!(alerts.len(), 1);
         assert!(state.ndi.sources.contains(&src));
+        assert_eq!(state.ndi.names.get(&src).map(|s| s.as_str()), Some("Studio Cam"));
+    }
+
+    #[test]
+    fn ndi_discovery_alert_only_on_first_sighting() {
+        // NDI tools re-announce / answer browses frequently; the discovery line
+        // must print once per source, same dedup rule as Dante discovery.
+        let mut state = CaptureState::new();
+        let src = Ipv4Addr::new(192, 168, 1, 60);
+        assert_eq!(state.handle_ndi_discovery(src, Some("Studio Cam".to_string())).len(), 1);
+        assert!(state.handle_ndi_discovery(src, Some("Studio Cam".to_string())).is_empty(),
+            "repeat mDNS response from a known source must not re-alert");
+    }
+
+    #[test]
+    fn ndi_discovery_late_name_recorded_without_realerting() {
+        // First sighting is name-pending; a later response carries the name.
+        // The name must still be recorded, but no second alert emitted.
+        let mut state = CaptureState::new();
+        let src = Ipv4Addr::new(192, 168, 1, 60);
+        assert_eq!(state.handle_ndi_discovery(src, None).len(), 1);
+        let alerts = state.handle_ndi_discovery(src, Some("Studio Cam".to_string()));
+        assert!(alerts.is_empty(), "late name must not re-alert");
         assert_eq!(state.ndi.names.get(&src).map(|s| s.as_str()), Some("Studio Cam"));
     }
 

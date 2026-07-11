@@ -42,30 +42,24 @@ fn ptp_accuracy_str(acc: u8) -> &'static str {
 
 /// Parse a PTPv1 (IEEE 1588-2002) UDP payload.
 ///
-/// Three wire encodings exist, distinguished by `hdr_shift`:
+/// Three variants of bytes 0-3 exist on the wire, but the field layout past
+/// them is identical in every case (subdomain at 4, sourceUuid at 22, control
+/// at 32 — the standard IEEE 1588-2002 header), so one set of offsets parses
+/// all three:
 ///
-/// Separate-byte (hdr_shift=0, e.g. ptpd, byte[0]=0x01):
-///   [0]     versionPTP = 0x01
-///   [1]     versionNetwork = 0x01
-///   [2-17]  subdomain (16 bytes)
-///   [20-25] sourceUuid   [26-27] sourcePortId   [28-29] sequenceId
-///   [30]    control      [31]    logMessagePeriod
+///   Nibble-packed (byte[0]=0x11, Audinate Dante):
+///     [0] (versionPTP=1)<<4 | versionNetwork=1   [1] (messageType)<<4 | sourceCT
+///     [2-3] flags
+///   Standard big-endian UInteger16 (byte[0]=0x00):
+///     [0-1] versionPTP = 0x0001   [2-3] versionNetwork = 0x0001
+///   Single-byte (byte[0]=0x01, e.g. ptpd):
+///     [0] versionPTP = 0x01   [1] versionNetwork = 0x01   [2-3] flags
 ///
-/// Nibble-packed (hdr_shift=2, byte[0]=0x11, Audinate Dante):
-///   [0]     (versionPTP=1)<<4 | versionNetwork=1  = 0x11
-///   [1]     (messageType)<<4  | sourceCT          = 0x11 for Sync/UDP
-///   [2-3]   flags
-///   [4-19]  subdomain (16 bytes)
-///   [22-27] sourceUuid   [28-29] sourcePortId   [30-31] sequenceId
-///   [32]    control      [33]    logMessagePeriod
-///
-/// Standard IEEE 1588-2002 (hdr_shift=2, byte[0]=0x00):
-///   [0-1]   versionPTP = 0x0001 (big-endian UInteger16)
-///   [2-3]   versionNetwork = 0x0001
+/// Common layout from byte 4:
 ///   [4-19]  subdomain (16 bytes)
 ///   [20]    messageType   [21] sourceCommunicationTechnology
 ///   [22-27] sourceUuid   [28-29] sourcePortId   [30-31] sequenceId
-///   [32]    control      [33]    reserved
+///   [32]    control      [33]    logMessagePeriod/reserved
 ///
 /// Sync body (same absolute offsets for all encodings):
 ///   [34-43] originTimestamp   [44-47] epochNumber/utcOffset
@@ -74,15 +68,15 @@ fn ptp_accuracy_str(acc: u8) -> &'static str {
 ///   [56-57] grandmasterPortId   [58-59] grandmasterSequenceId
 ///   [60] pad  [61] grandmasterClockStratum
 ///   [62-65] grandmasterClockIdentifier (4 bytes ASCII, e.g. "ATOM", "GPS ")
-fn parse_ptp_v1(payload: &[u8], hdr_shift: usize) -> Option<PtpInfo> {
+fn parse_ptp_v1(payload: &[u8]) -> Option<PtpInfo> {
     if payload.len() < 40 { return None; }
 
-    let sd = 2 + hdr_shift;   // subdomain start
-    let uu = 20 + hdr_shift;  // sourceUuid start
-    let po = 26 + hdr_shift;  // sourcePortId offset
-    let sq = 28 + hdr_shift;  // sequenceId offset
-    let ct = 30 + hdr_shift;  // control byte
-    let lp = 31 + hdr_shift;  // logMessagePeriod
+    let sd = 4;   // subdomain start
+    let uu = 22;  // sourceUuid start
+    let po = 28;  // sourcePortId offset
+    let sq = 30;  // sequenceId offset
+    let ct = 32;  // control byte
+    let lp = 33;  // logMessagePeriod
 
     let domain      = map_ptpv1_subdomain(&payload[sd..sd + 16]);
     let control     = payload[ct];
@@ -184,12 +178,9 @@ pub fn parse_ptp(payload: &[u8]) -> Option<PtpInfo> {
     // Anything that doesn't match is PTPv1 (we are already in a PTP context: port 319/320
     // or EtherType 0x88F7, so non-PTP traffic is not a concern here).
     if payload[1] & 0x0F != PTP_VERSION_V2 {
-        // All known PTPv1 encodings share the same field layout:
-        //   uuid at 22, control at 32, subdomain at 4.
-        // The only variation is what bytes 0-3 contain (packed nibbles, big-endian
-        // UInteger16, or single-byte), but the body offsets are identical in every case.
-        let hdr_shift = 2;
-        return parse_ptp_v1(payload, hdr_shift);
+        // All known PTPv1 encodings share the same field layout (uuid at 22,
+        // control at 32, subdomain at 4) — only bytes 0-3 vary. See parse_ptp_v1.
+        return parse_ptp_v1(payload);
     }
 
     // Common header is 34 bytes — enough to identify domain, clock, and message type.

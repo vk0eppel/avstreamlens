@@ -411,17 +411,24 @@ fn run_loop<T: Activated>(
     // Session-lifetime report config: `quiet` is fixed; `no_flows_diagnostic_shown`
     // latches after the no-active-flows diagnostic first appears.
     let mut session = ReportSession { quiet, no_flows_diagnostic_shown: false };
-    // The most recent `now` computed for a processed packet — live mode this is
-    // always ~real time anyway; offline mode this is the last synthetic virtual
-    // time, reused for report cycles that aren't triggered by a specific packet
-    // (the live top-of-loop timer, and EOF) so they don't jump ahead of it.
+    // The most recent `now` computed for a processed packet — only meaningful in
+    // offline mode, where it is the last synthetic virtual time, reused at EOF so
+    // the final report doesn't jump ahead of the capture's own clock. Live report
+    // cycles use real `Instant::now()` instead: `last_now` only advances when a
+    // packet arrives, so on a network that goes fully silent (the exact failure
+    // this tool exists to catch) it would freeze — and dead-stream, PTP
+    // clock-loss, and querier-silence detection would never fire.
     let mut last_now = Instant::now();
 
     loop {
         // ── Live: report at TOP so it fires even when next_packet() times out ─
         if !is_offline && last_report.elapsed() > Duration::from_secs(5) {
             let pcap_stats = cap.stats().ok().map(|s| (s.received, s.dropped, s.if_dropped));
-            do_report(state, expanded_protocols, is_offline, last_now, pcap_stats, &mut session, logger);
+            // Real time, not `last_now` — see its declaration above for why.
+            // Field check (no unit seam here — this loop owns the pcap handle):
+            // stop all traffic during a live capture and dead-stream + PTP
+            // clock-lost alerts must appear within ~2 report cycles.
+            do_report(state, expanded_protocols, is_offline, Instant::now(), pcap_stats, &mut session, logger);
             last_report = Instant::now();
 
             if let Some(secs) = live.as_ref().and_then(|l| l.duration_secs)
