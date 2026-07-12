@@ -1,6 +1,6 @@
 [package]
 name = "avstreamlens"
-version = "0.3.3"
+version = "0.3.4"
 edition = "2024"
 description = "Passive network monitor for professional AV-over-IP protocols: AES67, SMPTE ST 2110, Dante, NDI, AVB, SRT, RIST"
 authors = ["vk0eppel <vkoeppel@gmail.com>"]
