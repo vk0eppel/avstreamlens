@@ -23,7 +23,7 @@ use crate::protocols::{
     NdiKind, ProtocolChoice, PtpInfo, SdpMedia, SdpSession, St2110Type, TransmitterClass, DEFAULT_CLOCK_HZ,
     PTP_VERSION_V1, PTP_VERSION_V2, STREAM_TIMEOUT_SECS, classify_transmitter, msrp_failure_reason,
 };
-use crate::report::Logger;
+use crate::report::{Logger, ReportSession, ReportSnapshot, print_report};
 use crate::stats::{
     AvdeccEntity, AvtpStreamStats, ConmonDevice, NetworkHealth, PtpEvent, PtpStats, StreamQuality,
     StreamStats, TcpStreamStats,
@@ -77,20 +77,18 @@ pub struct MissingClock {
     pub affected: Vec<&'static str>,
 }
 
-/// Every periodic Alert/Diagnostic produced by `CaptureState::end_of_window`,
-/// bundled for main.rs to emit and the report layer to render. Building this
-/// struct is the interface — see `end_of_window`'s doc comment for the
-/// ordering invariant it exists to enforce.
-pub struct WindowChecks {
-    pub clock_alerts: Vec<Alert>,
-    pub clock_dropout_alert: Option<Alert>,
-    pub stream_count_alerts: Vec<Alert>,
-    pub igmp_query_interval_alerts: Vec<Alert>,
-    pub multiple_queriers_alerts: Vec<Alert>,
-    pub version_mismatch_alerts: Vec<Alert>,
-    pub filter_unregistered_alerts: Vec<Alert>,
-    pub high_bandwidth_alerts: Vec<Alert>,
-    pub igmp_snooping_ptp_alerts: Vec<Alert>,
+/// Everything `CaptureState::end_of_window` computes for one Window: the
+/// stand-alone alerts to emit, plus the render inputs the report reads. This is
+/// the internal compute result behind the public `close_window` — it is
+/// `pub(crate)` (not `pub`) because only `close_window` and the same-crate tests
+/// consume it; see `end_of_window`'s doc comment for the ordering invariant.
+pub(crate) struct WindowChecks {
+    /// The stand-alone periodic alerts, already in emit order — every check that
+    /// used to be emitted by a separate hand-ordered line in `do_report`. Emitting
+    /// is now one `emit(&emission, ..)` call; the clock-dropout either/or is
+    /// resolved into this vec, not carried as a separate field.
+    pub emission: Vec<Alert>,
+    // Rendered inline in their report sections rather than emitted (see Report Layer).
     pub ip_config_alerts: Vec<Alert>,
     pub conmon_bridge_alerts: Vec<Alert>,
     pub follower_census_alerts: Vec<Alert>,
@@ -1516,28 +1514,31 @@ impl CaptureState {
         missing
     }
 
-    /// Every periodic Alert/Diagnostic computed once per Window, bundled for the
-    /// report layer to render and emit. Fields are grouped by the section that
-    /// consumes them, not by call order.
+    /// Every periodic Alert/Diagnostic computed once per Window, bundled for
+    /// `close_window` to emit and the report layer to render. `pub(crate)`: the
+    /// public entry point is `close_window`; this compute core is called only by
+    /// it and by same-crate tests that assert on the returned bundle.
     /// `now`: the real clock live, or a pcap-timestamp-derived virtual clock in
     /// offline replay (issue #35) — passed straight through to
     /// `check_ptp_timeouts` so PTP clock-loss detection reflects capture-time
     /// silence rather than however fast the replay loop actually executes.
-    pub fn end_of_window(&mut self, expanded: &[ProtocolChoice], is_offline: bool, now: Instant) -> WindowChecks {
+    pub(crate) fn end_of_window(&mut self, expanded: &[ProtocolChoice], is_offline: bool, now: Instant) -> WindowChecks {
         // ── Ordering invariant ────────────────────────────────────────────────
         // Every check below reads Window-scoped state that `reset_window` (called
         // last) clears or prunes — this method is the one place that enforces the
-        // order, replacing nine-plus separately-ordered calls previously
-        // sequenced only by their position in main.rs's emit_periodic_alerts/
-        // do_report. `ts_refclk_alerts` is the one exception: it's read-only and
-        // computed by the caller (main.rs) before this method is invoked, since
-        // it needs `&CaptureState` immutably while other checks here need `&mut`.
+        // order. The stand-alone alerts are collected into `emission` in the order
+        // they must print, so `close_window` emits them with one call instead of a
+        // hand-maintained sequence. `ts_refclk` is the one exception: it's read-only
+        // and computed by `close_window` before this method (it needs `&self` while
+        // the checks here need `&mut`), and emitted after `emission`.
         let clock_alerts = self.ptp.check_ptp_timeouts(now);
-        let (clock_alerts, clock_dropout_alert) = if let Some(combined) = self.check_clock_dropout_correlation() {
+        // Clock dropout either/or: a correlated PTP-loss + stream-loss event
+        // replaces the individual clock-lost alerts with one combined alert.
+        let clock_emission = if let Some(combined) = self.check_clock_dropout_correlation() {
             self.clock_dropout_correlated = true;
-            (Vec::new(), Some(combined))
+            vec![combined]
         } else {
-            (clock_alerts, None)
+            clock_alerts
         };
         let stream_count_alerts = self.check_stream_count_anomaly();
         let igmp_query_interval_alerts = self.check_igmp_query_interval();
@@ -1549,6 +1550,17 @@ impl CaptureState {
         let high_bandwidth_alerts = self.check_high_multicast_bandwidth();
         let igmp_snooping_ptp_alerts = self.check_igmp_snooping_blocking_ptp(is_offline);
         self.aggregate_ndi_bitrate();
+
+        // Assemble the emission list in print order — same order the old
+        // `do_report` emitted its separate `capture::emit(&checks.X)` lines.
+        let mut emission = clock_emission;
+        emission.extend(stream_count_alerts);
+        emission.extend(igmp_query_interval_alerts);
+        emission.extend(multiple_queriers_alerts);
+        emission.extend(version_mismatch_alerts);
+        emission.extend(filter_unregistered_alerts);
+        emission.extend(high_bandwidth_alerts);
+        emission.extend(igmp_snooping_ptp_alerts);
 
         let ip_config_alerts = self.dante.check_ip_config();
         let conmon_bridge_alerts = self.dante.check_conmon_bridge();
@@ -1572,15 +1584,7 @@ impl CaptureState {
         self.reset_window(now);
 
         WindowChecks {
-            clock_alerts,
-            clock_dropout_alert,
-            stream_count_alerts,
-            igmp_query_interval_alerts,
-            multiple_queriers_alerts,
-            version_mismatch_alerts,
-            filter_unregistered_alerts,
-            high_bandwidth_alerts,
-            igmp_snooping_ptp_alerts,
+            emission,
             ip_config_alerts,
             conmon_bridge_alerts,
             follower_census_alerts,
@@ -1592,6 +1596,75 @@ impl CaptureState {
             pause_frames_this_window,
             pfc_frames_this_window,
         }
+    }
+
+    /// Close the current 5-second Window: run every periodic check, emit the
+    /// stand-alone alerts, render the full report, and reset the Window — the one
+    /// entry point `main.rs`'s capture loop calls per cycle. Wraps the
+    /// `end_of_window` compute core (kept separate so its result stays testable
+    /// without driving IO) with the emit + render steps that used to live in
+    /// `main.rs::do_report`.
+    ///
+    /// `ts_refclk_alerts` runs first because it needs `&self` immutably while
+    /// `end_of_window` needs `&mut self`, and it must read streams/domains before
+    /// `reset_window` prunes them.
+    pub fn close_window(
+        &mut self,
+        expanded: &[ProtocolChoice],
+        is_offline: bool,
+        now: Instant,
+        pcap_stats: Option<(u32, u32, u32)>,
+        session: &mut ReportSession,
+        logger: &mut Logger,
+    ) {
+        let ts_refclk = self.ts_refclk_alerts();
+        let checks = self.end_of_window(expanded, is_offline, now);
+
+        // `end_of_window`'s `&mut self` borrow has ended, so `self` and `checks`
+        // can both be borrowed immutably to build and render the snapshot.
+        emit(&checks.emission, logger);
+        emit(&ts_refclk, logger);
+        let snap = ReportSnapshot::from_state(self, &checks, pcap_stats, now);
+        print_report(&snap, session, logger);
+    }
+
+    /// SDP `ts-refclk` cross-check: validate that each SDP-claimed grandmaster
+    /// matches what's actually on the wire for that domain. Read-only — kept out
+    /// of `end_of_window`'s `&mut` body so it can run first, before pruning.
+    pub(crate) fn ts_refclk_alerts(&self) -> Vec<Alert> {
+        let mut alerts = Vec::new();
+        for sdp in self.sdp_cache.values() {
+            let session_active = sdp.media.iter().any(|m| {
+                self.streams.values().any(|s| s.dst_port == m.port && s.packets > 0)
+            });
+            if !session_active { continue; }
+            for m in &sdp.media {
+                if m.ts_refclk.is_empty() { continue; }
+                let Some((claimed_gm, claimed_domain)) = crate::parser::parse_ts_refclk(&m.ts_refclk) else { continue };
+                let entry = self.ptp.domains.get(&(claimed_domain, crate::protocols::PTP_VERSION_V2))
+                    .or_else(|| self.ptp.domains.get(&(claimed_domain, crate::protocols::PTP_VERSION_V1)));
+                match entry {
+                    None => {
+                        alerts.push(Alert::warn(format!(
+                            "⚠  SDP \"{}\" claims PTP domain {} but no PTP traffic detected",
+                            sdp.session_name, claimed_domain
+                        )));
+                    }
+                    Some(ptp) if ptp.clock_valid => {
+                        if let Some(ref active_gm) = ptp.last_grandmaster
+                            && *active_gm != claimed_gm
+                        {
+                            alerts.push(Alert::warn(format!(
+                                "⚠  PTP grandmaster mismatch for SDP \"{}\": claims {} (domain {}), active is {}",
+                                sdp.session_name, claimed_gm, claimed_domain, active_gm
+                            )));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        alerts
     }
 
     /// When a PTP clock is confirmed lost AND at least one stream in the affected
@@ -3677,6 +3750,84 @@ mod tests {
         // reset_window really did run — state itself is zeroed afterward.
         assert_eq!(state.bytes_this_window, 0);
         assert_eq!(state.packets_dispatched, 0);
+    }
+
+    /// Helper: a `ReportSession` for close_window tests. Not quiet, so the full
+    /// report is rendered (quiet only suppresses stdout, never the logged copy —
+    /// but rendering fully keeps the assertions honest).
+    fn test_session() -> ReportSession {
+        ReportSession { quiet: false, no_flows_diagnostic_shown: false }
+    }
+
+    /// The public `close_window` seam, end-to-end: it must render the complete
+    /// report through the in-memory Logger. Asserts on the captured text rather
+    /// than a returned struct — the maximal-collapse design point (the method
+    /// returns nothing; its output IS its interface).
+    #[test]
+    fn close_window_writes_full_report_to_logger() {
+        let mut state = CaptureState::new();
+        let mut logger = Logger::in_memory();
+        let mut session = test_session();
+
+        state.close_window(&[ProtocolChoice::AES67], false, Instant::now(), None, &mut session, &mut logger);
+
+        let out = logger.captured_text();
+        assert!(out.contains("Network Health"), "report header missing:\n{out}");
+        assert!(out.contains("Network Status:"), "Network Status section missing:\n{out}");
+    }
+
+    /// A periodic Diagnostic computed inside `close_window` (PTP multiple-Sync
+    /// conflict, rendered inline in Clock Sources) must reach the captured output —
+    /// proving the render half of the compute → emit → render → reset pipeline.
+    #[test]
+    fn close_window_renders_periodic_alert_in_output() {
+        let mut state = CaptureState::new();
+        state.handle_ptp(ptpv1_sync(Ipv4Addr::new(192, 168, 1, 10), 0, 0), Instant::now());
+        state.handle_ptp(ptpv1_sync(Ipv4Addr::new(192, 168, 1, 20), 0, 0), Instant::now());
+        let mut logger = Logger::in_memory();
+        let mut session = test_session();
+
+        state.close_window(&[ProtocolChoice::Dante], false, Instant::now(), None, &mut session, &mut logger);
+
+        assert!(logger.captured_text().contains("Multiple Preferred Leaders"),
+            "PTP sync conflict must render into the report:\n{}", logger.captured_text());
+    }
+
+    /// A stand-alone alert routed through `emission` — here the ts-refclk
+    /// cross-check (an SDP claiming a PTP domain with no wire traffic) — must be
+    /// emitted into the captured output. Also exercises `ts_refclk_alerts`, the
+    /// read-only method `close_window` runs before `end_of_window`.
+    #[test]
+    fn close_window_emits_ts_refclk_alert_to_output() {
+        let mut state = CaptureState::new();
+        let mut stream = StreamStats::new_with_info(
+            "AES67", 48_000.0, true, Ipv4Addr::new(239, 69, 0, 1), 5004);
+        stream.packets = 10;
+        state.streams.insert("s1".into(), stream);
+        state.sdp_cache.insert("1".into(), SdpSession {
+            session_id: "1".to_string(),
+            session_name: "Test Mix".to_string(),
+            info: String::new(),
+            media: vec![SdpMedia {
+                media_type: "audio".to_string(),
+                port: 5004,
+                payload_types: vec![96],
+                connection: String::new(),
+                rtpmap: "L24/48000/2".to_string(),
+                clock_hz: 48_000.0,
+                channels: 2,
+                ptime_ms: 1.0,
+                ts_refclk: "ptp=IEEE1588-2008:00-1a-e5-ff-fe-12-34-56:0".to_string(),
+                mediaclk: String::new(),
+            }],
+        });
+        let mut logger = Logger::in_memory();
+        let mut session = test_session();
+
+        state.close_window(&[ProtocolChoice::AES67], false, Instant::now(), None, &mut session, &mut logger);
+
+        assert!(logger.captured_text().contains("no PTP traffic detected"),
+            "ts-refclk emission alert must reach the output:\n{}", logger.captured_text());
     }
 
     /// Issue #70: stream/PTPv1-follower/ConMon pruning must be driven by the

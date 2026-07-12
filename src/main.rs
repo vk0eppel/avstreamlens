@@ -27,9 +27,9 @@ use std::io::IsTerminal;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use crate::capture::{Alert, CaptureState};
-use crate::parser::{detect_protocol_unwrapped, parse_ts_refclk, is_multicast, unwrap_vlan};
-use crate::report::{create_logger, print_report, ReportSnapshot, ReportSession};
+use crate::capture::CaptureState;
+use crate::parser::{detect_protocol_unwrapped, is_multicast, unwrap_vlan};
+use crate::report::{create_logger, ReportSession};
 
 use std::collections::HashSet;
 use std::net::{Ipv4Addr, UdpSocket};
@@ -428,7 +428,7 @@ fn run_loop<T: Activated>(
             // Field check (no unit seam here — this loop owns the pcap handle):
             // stop all traffic during a live capture and dead-stream + PTP
             // clock-lost alerts must appear within ~2 report cycles.
-            do_report(state, expanded_protocols, is_offline, Instant::now(), pcap_stats, &mut session, logger);
+            state.close_window(expanded_protocols, is_offline, Instant::now(), pcap_stats, &mut session, logger);
             last_report = Instant::now();
 
             if let Some(secs) = live.as_ref().and_then(|l| l.duration_secs)
@@ -444,7 +444,7 @@ fn run_loop<T: Activated>(
             Err(pcap::Error::TimeoutExpired) => continue,
             Err(pcap::Error::NoMorePackets)  => {
                 // EOF — print whatever accumulated in the last partial window.
-                do_report(state, expanded_protocols, is_offline, last_now, None, &mut session, logger);
+                state.close_window(expanded_protocols, is_offline, last_now, None, &mut session, logger);
                 let healthy = state.network_health.network_score >= 100.0;
                 std::process::exit(if healthy { 0 } else { 1 });
             }
@@ -469,49 +469,9 @@ fn run_loop<T: Activated>(
         // eth/outer_ip are no longer used past this point — NLL ends their borrows
         // of packet.data before we access pkt_ts (which was copied earlier).
         if is_offline && offline_clock.should_report(pkt_ts) {
-            do_report(state, expanded_protocols, is_offline, now, None, &mut session, logger);
+            state.close_window(expanded_protocols, is_offline, now, None, &mut session, logger);
         }
     }
-}
-
-/// Score, render, and reset a 5s report window. `CaptureState::end_of_window`
-/// owns the ordering invariant (every check before `reset_window`) — this
-/// function's job is just to emit what it returns and build the snapshot.
-/// `ts_refclk_alerts` is computed here rather than inside `end_of_window`
-/// because it needs `&CaptureState` immutably while `end_of_window` needs
-/// `&mut self` throughout; it must run before `end_of_window` so the streams/
-/// domains it reads haven't been pruned yet.
-fn do_report(
-    state: &mut CaptureState,
-    expanded_protocols: &[protocols::ProtocolChoice],
-    is_offline: bool,
-    now: Instant,
-    pcap_stats: Option<(u32, u32, u32)>,
-    session: &mut ReportSession,
-    logger: &mut crate::report::Logger,
-) {
-    let ts_refclk = ts_refclk_alerts(state);
-    let checks = state.end_of_window(expanded_protocols, is_offline, now);
-
-    if let Some(ref combined) = checks.clock_dropout_alert {
-        capture::emit(std::slice::from_ref(combined), logger);
-    } else {
-        capture::emit(&checks.clock_alerts, logger);
-    }
-    capture::emit(&checks.stream_count_alerts, logger);
-    capture::emit(&checks.igmp_query_interval_alerts, logger);
-    capture::emit(&checks.multiple_queriers_alerts, logger);
-    capture::emit(&checks.version_mismatch_alerts, logger);
-    capture::emit(&checks.filter_unregistered_alerts, logger);
-    capture::emit(&checks.high_bandwidth_alerts, logger);
-    capture::emit(&checks.igmp_snooping_ptp_alerts, logger);
-    capture::emit(&ts_refclk, logger);
-
-    // `end_of_window`'s `&mut self` borrow (which needed the expanded protocol
-    // list and computed the score) has already finished, so `state` and `checks`
-    // can both be borrowed immutably here.
-    let snap = ReportSnapshot::from_state(state, &checks, pcap_stats, now);
-    print_report(&snap, session, logger);
 }
 
 /// Send mDNS PTR queries for Dante (and optionally NDI) service types at startup.
@@ -565,44 +525,6 @@ fn send_mdns_startup_probe(iface_ip: Ipv4Addr, expanded: &[protocols::ProtocolCh
         }
         Err(e) => logger.log(&format!("   ⚠ mDNS probe socket failed: {}", e)),
     }
-}
-
-/// SDP `ts-refclk` cross-check: every 5s, validate that each SDP-claimed
-/// grandmaster matches what's actually on the wire for that domain.
-fn ts_refclk_alerts(state: &CaptureState) -> Vec<Alert> {
-    let mut alerts = Vec::new();
-    for sdp in state.sdp_cache.values() {
-        let session_active = sdp.media.iter().any(|m| {
-            state.streams.values().any(|s| s.dst_port == m.port && s.packets > 0)
-        });
-        if !session_active { continue; }
-        for m in &sdp.media {
-            if m.ts_refclk.is_empty() { continue; }
-            let Some((claimed_gm, claimed_domain)) = parse_ts_refclk(&m.ts_refclk) else { continue };
-            let entry = state.ptp.domains.get(&(claimed_domain, protocols::PTP_VERSION_V2))
-                .or_else(|| state.ptp.domains.get(&(claimed_domain, protocols::PTP_VERSION_V1)));
-            match entry {
-                None => {
-                    alerts.push(Alert::warn(format!(
-                        "⚠  SDP \"{}\" claims PTP domain {} but no PTP traffic detected",
-                        sdp.session_name, claimed_domain
-                    )));
-                }
-                Some(ptp) if ptp.clock_valid => {
-                    if let Some(ref active_gm) = ptp.last_grandmaster
-                        && *active_gm != claimed_gm
-                    {
-                        alerts.push(Alert::warn(format!(
-                            "⚠  PTP grandmaster mismatch for SDP \"{}\": claims {} (domain {}), active is {}",
-                            sdp.session_name, claimed_gm, claimed_domain, active_gm
-                        )));
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-    alerts
 }
 
 #[cfg(test)]
@@ -852,7 +774,7 @@ mod tests {
             sdp_with_ts_refclk(5004, "ptp=IEEE1588-2008:00-1a-e5-ff-fe-12-34-56:0"));
         // No entry in state.ptp.domains for domain 0 at all.
 
-        let alerts = ts_refclk_alerts(&state);
+        let alerts = state.ts_refclk_alerts();
 
         assert_eq!(alerts.len(), 1);
         assert!(alerts[0].message.contains("no PTP traffic detected"), "got {}", alerts[0].message);
@@ -870,7 +792,7 @@ mod tests {
         ptp.last_grandmaster = Some("00:1a:e5:ff:fe:12:34:56".to_string());
         state.ptp.domains.insert((0, protocols::PTP_VERSION_V2), ptp);
 
-        let alerts = ts_refclk_alerts(&state);
+        let alerts = state.ts_refclk_alerts();
 
         assert!(alerts.is_empty(), "matching grandmaster must not alert, got {:?}",
             alerts.iter().map(|a| &a.message).collect::<Vec<_>>());
@@ -888,7 +810,7 @@ mod tests {
         ptp.last_grandmaster = Some("aa:bb:cc:dd:ee:ff:00:11".to_string());
         state.ptp.domains.insert((0, protocols::PTP_VERSION_V2), ptp);
 
-        let alerts = ts_refclk_alerts(&state);
+        let alerts = state.ts_refclk_alerts();
 
         assert_eq!(alerts.len(), 1);
         assert!(alerts[0].message.contains("grandmaster mismatch"), "got {}", alerts[0].message);
@@ -902,7 +824,7 @@ mod tests {
         state.sdp_cache.insert("1".into(),
             sdp_with_ts_refclk(5004, "ptp=IEEE1588-2008:00-1a-e5-ff-fe-12-34-56:0"));
 
-        let alerts = ts_refclk_alerts(&state);
+        let alerts = state.ts_refclk_alerts();
 
         assert!(alerts.is_empty());
     }

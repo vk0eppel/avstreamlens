@@ -113,7 +113,7 @@ use crate::protocols::{STREAM_TIMEOUT_SECS, MsrpDeclaration, MsrpDeclType, PTP_V
 use crate::capture::{Alert, emit as emit_alerts, MissingClock, MissingClockKind};
 
 /// Everything one report cycle (one Window) needs to render, gathered behind a
-/// single borrow. Built by `do_report` via `from_state`-style assembly and
+/// single borrow. Built by `CaptureState::close_window` via `from_state` and
 /// consumed by `print_report`. All fields are borrows from the live
 /// `CaptureState` plus the locally-computed section diagnostics — zero copies,
 /// valid only for the stack frame that builds it.
@@ -144,7 +144,7 @@ pub struct ReportSnapshot<'a> {
     pub periodic_alerts: PeriodicAlerts<'a>,
     // Set when PTP clock loss and stream packet loss are correlated in the same
     // window. Suppresses the individual "no clock" and per-stream loss alerts
-    // so the combined dropout alert (already emitted by emit_periodic_alerts)
+    // so the combined dropout alert (already emitted by close_window)
     // dominates.
     pub clock_dropout_correlated: bool,
     // The real clock live, or a pcap-timestamp-derived virtual clock in offline
@@ -226,7 +226,7 @@ pub struct AvbSnapshot<'a> {
     pub avdecc_entities: &'a HashMap<[u8; 8], AvdeccEntity>,
 }
 
-/// Section-level diagnostics computed once per cycle in `do_report` and
+/// Section-level diagnostics computed once per cycle in `end_of_window` and
 /// rendered inline in their target sections (Discovered / Clock Sources).
 #[derive(Clone, Copy)]
 pub struct PeriodicAlerts<'a> {
@@ -245,10 +245,22 @@ pub struct ReportSession {
     pub no_flows_diagnostic_shown: bool,
 }
 
+/// Where a `Logger` writes its file-side copy of every line. Production always
+/// uses `File`; `Memory` backs an in-process buffer so a test can drive a full
+/// report cycle (`CaptureState::close_window`) and assert on the rendered text
+/// via `captured_text()` — the file target already receives every emitted line,
+/// so capturing it needs no separate sink.
+#[derive(Debug)]
+enum LogTarget {
+    File(std::fs::File),
+    #[cfg(test)]
+    Memory(Vec<u8>),
+}
+
 /// Logger for writing timestamped messages to both file and console.
 #[derive(Debug)]
 pub struct Logger {
-    file: std::fs::File,
+    target: LogTarget,
 }
 
 /// Create a file at `path`, failing (rather than following or truncating) if
@@ -290,7 +302,7 @@ impl Logger {
                 format!("{base}_{:05x}.log", salt & 0xF_FFFF)
             };
             match open_exclusive(std::path::Path::new(&filename)) {
-                Ok(file) => return Ok(Logger { file }),
+                Ok(file) => return Ok(Logger { target: LogTarget::File(file) }),
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
                 Err(e) => return Err(e),
             }
@@ -311,15 +323,41 @@ impl Logger {
             std::process::id(),
             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos(),
         ));
-        Logger { file: std::fs::File::options().read(true).write(true).create(true).truncate(true).open(&path).unwrap() }
+        Logger { target: LogTarget::File(std::fs::File::options().read(true).write(true).create(true).truncate(true).open(&path).unwrap()) }
+    }
+
+    /// A `Logger` that writes its file-side copy into an in-memory buffer instead
+    /// of a file. Lets a test run a full `close_window` cycle and read back the
+    /// complete rendered report with `captured_text()`.
+    #[cfg(test)]
+    pub(crate) fn in_memory() -> Self {
+        Logger { target: LogTarget::Memory(Vec::new()) }
+    }
+
+    /// The text written to this logger so far. Only valid on an `in_memory()`
+    /// logger — panics on a file-backed one, which is a test-authoring bug.
+    #[cfg(test)]
+    pub(crate) fn captured_text(&self) -> String {
+        match &self.target {
+            LogTarget::Memory(buf) => String::from_utf8_lossy(buf).into_owned(),
+            LogTarget::File(_) => panic!("captured_text() requires a Logger::in_memory()"),
+        }
     }
 
     /// Log a message to the file. Flushes immediately so the last lines
     /// survive a crash or SIGINT.
     pub fn log(&mut self, message: &str) {
         use std::io::Write;
-        let _ = writeln!(self.file, "{}", message);
-        let _ = self.file.flush();
+        match &mut self.target {
+            LogTarget::File(f) => {
+                let _ = writeln!(f, "{}", message);
+                let _ = f.flush();
+            }
+            #[cfg(test)]
+            LogTarget::Memory(buf) => {
+                let _ = writeln!(buf, "{}", message);
+            }
+        }
     }
 
 }
@@ -1314,7 +1352,6 @@ mod tests {
 
     #[test]
     fn quiet_healthy_cycle_still_writes_full_report_to_log() {
-        use std::io::Read;
         // The documented --quiet contract: a fully healthy cycle prints nothing to
         // stdout but MUST still write the complete report to the log file.
         let streams = HashMap::new(); let tcp = HashMap::new(); let ptp = HashMap::new();
@@ -1335,16 +1372,11 @@ mod tests {
             clock_dropout_correlated: false,
             now: std::time::Instant::now(),
         };
-        let tmp = std::env::temp_dir().join(format!("avsl_quiet_{}.log", std::process::id()));
-        let file = std::fs::File::options().read(true).write(true).create(true).truncate(true)
-            .open(&tmp).unwrap();
-        let mut logger = Logger { file };
+        let mut logger = Logger::in_memory();
         let mut session = ReportSession { quiet: true, no_flows_diagnostic_shown: false };
         print_report(&snap, &mut session, &mut logger);
 
-        let mut contents = String::new();
-        std::fs::File::open(&tmp).unwrap().read_to_string(&mut contents).unwrap();
-        std::fs::remove_file(&tmp).ok();
+        let contents = logger.captured_text();
         assert!(contents.contains("Network Health"),
             "log must contain the full report even when quiet suppresses stdout");
         assert!(contents.contains("Network Status:"), "log must include all sections");
