@@ -938,6 +938,42 @@ impl CaptureState {
                 .map(|m| (s.session_name.as_str(), m)))
     }
 
+    /// Shared AES67/ST2110 per-packet RTP update: DSCP compliance, ECN, PCP
+    /// advisory, RTP parse, payload-type mismatch, and the stats update. The
+    /// stream entry (`stats`) must already exist. `dscp_ok` decides DSCP
+    /// compliance (AES67 and 2110 audio/anc require EF; 2110-20 video also
+    /// accepts CS5/AF41); `observed_pt` extracts the RTP payload type from the
+    /// UDP payload to compare against the SDP-declared one (AES67 already has it
+    /// from `detect_protocol`, ST2110 reads it off the RTP header — the same
+    /// byte). Taken as an associated fn (not `&mut self`) so the caller can pass
+    /// its `self.streams` entry and `&mut self.network_health` as two disjoint
+    /// borrows. Dante audio is deliberately NOT routed here: its per-packet path
+    /// (ATP framing, TTL, transmitter classification, class-gated DSCP) is
+    /// materially different and would only add conditionals here.
+    fn update_rtp_media_packet(
+        stats: &mut StreamStats,
+        health: &mut NetworkHealth,
+        l2_payload: &[u8],
+        pcp: Option<u8>,
+        dscp_ok: impl Fn(u8) -> bool,
+        observed_pt: impl Fn(&[u8]) -> u8,
+        now: Instant,
+    ) {
+        if let Some(ip) = pnet_packet::ipv4::Ipv4Packet::new(l2_payload)
+            && let Some(udp) = pnet_packet::udp::UdpPacket::new(ip.payload())
+        {
+            if !dscp_ok(ip.get_dscp()) { stats.dscp_violations += 1; }
+            health.record_ecn_mark_if_congested(ip.get_ecn());
+            stats.apply_pcp_advisory(pcp);
+            if let Some((seq, ts, ssrc)) = parse_rtp(udp.payload()) {
+                if stats.expected_pt.is_some_and(|exp| observed_pt(udp.payload()) != exp) {
+                    stats.pt_mismatches += 1;
+                }
+                stats.update(seq, ts, ssrc, udp.payload().len(), now);
+            }
+        }
+    }
+
     /// AES67 RTP audio.
     pub fn handle_aes67(&mut self, dst: Ipv4Addr, dst_port: u16, payload_type: u8, l2_payload: &[u8], pcp: Option<u8>, now: Instant) -> Vec<Alert> {
         let key = format!("AES67 {}:{}", dst, dst_port);
@@ -951,20 +987,11 @@ impl CaptureState {
             }
             s
         });
-        if let Some(ip) = pnet_packet::ipv4::Ipv4Packet::new(l2_payload)
-            && let Some(udp) = pnet_packet::udp::UdpPacket::new(ip.payload())
-        {
-            // AES67 requires DSCP EF (46) per spec
-            if ip.get_dscp() != 46 { stats.dscp_violations += 1; }
-            self.network_health.record_ecn_mark_if_congested(ip.get_ecn());
-            stats.apply_pcp_advisory(pcp);
-            if let Some((seq, ts, ssrc)) = parse_rtp(udp.payload()) {
-                if stats.expected_pt.is_some_and(|exp| payload_type != exp) {
-                    stats.pt_mismatches += 1;
-                }
-                stats.update(seq, ts, ssrc, udp.payload().len(), now);
-            }
-        }
+        // AES67 requires DSCP EF (46) per spec; PT already extracted in detect_protocol.
+        Self::update_rtp_media_packet(
+            stats, &mut self.network_health, l2_payload, pcp,
+            |d| d == 46, |_| payload_type, now,
+        );
         Vec::new()
     }
 
@@ -996,26 +1023,13 @@ impl CaptureState {
             }
             s
         });
-        if let Some(ip) = pnet_packet::ipv4::Ipv4Packet::new(l2_payload)
-            && let Some(udp) = pnet_packet::udp::UdpPacket::new(ip.payload())
-        {
-            // ST2110-20 video accepts EF/CS5/AF41; audio/anc require EF only
-            let dscp_ok = if matches!(stream_type, St2110Type::Video) {
-                matches!(ip.get_dscp(), 46 | 40 | 34)
-            } else {
-                ip.get_dscp() == 46
-            };
-            if !dscp_ok { stats.dscp_violations += 1; }
-            self.network_health.record_ecn_mark_if_congested(ip.get_ecn());
-            stats.apply_pcp_advisory(pcp);
-            if let Some((seq, ts, ssrc)) = parse_rtp(udp.payload()) {
-                let rtp_pt = udp.payload()[1] & 0x7F;
-                if stats.expected_pt.is_some_and(|exp| rtp_pt != exp) {
-                    stats.pt_mismatches += 1;
-                }
-                stats.update(seq, ts, ssrc, udp.payload().len(), now);
-            }
-        }
+        // ST2110-20 video accepts EF/CS5/AF41; audio/anc require EF only.
+        let is_video = matches!(stream_type, St2110Type::Video);
+        Self::update_rtp_media_packet(
+            stats, &mut self.network_health, l2_payload, pcp,
+            move |d| if is_video { matches!(d, 46 | 40 | 34) } else { d == 46 },
+            |p| p[1] & 0x7F, now,
+        );
         Vec::new()
     }
 
