@@ -27,7 +27,7 @@ jobs:
     name: verify tag matches Cargo.toml version
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Compare tag to Cargo.toml version
         run: |
           tag_version="${GITHUB_REF_NAME#v}"
@@ -56,7 +56,7 @@ jobs:
             os: windows-2022
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -120,7 +120,7 @@ jobs:
           echo "ARCHIVE_NAME=$name.zip" >> $env:GITHUB_ENV
 
       - name: Upload to release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ github.ref_name }}
           files: ${{ env.ARCHIVE_NAME }}
