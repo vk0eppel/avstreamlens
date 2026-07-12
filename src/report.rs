@@ -1049,7 +1049,9 @@ pub fn print_report(snap: &ReportSnapshot, session: &mut ReportSession, logger: 
     // the scoring table exactly (NetworkHealth::build_health_summary). Empty when
     // the score is 100%.
     let health_summary =
-        health.build_health_summary(streams, tcp_streams, ptp_domains, msrp_state, eee_ports, avtp_streams, capture_now);
+        health.build_health_summary(&crate::stats::ScoringInputs {
+            streams, tcp_streams, ptp_domains, msrp_state, eee_ports, avtp_streams, now: capture_now,
+        });
 
     // ── Quiet mode: suppress stdout only, never the log ─────────────────────
     // A quiet cycle prints nothing to stdout when the report is fully healthy —

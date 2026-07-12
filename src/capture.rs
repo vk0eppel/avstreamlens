@@ -1568,10 +1568,15 @@ impl CaptureState {
         let ptp_sync_alerts = self.ptp.check_ptp_sync_conflict();
         let dante_unverified = self.dante.unverified();
 
-        self.network_health.calculate_score(
-            &self.streams, &self.tcp_streams, &self.ptp.domains,
-            &self.avb.msrp_state, &self.eee_ports, &self.avb.avtp_streams, now,
-        );
+        self.network_health.calculate_score(&crate::stats::ScoringInputs {
+            streams: &self.streams,
+            tcp_streams: &self.tcp_streams,
+            ptp_domains: &self.ptp.domains,
+            msrp_state: &self.avb.msrp_state,
+            eee_ports: &self.eee_ports,
+            avtp_streams: &self.avb.avtp_streams,
+            now,
+        });
         let missing_ptp = self.missing_ptp_clocks(expanded);
 
         // Snapshot the per-window counters `reset_window` is about to zero —
@@ -3086,16 +3091,20 @@ mod tests {
         let mut state = CaptureState::new();
         state.network_health.tcp_retransmissions = 20;
 
-        state.network_health.calculate_score(
-            &state.streams, &state.tcp_streams, &state.ptp.domains,
-            &state.avb.msrp_state, &state.eee_ports, &state.avb.avtp_streams, Instant::now());
+        state.network_health.calculate_score(&crate::stats::ScoringInputs {
+            streams: &state.streams, tcp_streams: &state.tcp_streams, ptp_domains: &state.ptp.domains,
+            msrp_state: &state.avb.msrp_state, eee_ports: &state.eee_ports, avtp_streams: &state.avb.avtp_streams,
+            now: Instant::now(),
+        });
         assert!(state.network_health.network_score < 100.0,
             "retransmissions should dock the score this window");
 
         state.reset_window(Instant::now());
-        state.network_health.calculate_score(
-            &state.streams, &state.tcp_streams, &state.ptp.domains,
-            &state.avb.msrp_state, &state.eee_ports, &state.avb.avtp_streams, Instant::now());
+        state.network_health.calculate_score(&crate::stats::ScoringInputs {
+            streams: &state.streams, tcp_streams: &state.tcp_streams, ptp_domains: &state.ptp.domains,
+            msrp_state: &state.avb.msrp_state, eee_ports: &state.eee_ports, avtp_streams: &state.avb.avtp_streams,
+            now: Instant::now(),
+        });
         assert_eq!(state.network_health.network_score, 100.0,
             "score must recover after a clean window");
     }

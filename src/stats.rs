@@ -894,6 +894,23 @@ impl ScorePenalty {
     }
 }
 
+/// The six live maps (plus `now`) the scoring functions read, gathered behind a
+/// single borrow so `collect_penalties` / `calculate_score` /
+/// `build_health_summary` take one argument instead of six. Same view-struct
+/// move `ReportSnapshot` makes for rendering: field selection lives in one place
+/// (the caller that builds this from `&CaptureState`), not spread across three
+/// method signatures. `NetworkHealth` lives inside `CaptureState` and can't
+/// borrow its parent, so the caller assembles this from the sibling fields.
+pub struct ScoringInputs<'a> {
+    pub streams:      &'a HashMap<String, StreamStats>,
+    pub tcp_streams:  &'a HashMap<String, TcpStreamStats>,
+    pub ptp_domains:  &'a HashMap<(u8, u8), PtpStats>,
+    pub msrp_state:   &'a HashMap<[u8; 8], crate::protocols::MsrpDeclaration>,
+    pub eee_ports:    &'a HashMap<(String, String), (u16, u16)>,
+    pub avtp_streams: &'a HashMap<[u8; 8], AvtpStreamStats>,
+    pub now: Instant,
+}
+
 impl NetworkHealth {
     pub fn new() -> Self {
         Self {
@@ -934,17 +951,8 @@ impl NetworkHealth {
     /// Collect every active penalty this Window. Both `calculate_score` and
     /// `build_health_summary` are thin consumers of this function, so the
     /// score and the summary are always derived from the same source of truth.
-    #[allow(clippy::too_many_arguments)]
-    pub fn collect_penalties(
-        &self,
-        streams:     &HashMap<String, StreamStats>,
-        tcp_streams: &HashMap<String, TcpStreamStats>,
-        ptp_domains: &HashMap<(u8, u8), PtpStats>,
-        msrp_state:  &HashMap<[u8; 8], crate::protocols::MsrpDeclaration>,
-        eee_ports:   &HashMap<(String, String), (u16, u16)>,
-        avtp_streams: &HashMap<[u8; 8], AvtpStreamStats>,
-        now: Instant,
-    ) -> Vec<ScorePenalty> {
+    pub fn collect_penalties(&self, inputs: &ScoringInputs) -> Vec<ScorePenalty> {
+        let ScoringInputs { streams, tcp_streams, ptp_domains, msrp_state, eee_ports, avtp_streams, now } = *inputs;
         let mut p: Vec<ScorePenalty> = Vec::new();
 
         // ── Per-stream penalties (aggregated by category) ─────────────────────
@@ -1118,21 +1126,11 @@ impl NetworkHealth {
         p
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub fn calculate_score(
-        &mut self,
-        streams: &std::collections::HashMap<String, StreamStats>,
-        tcp_streams: &std::collections::HashMap<String, TcpStreamStats>,
-        ptp_domains: &std::collections::HashMap<(u8, u8), PtpStats>,
-        msrp_state: &std::collections::HashMap<[u8; 8], crate::protocols::MsrpDeclaration>,
-        eee_ports: &std::collections::HashMap<(String, String), (u16, u16)>,
-        avtp_streams: &std::collections::HashMap<[u8; 8], AvtpStreamStats>,
-        now: Instant,
-    ) {
+    pub fn calculate_score(&mut self, inputs: &ScoringInputs) {
         // Score = 100 − Σ penalties. The penalty table lives once in
         // `collect_penalties`; this is a thin consumer of it.
         let total: f64 = self
-            .collect_penalties(streams, tcp_streams, ptp_domains, msrp_state, eee_ports, avtp_streams, now)
+            .collect_penalties(inputs)
             .iter()
             .map(|p| p.deduction())
             .sum();
@@ -1152,18 +1150,8 @@ impl NetworkHealth {
     /// tool limitation, not a network fault, and live in Network Status only.
     /// Factors that carry no score penalty (PAUSE/PFC frames, AES67/ST2110 PCP
     /// advisories) likewise produce no bullet.
-    #[allow(clippy::too_many_arguments)]
-    pub fn build_health_summary(
-        &self,
-        streams: &HashMap<String, StreamStats>,
-        tcp_streams: &HashMap<String, TcpStreamStats>,
-        ptp_domains: &HashMap<(u8, u8), PtpStats>,
-        msrp_state: &HashMap<[u8; 8], crate::protocols::MsrpDeclaration>,
-        eee_ports: &HashMap<(String, String), (u16, u16)>,
-        avtp_streams: &HashMap<[u8; 8], AvtpStreamStats>,
-        now: Instant,
-    ) -> Vec<String> {
-        self.collect_penalties(streams, tcp_streams, ptp_domains, msrp_state, eee_ports, avtp_streams, now)
+    pub fn build_health_summary(&self, inputs: &ScoringInputs) -> Vec<String> {
+        self.collect_penalties(inputs)
             .into_iter()
             .map(ScorePenalty::into_bullet)
             .collect()
@@ -1845,6 +1833,21 @@ mod tests {
     fn empty_eee() -> HashMap<(String, String), (u16, u16)> { HashMap::new() }
     fn empty_avtp() -> HashMap<[u8; 8], AvtpStreamStats> { HashMap::new() }
 
+    /// Assemble a `ScoringInputs` from the six maps — the one place the test
+    /// suite builds the scoring view, so the positional list lives here only.
+    #[allow(clippy::too_many_arguments)]
+    fn scoring<'a>(
+        streams: &'a HashMap<String, StreamStats>,
+        tcp: &'a HashMap<String, TcpStreamStats>,
+        ptp: &'a HashMap<(u8, u8), PtpStats>,
+        msrp: &'a HashMap<[u8; 8], crate::protocols::MsrpDeclaration>,
+        eee: &'a HashMap<(String, String), (u16, u16)>,
+        avtp: &'a HashMap<[u8; 8], AvtpStreamStats>,
+        now: Instant,
+    ) -> ScoringInputs<'a> {
+        ScoringInputs { streams, tcp_streams: tcp, ptp_domains: ptp, msrp_state: msrp, eee_ports: eee, avtp_streams: avtp, now }
+    }
+
     /// A stream that has received `packets` packets and `lost` losses, so
     /// loss_pct() and liveness are controllable without driving update().
     fn live_stream(lost: u64) -> StreamStats {
@@ -1865,7 +1868,7 @@ mod tests {
         let health = NetworkHealth::new();
         let mut streams = empty_streams();
         streams.insert("s1".into(), live_stream(0));
-        let out = health.build_health_summary(&streams, &empty_tcp(), &empty_ptp(), &empty_msrp(), &empty_eee(), &empty_avtp(), Instant::now());
+        let out = health.build_health_summary(&scoring(&streams, &empty_tcp(), &empty_ptp(), &empty_msrp(), &empty_eee(), &empty_avtp(), Instant::now()));
         assert!(out.is_empty(), "healthy state must yield no bullets, got {out:?}");
     }
 
@@ -1874,7 +1877,7 @@ mod tests {
         let health = NetworkHealth::new();
         let mut streams = empty_streams();
         streams.insert("s1".into(), live_stream(5));
-        let out = health.build_health_summary(&streams, &empty_tcp(), &empty_ptp(), &empty_msrp(), &empty_eee(), &empty_avtp(), Instant::now());
+        let out = health.build_health_summary(&scoring(&streams, &empty_tcp(), &empty_ptp(), &empty_msrp(), &empty_eee(), &empty_avtp(), Instant::now()));
         assert_eq!(out.len(), 1);
         assert!(out[0].contains("1 stream(s) with packet loss"), "got {out:?}");
     }
@@ -1886,7 +1889,7 @@ mod tests {
         streams.insert("s1".into(), live_stream(5));
         streams.insert("s2".into(), live_stream(3));
         streams.insert("s3".into(), live_stream(1));
-        let out = health.build_health_summary(&streams, &empty_tcp(), &empty_ptp(), &empty_msrp(), &empty_eee(), &empty_avtp(), Instant::now());
+        let out = health.build_health_summary(&scoring(&streams, &empty_tcp(), &empty_ptp(), &empty_msrp(), &empty_eee(), &empty_avtp(), Instant::now()));
         assert_eq!(out.len(), 1, "three lossy streams collapse to one bullet, got {out:?}");
         assert!(out[0].contains("3 stream(s) with packet loss"));
     }
@@ -1904,7 +1907,7 @@ mod tests {
         jittery.jitter = 0.015;                    // 15 ms > 10 ms threshold
         streams.insert("s2".into(), jittery);
 
-        let out = health.build_health_summary(&streams, &empty_tcp(), &empty_ptp(), &empty_msrp(), &empty_eee(), &empty_avtp(), Instant::now());
+        let out = health.build_health_summary(&scoring(&streams, &empty_tcp(), &empty_ptp(), &empty_msrp(), &empty_eee(), &empty_avtp(), Instant::now()));
         // loss, jitter, DSCP — three distinct categories, one bullet each.
         assert_eq!(out.len(), 3, "got {out:?}");
         assert!(out.iter().any(|b| b.contains("packet loss")));
@@ -1928,7 +1931,7 @@ mod tests {
         let mut eee = empty_eee();
         eee.insert(("chassis".into(), "port3".into()), (10, 20));
 
-        let out = health.build_health_summary(&empty_streams(), &empty_tcp(), &ptp, &empty_msrp(), &eee, &empty_avtp(), Instant::now());
+        let out = health.build_health_summary(&scoring(&empty_streams(), &empty_tcp(), &ptp, &empty_msrp(), &eee, &empty_avtp(), Instant::now()));
         assert!(out.iter().any(|b| b.contains("TCP retransmissions")), "got {out:?}");
         assert!(out.iter().any(|b| b.contains("ECN congestion")));
         assert!(out.iter().any(|b| b.contains("Multiple IGMP queriers")));
@@ -1943,7 +1946,7 @@ mod tests {
         let health = NetworkHealth::new();
         let mut unicast = empty_streams();
         unicast.insert("u1".into(), live_stream(0)); // is_multicast = false by default
-        let out = health.build_health_summary(&unicast, &empty_tcp(), &empty_ptp(), &empty_msrp(), &empty_eee(), &empty_avtp(), Instant::now());
+        let out = health.build_health_summary(&scoring(&unicast, &empty_tcp(), &empty_ptp(), &empty_msrp(), &empty_eee(), &empty_avtp(), Instant::now()));
         assert!(out.is_empty(), "no multicast → no querier bullet, got {out:?}");
 
         // Same querier state, but now an active multicast stream → querier-absent bullet.
@@ -1951,7 +1954,7 @@ mod tests {
         let mut m = live_stream(0);
         m.is_multicast = true;
         mc.insert("m1".into(), m);
-        let out = health.build_health_summary(&mc, &empty_tcp(), &empty_ptp(), &empty_msrp(), &empty_eee(), &empty_avtp(), Instant::now());
+        let out = health.build_health_summary(&scoring(&mc, &empty_tcp(), &empty_ptp(), &empty_msrp(), &empty_eee(), &empty_avtp(), Instant::now()));
         assert!(out.iter().any(|b| b.contains("IGMP querier absent")), "got {out:?}");
     }
 
@@ -1963,7 +1966,7 @@ mod tests {
         let health = NetworkHealth::new();
         let mut streams = empty_streams();
         streams.insert("s1".into(), live_stream(0));
-        let out = health.build_health_summary(&streams, &empty_tcp(), &empty_ptp(), &empty_msrp(), &empty_eee(), &empty_avtp(), Instant::now());
+        let out = health.build_health_summary(&scoring(&streams, &empty_tcp(), &empty_ptp(), &empty_msrp(), &empty_eee(), &empty_avtp(), Instant::now()));
         assert!(out.is_empty());
     }
 
@@ -1977,7 +1980,7 @@ mod tests {
         let Some(silent_since) = Instant::now().checked_sub(Duration::from_secs(crate::protocols::STREAM_TIMEOUT_SECS + 5)) else { return };
         dead.last_packet_time = Some(silent_since);
         streams.insert("s1".into(), dead);
-        let out = health.build_health_summary(&streams, &empty_tcp(), &empty_ptp(), &empty_msrp(), &empty_eee(), &empty_avtp(), Instant::now());
+        let out = health.build_health_summary(&scoring(&streams, &empty_tcp(), &empty_ptp(), &empty_msrp(), &empty_eee(), &empty_avtp(), Instant::now()));
         assert!(out.iter().any(|b| b.contains("dead stream")), "got {out:?}");
     }
 
@@ -2000,14 +2003,10 @@ mod tests {
         let mut eee = empty_eee();
         eee.insert(("chassis".into(), "port3".into()), (10, 20));
 
-        let penalties = health.collect_penalties(
-            &streams, &empty_tcp(), &empty_ptp(), &empty_msrp(), &eee, &empty_avtp(), Instant::now(),
-        );
-        let summary = health.build_health_summary(
-            &streams, &empty_tcp(), &empty_ptp(), &empty_msrp(), &eee, &empty_avtp(), Instant::now(),
-        );
+        let penalties = health.collect_penalties(&scoring(&streams, &empty_tcp(), &empty_ptp(), &empty_msrp(), &eee, &empty_avtp(), Instant::now()));
+        let summary = health.build_health_summary(&scoring(&streams, &empty_tcp(), &empty_ptp(), &empty_msrp(), &eee, &empty_avtp(), Instant::now()));
         let expected: f64 = penalties.iter().map(|p| p.deduction()).sum();
-        health.calculate_score(&streams, &empty_tcp(), &empty_ptp(), &empty_msrp(), &eee, &empty_avtp(), Instant::now());
+        health.calculate_score(&scoring(&streams, &empty_tcp(), &empty_ptp(), &empty_msrp(), &eee, &empty_avtp(), Instant::now()));
 
         // One bullet per penalty (biconditional), and the score is exactly the
         // complement of the summed deductions.
@@ -2054,12 +2053,8 @@ mod tests {
         let mut streams = empty_streams();
         streams.insert("s1".into(), s);
 
-        let penalties = health.collect_penalties(
-            &streams, &empty_tcp(), &empty_ptp(), &empty_msrp(), &empty_eee(), &empty_avtp(), Instant::now(),
-        );
-        let summary = health.build_health_summary(
-            &streams, &empty_tcp(), &empty_ptp(), &empty_msrp(), &empty_eee(), &empty_avtp(), Instant::now(),
-        );
+        let penalties = health.collect_penalties(&scoring(&streams, &empty_tcp(), &empty_ptp(), &empty_msrp(), &empty_eee(), &empty_avtp(), Instant::now()));
+        let summary = health.build_health_summary(&scoring(&streams, &empty_tcp(), &empty_ptp(), &empty_msrp(), &empty_eee(), &empty_avtp(), Instant::now()));
 
         assert!(penalties.is_empty(), "informational-only diagnostics must add no penalty, got {} penalties", penalties.len());
         assert!(summary.is_empty(), "informational-only diagnostics must add no bullet, got {summary:?}");
@@ -2079,12 +2074,8 @@ mod tests {
         s.msrp_declared_pcp = Some(3);
         avtp.insert(s.stream_id, s);
 
-        let penalties = health.collect_penalties(
-            &empty_streams(), &empty_tcp(), &empty_ptp(), &empty_msrp(), &empty_eee(), &avtp, Instant::now(),
-        );
-        let summary = health.build_health_summary(
-            &empty_streams(), &empty_tcp(), &empty_ptp(), &empty_msrp(), &empty_eee(), &avtp, Instant::now(),
-        );
+        let penalties = health.collect_penalties(&scoring(&empty_streams(), &empty_tcp(), &empty_ptp(), &empty_msrp(), &empty_eee(), &avtp, Instant::now()));
+        let summary = health.build_health_summary(&scoring(&empty_streams(), &empty_tcp(), &empty_ptp(), &empty_msrp(), &empty_eee(), &avtp, Instant::now()));
         let total: f64 = penalties.iter().map(|p| p.deduction()).sum();
 
         assert_eq!(total, 15.0, "PCP mismatch must deduct 15 points, got total {total}");
@@ -2098,9 +2089,7 @@ mod tests {
         let s = AvtpStreamStats::new([1, 2, 3, 4, 5, 6, 7, 8], 0x00);
         avtp.insert(s.stream_id, s);
 
-        let out = health.build_health_summary(
-            &empty_streams(), &empty_tcp(), &empty_ptp(), &empty_msrp(), &empty_eee(), &avtp, Instant::now(),
-        );
+        let out = health.build_health_summary(&scoring(&empty_streams(), &empty_tcp(), &empty_ptp(), &empty_msrp(), &empty_eee(), &avtp, Instant::now()));
         assert!(out.is_empty(), "got {out:?}");
     }
 
