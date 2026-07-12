@@ -739,7 +739,7 @@ fn render_streams(
             if s.is_multicast { "  [multicast]" } else { "  [unicast]" }
         } else { "" };
 
-        let tx_tag = transmitter_tag(s.transmitter);
+        let tx_tag = transmitter_tag(s.transmitter.verdict);
         lines.push(RenderedLine::plain(status_entry(&format!("▸ {}{}{}{}{}{}", proto_label, multicast_tag, name_str, codec_str, addr_str, tx_tag))));
 
         if s.protocol == Protocol::Ndi {

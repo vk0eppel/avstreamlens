@@ -21,7 +21,7 @@ use crate::parser::{is_aes67_multicast, is_st2110_multicast, parse_rtp};
 use crate::protocols::{
     AvProtocol, AvdeccAdp, DanteKind, FlowControlKind, IgmpType, MsrpDeclType, MsrpDeclaration,
     NdiKind, Protocol, ProtocolChoice, PtpInfo, SdpMedia, SdpSession, St2110Type, TransmitterClass, DEFAULT_CLOCK_HZ,
-    PTP_VERSION_V1, PTP_VERSION_V2, STREAM_TIMEOUT_SECS, classify_transmitter, msrp_failure_reason,
+    PTP_VERSION_V1, PTP_VERSION_V2, STREAM_TIMEOUT_SECS, msrp_failure_reason,
 };
 use crate::report::{Logger, ReportSession, ReportSnapshot, print_report};
 use crate::stats::{
@@ -1105,14 +1105,13 @@ impl CaptureState {
                     && let Some(udp) = pnet_packet::udp::UdpPacket::new(ip.payload())
                 {
                     let dscp = ip.get_dscp();
-                    if stats.observed_dscp.is_none() { stats.observed_dscp = Some(dscp); }
+                    stats.transmitter.record_dscp(dscp);
                     dscp_seen = Some(dscp);
                     self.network_health.record_ecn_mark_if_congested(ip.get_ecn());
                     // TTL routing check: Dante is L2-only; track minimum TTL so the
                     // report can alert when a router decremented it (TTL < 64 from a
                     // Linux/macOS source means ≥ 1 router hop — misconfiguration).
-                    let ttl = ip.get_ttl();
-                    stats.min_ttl = Some(stats.min_ttl.map_or(ttl, |m| m.min(ttl)));
+                    stats.transmitter.record_ttl(ip.get_ttl());
                     match parse_rtp(udp.payload()) {
                         Some((seq, ts, ssrc)) => stats.update(seq, ts, ssrc, udp.payload().len(), now),
                         // ATP framing (official ports 4321 / 14336–15359) is not RTP —
@@ -1122,19 +1121,16 @@ impl CaptureState {
                 }
                 // Transmitter Class verdict — recomputed each packet so an early
                 // inference upgrades to a confirmed verdict as signals accumulate.
-                let signals = crate::protocols::TransmitterSignals {
-                    control_plane: cp_class,
-                    metronomic: stats.timing_metronomic(),
-                    ttl: stats.min_ttl, // TTL 128 → Windows host → software (corroborating)
-                    dscp_zero: stats.observed_dscp == Some(0),
-                };
-                stats.transmitter = classify_transmitter(&signals);
+                // `classify` stores the verdict and hands back the same signal
+                // bundle so the DSCP gate below reuses it (one build — the verdict
+                // and the gate can't drift).
+                let signals = stats.transmitter.classify(cp_class);
 
                 if let Some(dscp) = dscp_seen {
                     // Dante hardware audio requires DSCP EF (46). DVS/Via intentionally
                     // send Best Effort (DSCP 0), so DSCP 0 is NOT a violation for a
                     // software source — see `is_software_ignoring_dscp` for why the
-                    // gate can't just reuse `stats.transmitter` above.
+                    // gate can't just reuse the stored verdict above.
                     let software = crate::protocols::is_software_ignoring_dscp(&signals);
                     if dscp != 46 && !(dscp == 0 && software) {
                         stats.dscp_violations += 1;
@@ -2166,7 +2162,7 @@ mod tests {
         state.handle_dante(DanteKind::AudioStream, src, Ipv4Addr::new(239,255,1,1), 4321, &[], Instant::now());
         let v = state.streams.values()
             .find(|s| s.src_ip == Some(src)).unwrap()
-            .transmitter.unwrap();
+            .transmitter.verdict.unwrap();
         assert_eq!(v.class, TransmitterClass::Dvs);
         assert_eq!(v.confidence, TransmitterConfidence::Confirmed);
     }
@@ -2248,7 +2244,7 @@ mod tests {
         pkt[8] = 128; // TTL 128 — Windows host
         state.handle_dante(DanteKind::AudioStream, src, Ipv4Addr::new(239,255,1,4), 5004, &pkt, Instant::now());
         let s = state.streams.values().find(|s| s.src_ip == Some(src)).unwrap();
-        assert_eq!(s.transmitter.map(|v| v.class), Some(TransmitterClass::Dvs),
+        assert_eq!(s.transmitter.verdict.map(|v| v.class), Some(TransmitterClass::Dvs),
             "TTL 128 alone should infer DVS");
         assert_eq!(s.dscp_violations, 0,
             "gating must agree with the displayed DVS verdict, not silently drop the TTL signal");
@@ -3902,7 +3898,7 @@ mod tests {
             5100, &pkt, Instant::now(),
         );
         let key = "Dante 192.168.1.50 → 192.168.1.60:5100";
-        assert_eq!(state.streams[key].min_ttl, Some(64), "TTL 64 should be stored");
+        assert_eq!(state.streams[key].transmitter.min_ttl, Some(64), "TTL 64 should be stored");
     }
 
     #[test]
@@ -3917,7 +3913,7 @@ mod tests {
             5100, &pkt, Instant::now(),
         );
         let key = "Dante 192.168.1.50 → 192.168.1.60:5100";
-        assert_eq!(state.streams[key].min_ttl, Some(63), "routed TTL should be stored");
+        assert_eq!(state.streams[key].transmitter.min_ttl, Some(63), "routed TTL should be stored");
     }
 
     #[test]
@@ -3930,7 +3926,7 @@ mod tests {
         state.handle_dante(DanteKind::AudioStream, src, dst, 5100, &pkt64, Instant::now());
         state.handle_dante(DanteKind::AudioStream, src, dst, 5100, &pkt60, Instant::now());
         let key = "Dante 192.168.1.50 → 192.168.1.60:5100";
-        assert_eq!(state.streams[key].min_ttl, Some(60), "should track minimum over all packets");
+        assert_eq!(state.streams[key].transmitter.min_ttl, Some(60), "should track minimum over all packets");
     }
 
     // ── check_clock_dropout_correlation ────────────────────────────────────────

@@ -5,11 +5,93 @@ use std::collections::HashMap;
 use std::net::Ipv4Addr;
 use std::time::{Duration, Instant};
 
-use crate::protocols::{Protocol, St2110Type};
+use crate::protocols::{Protocol, St2110Type, TransmitterClass, TransmitterVerdict, TransmitterSignals, classify_transmitter};
 
 // ═════════════════════════════════════════════════════════════════
 // SECTION 2 — STREAM STATISTICS (RTP/AV/Audio)
 // ════════════════════════════════════════════════════════════════
+
+/// The per-stream Transmitter Class state for a Dante Audio Flow: the signals
+/// that feed the verdict (timing samples, minimum TTL, first-seen DSCP) and the
+/// stored verdict itself. Grouped out of `StreamStats` because it is Dante-only
+/// and self-contained — the classification logic lives here next to the data it
+/// reads, so the report and the DSCP-violation gate each consume one stored
+/// verdict / one signal build instead of reaching across loose `StreamStats`
+/// fields. See CONTEXT.md "Transmitter Class".
+#[derive(Debug, Clone, Default)]
+pub struct TransmitterProfile {
+    /// Hardware / DVS / Via verdict with confidence; `None` until a signal is seen.
+    pub verdict: Option<TransmitterVerdict>,
+    /// Recent inter-arrival times (ms), bounded ring — feeds the timing signal.
+    /// hardware/FPGA sources are metronomic (low variance), general-purpose-OS
+    /// software (DVS/Via) is scheduler-noisy.
+    pub iat_samples: Vec<f64>,
+    /// Minimum IP TTL over the stream's lifetime. TTL < 64 ⇒ a router decremented
+    /// it (Dante is L2-only) — a misconfiguration the report alerts on. Also the
+    /// host-OS signal (128 ⇒ Windows ⇒ software).
+    pub min_ttl: Option<u8>,
+    /// DSCP on the first packet, set once, never reset — distinguishes intentional
+    /// Best Effort (software) from misconfigured hardware; gates the Dante
+    /// DSCP-violation check.
+    pub observed_dscp: Option<u8>,
+}
+
+impl TransmitterProfile {
+    /// Record an inter-arrival sample (ms) into the bounded ring.
+    fn record_iat(&mut self, iat_ms: f64) {
+        const MAX_IAT_SAMPLES: usize = 64;
+        if iat_ms > 0.0 {
+            self.iat_samples.push(iat_ms);
+            if self.iat_samples.len() > MAX_IAT_SAMPLES {
+                self.iat_samples.remove(0);
+            }
+        }
+    }
+
+    /// Track the minimum TTL seen so far.
+    pub(crate) fn record_ttl(&mut self, ttl: u8) {
+        self.min_ttl = Some(self.min_ttl.map_or(ttl, |m| m.min(ttl)));
+    }
+
+    /// Set the observed DSCP once (first packet); later packets don't overwrite.
+    pub(crate) fn record_dscp(&mut self, dscp: u8) {
+        if self.observed_dscp.is_none() { self.observed_dscp = Some(dscp); }
+    }
+
+    /// Timing-regularity signal for Transmitter Class. Returns `Some(true)` when
+    /// the source is metronomic (low coefficient of variation → hardware/FPGA),
+    /// `Some(false)` when clearly noisy (→ software), and `None` while there are
+    /// too few samples or the regularity is ambiguous. Independent of QoS marking,
+    /// so it disambiguates a re-marked hardware source from genuine software.
+    pub fn timing_metronomic(&self) -> Option<bool> {
+        const MIN_SAMPLES: usize = 16;
+        if self.iat_samples.len() < MIN_SAMPLES { return None; }
+        let n = self.iat_samples.len() as f64;
+        let mean = self.iat_samples.iter().sum::<f64>() / n;
+        if mean <= 0.0 { return None; }
+        let var = self.iat_samples.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / n;
+        let cv = var.sqrt() / mean; // coefficient of variation
+        if cv < 0.10 { Some(true) }        // metronomic — hardware
+        else if cv > 0.30 { Some(false) }  // noisy — software
+        else { None }                      // ambiguous
+    }
+
+    /// Build the signal bundle from this profile's own fields plus the external
+    /// control-plane class, store the resulting verdict, and return the bundle so
+    /// the caller reuses the same signals for the DSCP-violation gate — one build,
+    /// so the displayed verdict and the DSCP gate can never drift (see CLAUDE.md's
+    /// note on the two literals that previously diverged).
+    pub fn classify(&mut self, control_plane: Option<TransmitterClass>) -> TransmitterSignals {
+        let signals = TransmitterSignals {
+            control_plane,
+            metronomic: self.timing_metronomic(),
+            ttl: self.min_ttl, // TTL 128 → Windows host → software (corroborating)
+            dscp_zero: self.observed_dscp == Some(0),
+        };
+        self.verdict = classify_transmitter(&signals);
+        signals
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct StreamStats {
@@ -76,25 +158,12 @@ pub struct StreamStats {
     // update_non_rtp and must not render 0% loss / 0 ms jitter as if measured,
     // nor fire the "not announced (no SAP)" alert.
     pub rtp_seen:                       bool,
-    // Minimum IP TTL observed across all packets in this stream's lifetime.
-    // Used for Dante routing detection: Dante is L2-only, so any TTL < 64 means
-    // a router decremented it — a misconfiguration that should alert the engineer.
-    pub min_ttl:                        Option<u8>,
     // Scratch buffer for clock-rate inference from RTP timestamp deltas.
     // Cleared once clock_hz_confirmed is set; empty thereafter.
     pub ts_delta_samples:               Vec<i64>,
-    // Transmitter Class verdict (Dante audio only) — Hardware / DVS / Via with a
-    // confidence level, recomputed as signals accumulate. None for non-Dante and
-    // until any signal is observed.
-    pub transmitter:                    Option<crate::protocols::TransmitterVerdict>,
-    // Recent inter-arrival times (ms), bounded ring. Drives the timing-regularity
-    // signal for Transmitter Class: hardware/FPGA sources are metronomic (low
-    // variance), general-purpose-OS software (DVS/Via) is scheduler-noisy.
-    pub iat_samples:                    Vec<f64>,
-    // DSCP observed on the first packet — set once, never reset. Distinguishes a
-    // software source intentionally sending Best Effort (DSCP 0) from misconfigured
-    // hardware (wrong non-zero DSCP); used to gate the Dante DSCP violation.
-    pub observed_dscp:                  Option<u8>,
+    // Dante Transmitter Class state (verdict + its signal inputs) — grouped so the
+    // classification lives next to its data; see `TransmitterProfile`.
+    pub transmitter:                    TransmitterProfile,
     // PCP (802.1p) violations in the current 5 s window. Reset each window.
     // AVB: mismatch against MSRP TalkerAdvertise declared priority.
     // AES67/ST2110: any non-6 value (advisory only).
@@ -145,45 +214,13 @@ impl StreamStats {
             reorders_this_window:           0,
             packets_this_window:            0,
             rtp_seen:                       false,
-            min_ttl:                        None,
             ts_delta_samples:               Vec::new(),
-            transmitter:                    None,
-            iat_samples:                    Vec::new(),
-            observed_dscp:                  None,
+            transmitter:                    TransmitterProfile::default(),
             pcp_violations:                 0,
             observed_pcp:                   None,
         }
     }
 
-    /// Push an inter-arrival sample (ms) into the bounded ring used for the
-    /// timing-regularity signal. Shared by RTP and ATP update paths.
-    fn push_iat(&mut self, iat_ms: f64) {
-        const MAX_IAT_SAMPLES: usize = 64;
-        if iat_ms > 0.0 {
-            self.iat_samples.push(iat_ms);
-            if self.iat_samples.len() > MAX_IAT_SAMPLES {
-                self.iat_samples.remove(0);
-            }
-        }
-    }
-
-    /// Timing-regularity signal for Transmitter Class. Returns `Some(true)` when
-    /// the source is metronomic (low coefficient of variation → hardware/FPGA),
-    /// `Some(false)` when clearly noisy (→ software), and `None` while there are
-    /// too few samples or the regularity is ambiguous. Independent of QoS marking,
-    /// so it disambiguates a re-marked hardware source from genuine software.
-    pub fn timing_metronomic(&self) -> Option<bool> {
-        const MIN_SAMPLES: usize = 16;
-        if self.iat_samples.len() < MIN_SAMPLES { return None; }
-        let n = self.iat_samples.len() as f64;
-        let mean = self.iat_samples.iter().sum::<f64>() / n;
-        if mean <= 0.0 { return None; }
-        let var = self.iat_samples.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / n;
-        let cv = var.sqrt() / mean; // coefficient of variation
-        if cv < 0.10 { Some(true) }        // metronomic — hardware
-        else if cv > 0.30 { Some(false) }  // noisy — software
-        else { None }                      // ambiguous
-    }
     // Constructor with enhanced info — useful when SDP is available at stream start
     pub fn new_with_info(protocol: crate::protocols::Protocol, clock_hz: f64, is_multicast: bool, dst_ip: Ipv4Addr, dst_port: u16) -> Self {
         let mut stats = Self::new(protocol, clock_hz);
@@ -312,7 +349,7 @@ impl StreamStats {
         // Timing-regularity sampling (Transmitter Class) — before last_arrival is
         // overwritten below.
         if let Some(last_time) = self.last_arrival {
-            self.push_iat(now.duration_since(last_time).as_secs_f64() * 1000.0);
+            self.transmitter.record_iat(now.duration_since(last_time).as_secs_f64() * 1000.0);
         }
 
         // IAT burst: ptime_ms > 0 means SDP confirmed the expected packet interval
@@ -360,7 +397,7 @@ impl StreamStats {
         self.packets_this_window += 1;
         // Timing-regularity sampling (Transmitter Class) for ATP flows.
         if let Some(last) = self.last_arrival {
-            self.push_iat(now.duration_since(last).as_secs_f64() * 1000.0);
+            self.transmitter.record_iat(now.duration_since(last).as_secs_f64() * 1000.0);
         }
         self.last_arrival = Some(now);
         self.last_packet_time = Some(now);
@@ -469,8 +506,8 @@ impl StreamStats {
             let expected = if self.protocol == Protocol::St2110(St2110Type::Video) { "EF (46), AF41 (34), or CS5 (40)" } else { "EF (46)" };
             d.push(StreamDiagnostic::DscpViolation { count: self.dscp_violations, expected });
         }
-        if self.protocol == Protocol::Dante && self.min_ttl.is_some_and(|t| t < 64) {
-            d.push(StreamDiagnostic::TtlRouted { ttl: self.min_ttl.unwrap() });
+        if self.protocol == Protocol::Dante && self.transmitter.min_ttl.is_some_and(|t| t < 64) {
+            d.push(StreamDiagnostic::TtlRouted { ttl: self.transmitter.min_ttl.unwrap() });
         }
         if self.jitter_ms() > 10.0 {
             d.push(StreamDiagnostic::HighJitter { jitter_ms: self.jitter_ms() });
@@ -2099,23 +2136,23 @@ mod tests {
     #[test]
     fn timing_metronomic_true_for_steady_intervals() {
         let mut s = aes67();
-        s.iat_samples = vec![1.0; 32]; // perfectly steady → cv 0
-        assert_eq!(s.timing_metronomic(), Some(true));
+        s.transmitter.iat_samples = vec![1.0; 32]; // perfectly steady → cv 0
+        assert_eq!(s.transmitter.timing_metronomic(), Some(true));
     }
 
     #[test]
     fn timing_metronomic_false_for_noisy_intervals() {
         let mut s = aes67();
         // alternating 0.5 / 1.5 ms → mean 1.0, cv 0.5 — scheduler-noisy software
-        s.iat_samples = (0..32).map(|i| if i % 2 == 0 { 0.5 } else { 1.5 }).collect();
-        assert_eq!(s.timing_metronomic(), Some(false));
+        s.transmitter.iat_samples = (0..32).map(|i| if i % 2 == 0 { 0.5 } else { 1.5 }).collect();
+        assert_eq!(s.transmitter.timing_metronomic(), Some(false));
     }
 
     #[test]
     fn timing_metronomic_none_with_too_few_samples() {
         let mut s = aes67();
-        s.iat_samples = vec![1.0; 4];
-        assert_eq!(s.timing_metronomic(), None);
+        s.transmitter.iat_samples = vec![1.0; 4];
+        assert_eq!(s.transmitter.timing_metronomic(), None);
     }
 
     // ── apply_sdp (Session Announcement enrichment) ──────────────────────────
