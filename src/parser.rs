@@ -751,7 +751,7 @@ mod tests {
         let udp_len = (8 + payload.len()) as u16;
         let mut ip = vec![0u8; 20 + 8 + payload.len()];
         ip[0] = 0x45;                                       // v4, IHL=5
-        let total = (20 + udp_len) as u16;
+        let total = 20 + udp_len;
         ip[2..4].copy_from_slice(&total.to_be_bytes());
         ip[8] = 64;                                         // TTL
         ip[9] = 0x11;                                       // UDP
@@ -1026,7 +1026,7 @@ mod tests {
     /// `qr` sets bit 7 of flags byte (payload[2]): true = response, false = query.
     fn mdns_frame(src_ip: [u8; 4], qr: bool, mdns_body: &[u8]) -> Vec<u8> {
         let udp_len = (8 + mdns_body.len()) as u16;
-        let ip_total = (20 + udp_len) as u16;
+        let ip_total = 20 + udp_len;
         let mut ip = vec![0u8; 20 + 8 + mdns_body.len()];
         ip[0] = 0x45;
         ip[2..4].copy_from_slice(&ip_total.to_be_bytes());

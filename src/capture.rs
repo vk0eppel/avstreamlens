@@ -2892,7 +2892,7 @@ mod tests {
         let mut buf = vec![0u8; 20 + 8 + payload_len];
         buf[0] = 0x45;
         buf[1] = 46 << 2; // DSCP EF
-        let total = (20 + udp_len) as u16;
+        let total = 20 + udp_len;
         buf[2..4].copy_from_slice(&total.to_be_bytes());
         buf[8] = 64;
         buf[9] = 0x11;
@@ -3857,7 +3857,7 @@ mod tests {
     fn ip_udp_rtp_with_ttl(ttl: u8, src_ip: [u8;4], dst_ip: [u8;4], dst_port: u16) -> Vec<u8> {
         let mut buf = vec![0u8; 20 + 8 + 12];
         buf[0] = 0x45;
-        buf[1] = (46 << 2) | 0; // DSCP EF, ECN 0
+        buf[1] = 46 << 2; // DSCP EF, ECN 0
         let total_len: u16 = (20 + 8 + 12) as u16;
         buf[2..4].copy_from_slice(&total_len.to_be_bytes());
         buf[8]  = ttl;
