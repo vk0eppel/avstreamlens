@@ -777,7 +777,7 @@ impl CaptureState {
     /// SAP/SDP: cache the SDP and retroactively enrich any existing stream
     /// whose port matches an announced media — see `StreamStats::apply_sdp`
     /// for the field-transfer rules.
-    pub fn handle_sap(&mut self, sdp: SdpSession) {
+    pub fn handle_sap(&mut self, sdp: SdpSession) -> Vec<Alert> {
         // Enrich EVERY stream this announcement matches — not just the first. When
         // the media carries a connection IP, require the stream's destination group
         // to match it, so two streams sharing a port (different multicast groups)
@@ -800,6 +800,7 @@ impl CaptureState {
             }
         }
         self.cache_sdp(sdp);
+        Vec::new()
     }
 
     /// Insert an SDP session into `sdp_cache`, keeping it bounded against a flood of
@@ -940,7 +941,7 @@ impl CaptureState {
     }
 
     /// AES67 RTP audio.
-    pub fn handle_aes67(&mut self, dst: Ipv4Addr, dst_port: u16, payload_type: u8, l2_payload: &[u8], pcp: Option<u8>, now: Instant) {
+    pub fn handle_aes67(&mut self, dst: Ipv4Addr, dst_port: u16, payload_type: u8, l2_payload: &[u8], pcp: Option<u8>, now: Instant) -> Vec<Alert> {
         let key = format!("AES67 {}:{}", dst, dst_port);
         let sdp_match = self.find_sdp_media(dst, dst_port).map(|(name, m)| (name.to_string(), m.clone()));
         let stats = self.streams.entry(key).or_insert_with(|| {
@@ -966,10 +967,11 @@ impl CaptureState {
                 stats.update(seq, ts, ssrc, udp.payload().len(), now);
             }
         }
+        Vec::new()
     }
 
     /// ST 2110 video/audio/ancillary.
-    pub fn handle_st2110(&mut self, dst: Ipv4Addr, dst_port: u16, stream_type: St2110Type, l2_payload: &[u8], pcp: Option<u8>, now: Instant) {
+    pub fn handle_st2110(&mut self, dst: Ipv4Addr, dst_port: u16, stream_type: St2110Type, l2_payload: &[u8], pcp: Option<u8>, now: Instant) -> Vec<Alert> {
         let label = match stream_type {
             St2110Type::Video   => "2110-20",
             St2110Type::Audio   => "2110-30",
@@ -1016,6 +1018,7 @@ impl CaptureState {
                 stats.update(seq, ts, ssrc, udp.payload().len(), now);
             }
         }
+        Vec::new()
     }
 
     /// Dante: discovery, control (silent), ConMon liveness, or audio stream.
@@ -1151,12 +1154,12 @@ impl CaptureState {
     /// window reads: the per-connection quality/retransmission state in
     /// `tcp_streams`, and the `"NDI {ip}"` entry in `streams` (packet count +
     /// liveness) that `aggregate_ndi_bitrate` later sums `tcp_streams` bitrate into.
-    pub fn handle_tcp(&mut self, segment: crate::protocols::TcpSegment, frame_bytes: u64, now: Instant) {
+    pub fn handle_tcp(&mut self, segment: crate::protocols::TcpSegment, frame_bytes: u64, now: Instant) -> Vec<Alert> {
         let crate::protocols::TcpSegment { src, dst, src_port, dst_port, seq, ack, has_fin, has_syn, has_rst } = segment;
         let ndi_range = crate::protocols::NDI_PORT_MIN..=crate::protocols::NDI_PORT_MAX;
         let is_ndi = ndi_range.contains(&src_port) || ndi_range.contains(&dst_port)
             || self.ndi.sources.contains(&src) || self.ndi.sources.contains(&dst);
-        if !is_ndi { return; }
+        if !is_ndi { return Vec::new(); }
 
         let sender = if self.ndi.sources.contains(&src) { Some(src) }
                      else if self.ndi.sources.contains(&dst) { Some(dst) }
@@ -1201,16 +1204,17 @@ impl CaptureState {
         tcp_stat.last_ack = Some(ack);
         tcp_stat.update_bitrate(now);
         tcp_stat.update_quality();
+        Vec::new()
     }
 
     /// AVB AVTP frame — updates the per-subtype aggregate stream and per-stream_id entry.
-    pub fn handle_avb(&mut self, subtype: u8, stream_id: Option<[u8; 8]>, frame_bytes: u64, avtp_seq: Option<u8>, pcp: Option<u8>, now: Instant) {
+    pub fn handle_avb(&mut self, subtype: u8, stream_id: Option<[u8; 8]>, frame_bytes: u64, avtp_seq: Option<u8>, pcp: Option<u8>, now: Instant) -> Vec<Alert> {
         // sv=0 AVTP control/discovery frames (AVDECC ADP/ACMP, MAAP) carry no stream
         // id — they are not media streams. Skip them so they don't inflate the AVB
         // stream count, create a phantom dead-stream entry, or diverge from the
         // per-stream-id avtp_streams map the Streams list and clock gate both read.
         // (Their bytes still count toward bandwidth via bytes_this_window in main.rs.)
-        let Some(sid) = stream_id else { return; };
+        let Some(sid) = stream_id else { return Vec::new(); };
 
         let entry = self.avb.avtp_streams.entry(sid)
             .or_insert_with(|| AvtpStreamStats::new(sid, subtype));
@@ -1233,6 +1237,7 @@ impl CaptureState {
             entry.observed_pcp.get_or_insert(observed);
             entry.msrp_declared_pcp = Some(declared);
         }
+        Vec::new()
     }
 
     /// MSRP declarations — records all, alerts only on TalkerFailed.
@@ -1342,11 +1347,12 @@ impl CaptureState {
 
     /// Link-layer flow control (PAUSE or PFC). Just counts — alert text and
     /// score penalty live in the periodic report.
-    pub fn handle_flow_control(&mut self, kind: FlowControlKind) {
+    pub fn handle_flow_control(&mut self, kind: FlowControlKind) -> Vec<Alert> {
         match kind {
             FlowControlKind::Pause                => self.pause_frames_this_window += 1,
             FlowControlKind::PriorityFlowControl  => self.pfc_frames_this_window   += 1,
         }
+        Vec::new()
     }
 
     /// True when at least one multicast stream has carried traffic. Mirrors the
@@ -1757,19 +1763,17 @@ pub fn dispatch(
     now: Instant,
     logger: &mut Logger,
 ) {
+    // Every handler returns `Vec<Alert>` (empty when it emits nothing this
+    // packet), so dispatch is a uniform variant → handler table — whether a
+    // protocol alerts immediately is no longer encoded in the return type.
     let alerts = match proto {
-        AvProtocol::Sap { src: _, sdp } => {
-            state.handle_sap(sdp);
-            vec![]
-        }
+        AvProtocol::Sap { src: _, sdp } => state.handle_sap(sdp),
         AvProtocol::Ptp { info } => state.handle_ptp(info, now),
         AvProtocol::Aes67 { dst, dst_port, payload_type, .. } => {
-            state.handle_aes67(dst, dst_port, payload_type, l2_payload, pcp, now);
-            vec![]
+            state.handle_aes67(dst, dst_port, payload_type, l2_payload, pcp, now)
         }
         AvProtocol::St2110 { dst, dst_port, stream_type, .. } => {
-            state.handle_st2110(dst, dst_port, stream_type, l2_payload, pcp, now);
-            vec![]
+            state.handle_st2110(dst, dst_port, stream_type, l2_payload, pcp, now)
         }
         AvProtocol::Dante { kind, src, dst, dst_port } => {
             state.handle_dante(kind, src, dst, dst_port, l2_payload, now)
@@ -1779,8 +1783,7 @@ pub fn dispatch(
         }
         AvProtocol::AvdeccAdp(adp) => state.handle_avdecc_adp(adp, now),
         AvProtocol::Avb { subtype, stream_id, seq } => {
-            state.handle_avb(subtype, stream_id, frame_bytes, seq, pcp, now);
-            vec![]
+            state.handle_avb(subtype, stream_id, frame_bytes, seq, pcp, now)
         }
         AvProtocol::Msrp { declarations } => state.handle_msrp(declarations),
         AvProtocol::Mvrp { vlan_ids }     => state.handle_mvrp(vlan_ids),
@@ -1790,14 +1793,8 @@ pub fn dispatch(
         AvProtocol::Igmp { src, src_mac, group, igmp_type } => {
             state.handle_igmp(src, src_mac, group, igmp_type, now)
         }
-        AvProtocol::FlowControl { kind } => {
-            state.handle_flow_control(kind);
-            vec![]
-        }
-        AvProtocol::Tcp(segment) => {
-            state.handle_tcp(segment, frame_bytes, now);
-            vec![]
-        }
+        AvProtocol::FlowControl { kind } => state.handle_flow_control(kind),
+        AvProtocol::Tcp(segment) => state.handle_tcp(segment, frame_bytes, now),
     };
     emit(&alerts, logger);
 }
