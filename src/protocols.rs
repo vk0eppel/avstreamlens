@@ -386,8 +386,49 @@ pub fn avtp_subtype_name(subtype: u8) -> &'static str {
 
 // ── Stream Protocol Types ──
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum St2110Type { Video, Audio, Ancdata, Unknown }
+
+/// The media protocol a `StreamStats` belongs to — the typed replacement for the
+/// old stringly-typed `protocol` field, which was matched with `==` and
+/// `starts_with("2110-")` in a dozen places (a typo or new label silently missed
+/// a branch). Matches are now exhaustive and the display label is derived, not
+/// re-matched. ST2110 carries its sub-type so the `2110-20/30/40/??` distinction
+/// is data, not a string suffix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Protocol {
+    Aes67,
+    Dante,
+    Ndi,
+    Avb,
+    St2110(St2110Type),
+}
+
+impl Protocol {
+    /// The exact display/log label used before the enum existed — preserved
+    /// verbatim so report output is byte-for-byte unchanged.
+    pub fn label(self) -> &'static str {
+        match self {
+            Protocol::Aes67 => "AES67",
+            Protocol::Dante => "Dante",
+            Protocol::Ndi   => "NDI",
+            Protocol::Avb   => "AVB",
+            Protocol::St2110(St2110Type::Video)   => "2110-20",
+            Protocol::St2110(St2110Type::Audio)   => "2110-30",
+            Protocol::St2110(St2110Type::Ancdata) => "2110-40",
+            Protocol::St2110(St2110Type::Unknown) => "2110-??",
+        }
+    }
+
+    /// True for any ST2110 sub-type — replaces `protocol.starts_with("2110-")`.
+    pub fn is_st2110(self) -> bool { matches!(self, Protocol::St2110(_)) }
+}
+
+impl std::fmt::Display for Protocol {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.label())
+    }
+}
 
 // ── AVB / MSRP types ──
 

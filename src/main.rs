@@ -30,6 +30,8 @@ use std::time::{Duration, Instant};
 use crate::capture::CaptureState;
 use crate::parser::{detect_protocol_unwrapped, is_multicast, unwrap_vlan};
 use crate::report::{create_logger, ReportSession};
+#[cfg(test)]
+use crate::protocols::Protocol;
 
 use std::collections::HashSet;
 use std::net::{Ipv4Addr, UdpSocket};
@@ -633,7 +635,7 @@ mod tests {
         process_packet(&mut state, &eth, &expanded, Instant::now(), &mut logger);
 
         assert_eq!(state.packets_dispatched, 1);
-        assert!(state.streams.values().any(|s| s.protocol == "AES67"),
+        assert!(state.streams.values().any(|s| s.protocol == Protocol::Aes67),
             "an AES67 RTP frame must create a stream");
     }
 
@@ -761,7 +763,7 @@ mod tests {
 
     fn active_aes67_stream(port: u16) -> crate::stats::StreamStats {
         let mut s = crate::stats::StreamStats::new_with_info(
-            "AES67", 48_000.0, true, Ipv4Addr::new(239, 69, 0, 1), port);
+            Protocol::Aes67, 48_000.0, true, Ipv4Addr::new(239, 69, 0, 1), port);
         s.packets = 10;
         s
     }

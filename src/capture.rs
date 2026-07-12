@@ -20,7 +20,7 @@ use pnet_packet::Packet;
 use crate::parser::{is_aes67_multicast, is_st2110_multicast, parse_rtp};
 use crate::protocols::{
     AvProtocol, AvdeccAdp, DanteKind, FlowControlKind, IgmpType, MsrpDeclType, MsrpDeclaration,
-    NdiKind, ProtocolChoice, PtpInfo, SdpMedia, SdpSession, St2110Type, TransmitterClass, DEFAULT_CLOCK_HZ,
+    NdiKind, Protocol, ProtocolChoice, PtpInfo, SdpMedia, SdpSession, St2110Type, TransmitterClass, DEFAULT_CLOCK_HZ,
     PTP_VERSION_V1, PTP_VERSION_V2, STREAM_TIMEOUT_SECS, classify_transmitter, msrp_failure_reason,
 };
 use crate::report::{Logger, ReportSession, ReportSnapshot, print_report};
@@ -58,13 +58,11 @@ pub enum MissingClockKind {
 /// of sync with each other. AVB is deliberately not handled here: its gPTP
 /// requirement is derived from `avb.avtp_streams` presence, not a `StreamStats`
 /// protocol label (AVB frames never populate `CaptureState::streams`).
-pub fn stream_clock_kind(protocol: &str) -> Option<MissingClockKind> {
-    if protocol == "AES67" || protocol.starts_with("2110-") {
-        Some(MissingClockKind::Ptpv2)
-    } else if protocol == "Dante" {
-        Some(MissingClockKind::Ptp)
-    } else {
-        None
+pub fn stream_clock_kind(protocol: Protocol) -> Option<MissingClockKind> {
+    match protocol {
+        Protocol::Aes67 | Protocol::St2110(_) => Some(MissingClockKind::Ptpv2),
+        Protocol::Dante                       => Some(MissingClockKind::Ptp),
+        Protocol::Ndi | Protocol::Avb         => None,
     }
 }
 
@@ -945,7 +943,7 @@ impl CaptureState {
         let key = format!("AES67 {}:{}", dst, dst_port);
         let sdp_match = self.find_sdp_media(dst, dst_port).map(|(name, m)| (name.to_string(), m.clone()));
         let stats = self.streams.entry(key).or_insert_with(|| {
-            let mut s = StreamStats::new_with_info("AES67", DEFAULT_CLOCK_HZ, is_aes67_multicast(dst), dst, dst_port);
+            let mut s = StreamStats::new_with_info(Protocol::Aes67, DEFAULT_CLOCK_HZ, is_aes67_multicast(dst), dst, dst_port);
             s.media_type = "audio".to_string();
             s.channels = 1;
             if let Some((name, media)) = &sdp_match {
@@ -982,7 +980,7 @@ impl CaptureState {
         let default_clock = if matches!(stream_type, St2110Type::Video) { 90_000.0 } else { DEFAULT_CLOCK_HZ };
         let sdp_match = self.find_sdp_media(dst, dst_port).map(|(name, m)| (name.to_string(), m.clone()));
         let stats = self.streams.entry(key).or_insert_with(|| {
-            let mut s = StreamStats::new_with_info(label, default_clock, is_st2110_multicast(dst), dst, dst_port);
+            let mut s = StreamStats::new_with_info(Protocol::St2110(stream_type), default_clock, is_st2110_multicast(dst), dst, dst_port);
             s.media_type = match stream_type {
                 St2110Type::Video => "video".to_string(),
                 St2110Type::Audio => "audio".to_string(),
@@ -1033,7 +1031,7 @@ impl CaptureState {
                     // Name is written once (same rule as SAP session names) so
                     // later re-announcements don't flicker the display.
                     for s in self.streams.values_mut() {
-                        if s.protocol == "Dante" && s.src_ip == Some(src) && s.sdp_name.is_none() {
+                        if s.protocol == Protocol::Dante && s.src_ip == Some(src) && s.sdp_name.is_none() {
                             s.sdp_name = Some(name.clone());
                         }
                     }
@@ -1082,7 +1080,7 @@ impl CaptureState {
                 // interleaving their sequence numbers into false loss.
                 let key = format!("Dante {} → {}:{}", src, dst, dst_port);
                 let stats = self.streams.entry(key).or_insert_with(|| {
-                    let mut s = StreamStats::new_with_info("Dante", DEFAULT_CLOCK_HZ, is_mc, dst, dst_port);
+                    let mut s = StreamStats::new_with_info(Protocol::Dante, DEFAULT_CLOCK_HZ, is_mc, dst, dst_port);
                     s.ptime_ms = 1.0; // Dante standard: 48 samples @ 48kHz = 1ms
                     s.src_ip = Some(src);
                     s.sdp_name = self.dante.names.get(&src).cloned();
@@ -1168,7 +1166,7 @@ impl CaptureState {
             let names = &self.ndi.names;
             let stats = self.streams.entry(format!("NDI {}", sender_ip))
                 .or_insert_with(|| {
-                    let mut s = StreamStats::new_with_info("NDI", 0.0, false, sender_ip, 0);
+                    let mut s = StreamStats::new_with_info(Protocol::Ndi, 0.0, false, sender_ip, 0);
                     s.sdp_name = names.get(&sender_ip).cloned();
                     s
                 });
@@ -1483,8 +1481,8 @@ impl CaptureState {
 
         // ── PTPv2 (AES67, ST2110) ────────────────────────────────────────────
         let ptpv2_streams: Vec<&str> = self.streams.values()
-            .filter(|s| stream_clock_kind(&s.protocol) == Some(MissingClockKind::Ptpv2))
-            .map(|s| s.protocol.as_str())
+            .filter(|s| stream_clock_kind(s.protocol) == Some(MissingClockKind::Ptpv2))
+            .map(|s| s.protocol.label())
             .collect();
         let aes67_active  = expanded.iter().any(|c| matches!(c, ProtocolChoice::AES67))
             && ptpv2_streams.contains(&"AES67");
@@ -1501,7 +1499,7 @@ impl CaptureState {
 
         // ── PTPv1 or PTPv2 (Dante) ───────────────────────────────────────────
         let dante_active = expanded.iter().any(|c| matches!(c, ProtocolChoice::Dante))
-            && self.streams.values().any(|s| stream_clock_kind(&s.protocol) == Some(MissingClockKind::Ptp));
+            && self.streams.values().any(|s| stream_clock_kind(s.protocol) == Some(MissingClockKind::Ptp));
         // Dante needs PTPv1/PTPv2 on the IP network — an L2 gPTP (AVB) clock does
         // not satisfy it, so exclude AVB domains just like the PTPv2 check above.
         let has_ptp = self.ptp.domains.values().any(|s| s.clock_valid && s.is_ip_ptp_domain());
@@ -1697,8 +1695,8 @@ impl CaptureState {
 
         let stream_loss = self.streams.values().any(|s| {
             s.lost_this_window > 0 && (
-                (ptpv1_lost && stream_clock_kind(&s.protocol) == Some(MissingClockKind::Ptp))
-                || (ptpv2_lost && stream_clock_kind(&s.protocol) == Some(MissingClockKind::Ptpv2))
+                (ptpv1_lost && stream_clock_kind(s.protocol) == Some(MissingClockKind::Ptp))
+                || (ptpv2_lost && stream_clock_kind(s.protocol) == Some(MissingClockKind::Ptpv2))
             )
         });
 
@@ -1714,7 +1712,7 @@ impl CaptureState {
 
     pub fn aggregate_ndi_bitrate(&mut self) {
         for stream in self.streams.values_mut() {
-            if stream.protocol == "NDI"
+            if stream.protocol == Protocol::Ndi
                 && let Some(src_ip) = stream.dst_ip
             {
                 stream.bitrate_bps = self.tcp_streams.values()
@@ -1815,7 +1813,7 @@ mod tests {
     /// true — required for the IGMP querier checks (absent / multiple) to engage.
     fn add_active_multicast_stream(state: &mut CaptureState) {
         let mut s = StreamStats::new_with_info(
-            "AES67", 48_000.0, true, Ipv4Addr::new(239, 69, 0, 1), 5004);
+            Protocol::Aes67, 48_000.0, true, Ipv4Addr::new(239, 69, 0, 1), 5004);
         s.packets = 1;
         state.streams.insert("AES67 test-mc".to_string(), s);
     }
@@ -1897,9 +1895,9 @@ mod tests {
         let group_a = Ipv4Addr::new(239, 69, 0, 1);
         let group_b = Ipv4Addr::new(239, 69, 0, 2);
         state.streams.insert("AES67 a".into(),
-            StreamStats::new_with_info("AES67", 48_000.0, true, group_a, 5004));
+            StreamStats::new_with_info(Protocol::Aes67, 48_000.0, true, group_a, 5004));
         state.streams.insert("AES67 b".into(),
-            StreamStats::new_with_info("AES67", 48_000.0, true, group_b, 5004));
+            StreamStats::new_with_info(Protocol::Aes67, 48_000.0, true, group_b, 5004));
 
         let mut sa = sdp_for_port(5004, 96, 48_000.0);
         sa.session_id = "A".into();
@@ -2053,7 +2051,7 @@ mod tests {
         // CS5 = 40
         let pkt = ip_udp_rtp(40 << 2, 5004, 96, 0, 0, 0xAAAA);
         state.handle_st2110(Ipv4Addr::new(239, 1, 2, 3), 5004, St2110Type::Video, &pkt, None, Instant::now());
-        let s = state.streams.values().find(|s| s.protocol == "2110-20").expect("video stream");
+        let s = state.streams.values().find(|s| s.protocol == Protocol::St2110(St2110Type::Video)).expect("video stream");
         assert_eq!(s.dscp_violations, 0, "CS5 is valid for ST2110-20 video");
     }
 
@@ -2062,7 +2060,7 @@ mod tests {
         let mut state = CaptureState::new();
         let pkt = ip_udp_rtp(40 << 2, 5004, 96, 0, 0, 0xAAAA);
         state.handle_st2110(Ipv4Addr::new(239, 1, 2, 3), 5004, St2110Type::Audio, &pkt, None, Instant::now());
-        let s = state.streams.values().find(|s| s.protocol == "2110-30").expect("audio stream");
+        let s = state.streams.values().find(|s| s.protocol == Protocol::St2110(St2110Type::Audio)).expect("audio stream");
         assert_eq!(s.dscp_violations, 1, "audio requires EF only");
     }
 
@@ -2071,7 +2069,7 @@ mod tests {
         let mut state = CaptureState::new();
         let pkt = ip_udp_rtp(46 << 2, 5004, 96, 0, 0, 0xAAAA);
         state.handle_st2110(Ipv4Addr::new(239, 1, 2, 3), 5004, St2110Type::Video, &pkt, None, Instant::now());
-        let s = state.streams.values().find(|s| s.protocol == "2110-20").unwrap();
+        let s = state.streams.values().find(|s| s.protocol == Protocol::St2110(St2110Type::Video)).unwrap();
         assert!(s.clock_hz_confirmed, "video uses 90 kHz by spec, no SDP needed");
     }
 
@@ -2084,7 +2082,7 @@ mod tests {
         state.sdp_cache.insert("1".to_string(), sdp_for_port(5004, 96, 48_000.0));
         let pkt = ip_udp_rtp(46 << 2, 5004, 96, 0, 0, 0xAAAA);
         state.handle_st2110(Ipv4Addr::new(239, 1, 2, 3), 5004, St2110Type::Audio, &pkt, None, Instant::now());
-        let s = state.streams.values().find(|s| s.protocol == "2110-30").unwrap();
+        let s = state.streams.values().find(|s| s.protocol == Protocol::St2110(St2110Type::Audio)).unwrap();
         assert_eq!(s.channels, 2);
         assert_eq!(s.ptime_ms, 1.0);
         assert_eq!(s.sdp_name.as_deref(), Some("Test Mix"));
@@ -2511,7 +2509,7 @@ mod tests {
         state.dante.reset_window(&state.streams, Instant::now());
         // A stream from this source appears before the third silent window —
         // the counter must clear, not just stop incrementing.
-        let mut s = StreamStats::new_with_info("Dante", 48_000.0, false, Ipv4Addr::new(239,255,1,1), 5004);
+        let mut s = StreamStats::new_with_info(Protocol::Dante, 48_000.0, false, Ipv4Addr::new(239,255,1,1), 5004);
         s.src_ip = Some(src);
         state.streams.insert("Dante test".to_string(), s);
         state.dante.reset_window(&state.streams, Instant::now());
@@ -2748,7 +2746,7 @@ mod tests {
         state.check_filter_unregistered_multicast(); // cycle 1
         assert_eq!(state.filter_unregistered_suspect_cycles, 1);
         // A stream appears — condition clears.
-        state.streams.insert("test".to_string(), StreamStats::new("Dante", 1.0));
+        state.streams.insert("test".to_string(), StreamStats::new(Protocol::Dante, 1.0));
         state.check_filter_unregistered_multicast();
         assert_eq!(state.filter_unregistered_suspect_cycles, 0);
     }
@@ -2967,7 +2965,7 @@ mod tests {
         let ndi_ip = Ipv4Addr::new(192, 168, 1, 60);
         let other_host = Ipv4Addr::new(192, 168, 1, 5);
         state.streams.insert("NDI a".into(),
-            StreamStats::new_with_info("NDI", 0.0, false, ndi_ip, 0));
+            StreamStats::new_with_info(Protocol::Ndi, 0.0, false, ndi_ip, 0));
 
         let mut t1 = crate::stats::TcpStreamStats::new(ndi_ip, other_host);
         t1.bitrate_bps = 1_000_000;
@@ -2990,7 +2988,7 @@ mod tests {
         let unrelated_a = Ipv4Addr::new(192, 168, 1, 5);
         let unrelated_b = Ipv4Addr::new(192, 168, 1, 6);
         state.streams.insert("NDI a".into(),
-            StreamStats::new_with_info("NDI", 0.0, false, ndi_ip, 0));
+            StreamStats::new_with_info(Protocol::Ndi, 0.0, false, ndi_ip, 0));
 
         let mut unrelated = crate::stats::TcpStreamStats::new(unrelated_a, unrelated_b);
         unrelated.bitrate_bps = 9_999_999;
@@ -3007,7 +3005,7 @@ mod tests {
         let mut state = CaptureState::new();
         let ndi_ip = Ipv4Addr::new(192, 168, 1, 60);
         state.streams.insert("NDI a".into(),
-            StreamStats::new_with_info("NDI", 0.0, false, ndi_ip, 0));
+            StreamStats::new_with_info(Protocol::Ndi, 0.0, false, ndi_ip, 0));
 
         state.aggregate_ndi_bitrate();
 
@@ -3379,14 +3377,14 @@ mod tests {
 
     #[test]
     fn stream_clock_kind_matches_protocol_family() {
-        assert_eq!(stream_clock_kind("AES67"), Some(MissingClockKind::Ptpv2));
-        assert_eq!(stream_clock_kind("2110-20"), Some(MissingClockKind::Ptpv2));
-        assert_eq!(stream_clock_kind("2110-30"), Some(MissingClockKind::Ptpv2));
-        assert_eq!(stream_clock_kind("Dante"), Some(MissingClockKind::Ptp));
-        assert_eq!(stream_clock_kind("NDI"), None);
+        assert_eq!(stream_clock_kind(Protocol::Aes67), Some(MissingClockKind::Ptpv2));
+        assert_eq!(stream_clock_kind(Protocol::St2110(St2110Type::Video)), Some(MissingClockKind::Ptpv2));
+        assert_eq!(stream_clock_kind(Protocol::St2110(St2110Type::Audio)), Some(MissingClockKind::Ptpv2));
+        assert_eq!(stream_clock_kind(Protocol::Dante), Some(MissingClockKind::Ptp));
+        assert_eq!(stream_clock_kind(Protocol::Ndi), None);
         // AVB's gPTP requirement is derived from avtp_streams presence, not a
         // StreamStats protocol label — AVB frames never populate `self.streams`.
-        assert_eq!(stream_clock_kind("AVB"), None);
+        assert_eq!(stream_clock_kind(Protocol::Avb), None);
     }
 
     // ── handle_avb — sv=0 control frames must not become phantom streams ─────
@@ -3445,7 +3443,7 @@ mod tests {
     // ── Stream count anomaly detection ────────────────────────────────────
 
     fn add_rtp_stream(state: &mut CaptureState, key: &str) {
-        state.streams.insert(key.to_string(), StreamStats::new("AES67", 48_000.0));
+        state.streams.insert(key.to_string(), StreamStats::new(Protocol::Aes67, 48_000.0));
     }
 
     #[test]
@@ -3807,7 +3805,7 @@ mod tests {
     fn close_window_emits_ts_refclk_alert_to_output() {
         let mut state = CaptureState::new();
         let mut stream = StreamStats::new_with_info(
-            "AES67", 48_000.0, true, Ipv4Addr::new(239, 69, 0, 1), 5004);
+            Protocol::Aes67, 48_000.0, true, Ipv4Addr::new(239, 69, 0, 1), 5004);
         stream.packets = 10;
         state.streams.insert("s1".into(), stream);
         state.sdp_cache.insert("1".into(), SdpSession {
@@ -3845,7 +3843,7 @@ mod tests {
     fn reset_window_prunes_streams_by_synthetic_capture_time_gap() {
         let mut state = CaptureState::new();
         let t0 = Instant::now();
-        let mut s = StreamStats::new("AES67", 48_000.0);
+        let mut s = StreamStats::new(Protocol::Aes67, 48_000.0);
         s.last_packet_time = Some(t0);
         state.streams.insert("s1".into(), s);
 
@@ -3942,13 +3940,13 @@ mod tests {
     }
 
     fn dante_stream_with_loss() -> StreamStats {
-        let mut s = StreamStats::new("Dante", crate::protocols::DEFAULT_CLOCK_HZ);
+        let mut s = StreamStats::new(Protocol::Dante, crate::protocols::DEFAULT_CLOCK_HZ);
         s.lost_this_window = 1;
         s
     }
 
     fn aes67_stream_with_loss() -> StreamStats {
-        let mut s = StreamStats::new("AES67", 48_000.0);
+        let mut s = StreamStats::new(Protocol::Aes67, 48_000.0);
         s.lost_this_window = 1;
         s
     }
@@ -3973,7 +3971,7 @@ mod tests {
     fn clock_dropout_none_when_ptpv1_lost_but_no_stream_loss() {
         let mut state = CaptureState::new();
         state.ptp = lost_ptpv1_state();
-        let mut s = StreamStats::new("Dante", crate::protocols::DEFAULT_CLOCK_HZ);
+        let mut s = StreamStats::new(Protocol::Dante, crate::protocols::DEFAULT_CLOCK_HZ);
         s.lost_this_window = 0;
         state.streams.insert("Dante 1.2.3.4 → 5.6.7.8:5000".to_string(), s);
         assert!(state.check_clock_dropout_correlation().is_none());
@@ -4110,7 +4108,7 @@ mod tests {
         let mut state = CaptureState::new();
         let pkt = ip_udp_rtp(46 << 2, 5004, 96, 0, 0, 0xAAAA);
         state.handle_st2110(Ipv4Addr::new(239, 1, 2, 3), 5004, St2110Type::Audio, &pkt, Some(3), Instant::now());
-        let s = state.streams.values().find(|s| s.protocol == "2110-30").expect("stream");
+        let s = state.streams.values().find(|s| s.protocol == Protocol::St2110(St2110Type::Audio)).expect("stream");
         assert_eq!(s.pcp_violations, 1);
         assert_eq!(s.observed_pcp, Some(3));
     }

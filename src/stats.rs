@@ -5,13 +5,15 @@ use std::collections::HashMap;
 use std::net::Ipv4Addr;
 use std::time::{Duration, Instant};
 
+use crate::protocols::{Protocol, St2110Type};
+
 // ═════════════════════════════════════════════════════════════════
 // SECTION 2 — STREAM STATISTICS (RTP/AV/Audio)
 // ════════════════════════════════════════════════════════════════
 
 #[derive(Debug, Clone)]
 pub struct StreamStats {
-    pub protocol:          String,
+    pub protocol:          crate::protocols::Protocol,
     pub packets:           u64,
     pub lost_packets:      u64,
     pub last_seq:          Option<u16>,
@@ -103,9 +105,9 @@ pub struct StreamStats {
 }
 
 impl StreamStats {
-    pub fn new(protocol: &str, clock_hz: f64) -> Self {
+    pub fn new(protocol: crate::protocols::Protocol, clock_hz: f64) -> Self {
         Self {
-            protocol:            protocol.to_string(),
+            protocol,
             packets:             0,
             lost_packets:        0,
             last_seq:            None,
@@ -183,7 +185,7 @@ impl StreamStats {
         else { None }                      // ambiguous
     }
     // Constructor with enhanced info — useful when SDP is available at stream start
-    pub fn new_with_info(protocol: &str, clock_hz: f64, is_multicast: bool, dst_ip: Ipv4Addr, dst_port: u16) -> Self {
+    pub fn new_with_info(protocol: crate::protocols::Protocol, clock_hz: f64, is_multicast: bool, dst_ip: Ipv4Addr, dst_port: u16) -> Self {
         let mut stats = Self::new(protocol, clock_hz);
         stats.is_multicast = is_multicast;
         stats.dst_ip = Some(dst_ip);
@@ -464,19 +466,19 @@ impl StreamStats {
             }
         }
         if self.dscp_violations > 0 {
-            let expected = if self.protocol == "2110-20" { "EF (46), AF41 (34), or CS5 (40)" } else { "EF (46)" };
+            let expected = if self.protocol == Protocol::St2110(St2110Type::Video) { "EF (46), AF41 (34), or CS5 (40)" } else { "EF (46)" };
             d.push(StreamDiagnostic::DscpViolation { count: self.dscp_violations, expected });
         }
-        if self.protocol == "Dante" && self.min_ttl.is_some_and(|t| t < 64) {
+        if self.protocol == Protocol::Dante && self.min_ttl.is_some_and(|t| t < 64) {
             d.push(StreamDiagnostic::TtlRouted { ttl: self.min_ttl.unwrap() });
         }
         if self.jitter_ms() > 10.0 {
             d.push(StreamDiagnostic::HighJitter { jitter_ms: self.jitter_ms() });
         }
-        if self.protocol == "AES67" && self.jitter_ms() > 10.0 {
+        if self.protocol == Protocol::Aes67 && self.jitter_ms() > 10.0 {
             d.push(StreamDiagnostic::Aes67PtpLockHint);
         }
-        if self.protocol == "Dante" && (self.loss_pct() > 0.1 || self.jitter_ms() > 15.0) {
+        if self.protocol == Protocol::Dante && (self.loss_pct() > 0.1 || self.jitter_ms() > 15.0) {
             d.push(StreamDiagnostic::DanteClockOrSubscriptionHint);
         }
         if self.ssrc_changes > 0 {
@@ -485,12 +487,12 @@ impl StreamStats {
         if self.pt_mismatches > 0 {
             d.push(StreamDiagnostic::PtMismatch { count: self.pt_mismatches });
         }
-        let expects_sdp = (self.protocol == "AES67" || self.protocol == "Dante" || self.protocol.starts_with("2110-"))
+        let expects_sdp = (self.protocol == Protocol::Aes67 || self.protocol == Protocol::Dante || self.protocol.is_st2110())
             && self.rtp_seen;
         if expects_sdp && !self.clock_hz_confirmed && self.packets > 10 {
             d.push(StreamDiagnostic::NotAnnounced);
         }
-        if self.protocol == "2110-??" {
+        if self.protocol == Protocol::St2110(St2110Type::Unknown) {
             d.push(StreamDiagnostic::UnknownStreamType);
         }
         if self.gap_events >= 2 {
@@ -506,7 +508,7 @@ impl StreamStats {
         // `NetworkHealth::collect_penalties` and `report.rs`'s AVTP render block) —
         // no `StreamStats` entry with `protocol == "AVB"` is ever constructed, so
         // this diagnostic only applies to the AES67/ST2110 advisory.
-        if self.pcp_violations > 0 && (self.protocol == "AES67" || self.protocol.starts_with("2110-")) {
+        if self.pcp_violations > 0 && (self.protocol == Protocol::Aes67 || self.protocol.is_st2110()) {
             d.push(StreamDiagnostic::PcpAdvisory { observed: self.observed_pcp.unwrap_or(0) });
         }
 
@@ -1379,7 +1381,7 @@ mod tests {
     use super::*;
 
     fn aes67() -> StreamStats {
-        StreamStats::new("AES67", 48_000.0)
+        StreamStats::new(Protocol::Aes67, 48_000.0)
     }
 
     // ── Bitrate reflects the caller's clock, not wall time (issue #35) ───────
@@ -2042,7 +2044,7 @@ mod tests {
     #[test]
     fn informational_only_diagnostics_produce_no_penalty() {
         let health = NetworkHealth::new();
-        let mut s = StreamStats::new("2110-??", 90_000.0); // UnknownStreamType
+        let mut s = StreamStats::new(Protocol::St2110(St2110Type::Unknown), 90_000.0); // UnknownStreamType
         s.packets = 100;
         s.packets_this_window = 100;
         s.last_packet_time = Some(Instant::now());

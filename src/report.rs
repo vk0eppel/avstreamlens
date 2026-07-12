@@ -109,7 +109,7 @@ use std::time::Duration;
 
 use crate::stats::{AvdeccEntity, ConmonDevice, StreamDiagnostic, StreamStats, TcpStreamStats, PtpStats, NetworkHealth, StreamQuality, AvtpStreamStats};
 use crate::parser::{fmt_eui64, media_type_summary, sr_class_str};
-use crate::protocols::{STREAM_TIMEOUT_SECS, MsrpDeclaration, MsrpDeclType, PTP_VERSION_V1, TransmitterConfidence, TransmitterVerdict, avtp_subtype_name, msrp_failure_reason};
+use crate::protocols::{Protocol, STREAM_TIMEOUT_SECS, MsrpDeclaration, MsrpDeclType, PTP_VERSION_V1, TransmitterConfidence, TransmitterVerdict, avtp_subtype_name, msrp_failure_reason};
 use crate::capture::{Alert, emit as emit_alerts, MissingClock, MissingClockKind};
 
 /// Everything one report cycle (one Window) needs to render, gathered behind a
@@ -378,7 +378,7 @@ pub fn dante_tx_flow_count(
     device_ip: std::net::Ipv4Addr,
 ) -> usize {
     streams.values()
-        .filter(|s| s.protocol == "Dante" && s.src_ip == Some(device_ip))
+        .filter(|s| s.protocol == Protocol::Dante && s.src_ip == Some(device_ip))
         .count()
 }
 
@@ -706,11 +706,11 @@ fn render_streams(
     for key in keys {
         let s = &streams[key];
 
-        if s.protocol == "AVB" || s.protocol.starts_with("AVB ") { continue; }
+        if s.protocol == Protocol::Avb { continue; }
 
-        let proto_label = if s.protocol.starts_with("2110-") {
+        let proto_label = if s.protocol.is_st2110() {
             format!("ST{}", s.protocol)
-        } else if s.protocol == "AES67"
+        } else if s.protocol == Protocol::Aes67
             && s.src_ip.map(|ip| dante_sources.contains(&ip)).unwrap_or(false)
         {
             s.src_ip
@@ -718,7 +718,7 @@ fn render_streams(
                 .map(|n| format!("AES67 (Dante: \"{}\")", n))
                 .unwrap_or_else(|| "AES67 (Dante)".to_string())
         } else {
-            s.protocol.clone()
+            s.protocol.to_string()
         };
 
         let name_str = s.sdp_name.as_deref()
@@ -735,14 +735,14 @@ fn render_streams(
             None                       => String::new(),
         };
 
-        let multicast_tag = if s.protocol == "Dante" {
+        let multicast_tag = if s.protocol == Protocol::Dante {
             if s.is_multicast { "  [multicast]" } else { "  [unicast]" }
         } else { "" };
 
         let tx_tag = transmitter_tag(s.transmitter);
         lines.push(RenderedLine::plain(status_entry(&format!("▸ {}{}{}{}{}{}", proto_label, multicast_tag, name_str, codec_str, addr_str, tx_tag))));
 
-        if s.protocol == "NDI" {
+        if s.protocol == Protocol::Ndi {
             // Aggregate across ALL of this source's TCP connections: the
             // bitrate is already summed onto the stream entry by
             // aggregate_ndi_bitrate; retransmissions are summed here; quality
@@ -775,7 +775,7 @@ fn render_streams(
                     quality_str, s.bitrate_bps as f64 / 1_000_000.0, retrans))
             };
             lines.push(RenderedLine::plain(metrics));
-        } else if s.protocol == "Dante" && !s.rtp_seen {
+        } else if s.protocol == Protocol::Dante && !s.rtp_seen {
             lines.push(RenderedLine::plain(status_detail(&format!(
                 "{} pkts  |  {:.1} Mbps  (ATP framing — loss/jitter unavailable)",
                 s.packets, s.bitrate_bps as f64 / 1_000_000.0
@@ -790,7 +790,7 @@ fn render_streams(
         for diag in s.diagnostics(now) {
             // Suppress PacketLoss for clock-dependent protocols when the combined
             // clock-dropout alert already fired — avoids double-reporting.
-            let clock_proto = crate::capture::stream_clock_kind(&s.protocol).is_some();
+            let clock_proto = crate::capture::stream_clock_kind(s.protocol).is_some();
             if clock_dropout_correlated
                 && clock_proto
                 && matches!(diag, StreamDiagnostic::PacketLoss { .. })
@@ -891,7 +891,7 @@ fn render_network_status(inputs: &NetworkStatusInputs) -> Vec<RenderedLine> {
     lines.push(RenderedLine::plain(status_entry(&format!("Bandwidth: {:.1} Mbps (last 5s)", mbps))));
 
     let dscp_bad = streams.values().filter(|s| s.dscp_violations > 0).count();
-    let qos_str = if streams.values().all(|s| s.protocol == "NDI" || s.protocol == "AVB" || s.protocol.starts_with("AVB ")) {
+    let qos_str = if streams.values().all(|s| s.protocol == Protocol::Ndi || s.protocol == Protocol::Avb) {
         "QoS: – (no IP streams)".to_string()
     } else if dscp_bad == 0 {
         "QoS: ✓ all streams correctly marked".to_string()
@@ -1014,17 +1014,17 @@ pub fn print_report(snap: &ReportSnapshot, session: &mut ReportSession, logger: 
 
     let mbps = bytes_this_window as f64 * 8.0 / 5_000_000.0;
 
-    type ProtocolGroup = (&'static str, fn(&str) -> bool);
+    type ProtocolGroup = (&'static str, fn(Protocol) -> bool);
     let protocol_groups: &[ProtocolGroup] = &[
-        ("AES67",  |p| p == "AES67"),
-        ("ST2110", |p| p.starts_with("2110-")),
-        ("Dante",  |p| p == "Dante"),
-        ("NDI",    |p| p == "NDI"),
+        ("AES67",  |p| p == Protocol::Aes67),
+        ("ST2110", |p| p.is_st2110()),
+        ("Dante",  |p| p == Protocol::Dante),
+        ("NDI",    |p| p == Protocol::Ndi),
     ];
 
     let mut proto_parts: Vec<String> = protocol_groups.iter()
         .filter_map(|(label, matches)| {
-            let n = streams.values().filter(|s| matches(&s.protocol)).count();
+            let n = streams.values().filter(|s| matches(s.protocol)).count();
             if n > 0 { Some(format!("{}: {}", label, n)) } else { None }
         })
         .collect();
@@ -1094,8 +1094,8 @@ pub fn print_report(snap: &ReportSnapshot, session: &mut ReportSession, logger: 
     }
 
     // ── 3. Discovered (mDNS/ConMon) ────────────────────────────────────────
-    let dante_active = streams.values().filter(|s| s.protocol == "Dante").count();
-    let ndi_active   = streams.values().filter(|s| s.protocol == "NDI").count();
+    let dante_active = streams.values().filter(|s| s.protocol == Protocol::Dante).count();
+    let ndi_active   = streams.values().filter(|s| s.protocol == Protocol::Ndi).count();
     let discovery_inputs = DiscoveryInputs {
         dante_sources, dante_names, dante_conmon, dante_unverified,
         ndi_sources, ndi_names, dante_active, ndi_active, streams,
@@ -1202,7 +1202,7 @@ mod tests {
     use std::net::Ipv4Addr;
 
     fn dante_stream(src: Ipv4Addr, multicast: bool, atp: bool) -> StreamStats {
-        let mut s = StreamStats::new("Dante", 48_000.0);
+        let mut s = StreamStats::new(Protocol::Dante, 48_000.0);
         s.src_ip = Some(src);
         s.is_multicast = multicast;
         s.rtp_seen = !atp; // ATP flows never set rtp_seen
@@ -1258,7 +1258,7 @@ mod tests {
     fn tx_flow_count_ignores_non_dante_protocols() {
         let ip = Ipv4Addr::new(192, 168, 1, 45);
         let mut streams = HashMap::new();
-        let mut aes = StreamStats::new("AES67", 48_000.0);
+        let mut aes = StreamStats::new(Protocol::Aes67, 48_000.0);
         aes.src_ip = Some(ip);
         streams.insert("AES67 x".into(), aes);
         assert_eq!(dante_tx_flow_count(&streams, ip), 0, "only Dante flows count toward Dante budget");
@@ -1414,7 +1414,7 @@ mod tests {
         let ndi_ip = Ipv4Addr::new(192, 168, 1, 60);
         let peer = Ipv4Addr::new(192, 168, 1, 5);
         let mut streams = HashMap::new();
-        let mut s = StreamStats::new_with_info("NDI", 0.0, false, ndi_ip, 0);
+        let mut s = StreamStats::new_with_info(Protocol::Ndi, 0.0, false, ndi_ip, 0);
         s.bitrate_bps = 3_500_000; // aggregate_ndi_bitrate's sum of both connections
         s.last_packet_time = Some(std::time::Instant::now());
         streams.insert("NDI x".into(), s);
@@ -1561,8 +1561,8 @@ mod tests {
     #[test]
     fn qos_status_reads_no_ip_streams_when_all_ndi_or_avb() {
         let mut streams = HashMap::new();
-        streams.insert("NDI a".into(), StreamStats::new("NDI", 0.0));
-        streams.insert("AVB a".into(), StreamStats::new("AVB", 0.0));
+        streams.insert("NDI a".into(), StreamStats::new(Protocol::Ndi, 0.0));
+        streams.insert("AVB a".into(), StreamStats::new(Protocol::Avb, 0.0));
         let health = NetworkHealth::new();
 
         let lines = render_network_status(&network_status_inputs(&streams, &health, &HashMap::new()));
@@ -1574,7 +1574,7 @@ mod tests {
     #[test]
     fn qos_status_reads_all_correct_when_no_dscp_violations() {
         let mut streams = HashMap::new();
-        streams.insert("AES67 a".into(), StreamStats::new("AES67", 48_000.0));
+        streams.insert("AES67 a".into(), StreamStats::new(Protocol::Aes67, 48_000.0));
         let health = NetworkHealth::new();
 
         let lines = render_network_status(&network_status_inputs(&streams, &health, &HashMap::new()));
@@ -1586,7 +1586,7 @@ mod tests {
     #[test]
     fn qos_status_reports_violation_count() {
         let mut streams = HashMap::new();
-        let mut bad = StreamStats::new("AES67", 48_000.0);
+        let mut bad = StreamStats::new(Protocol::Aes67, 48_000.0);
         bad.dscp_violations = 3;
         streams.insert("AES67 a".into(), bad);
         let health = NetworkHealth::new();
@@ -1654,7 +1654,7 @@ mod tests {
         use crate::capture::CaptureState;
 
         let mut state = CaptureState::new();
-        state.streams.insert("s1".into(), StreamStats::new("AES67", 48_000.0));
+        state.streams.insert("s1".into(), StreamStats::new(Protocol::Aes67, 48_000.0));
         state.dante.sources.insert(Ipv4Addr::new(169, 254, 1, 1));
 
         let checks = state.end_of_window(&[], false, std::time::Instant::now());
