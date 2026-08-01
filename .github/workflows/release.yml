@@ -21,6 +21,15 @@ env:
   # this is pinned + checksummed rather than always fetching "latest".
   NPCAP_SDK_VERSION: "1.16"
   NPCAP_SDK_SHA256: "f0a8be7778ee3ae1b99bbbecb27a3ff0f6c111a4093f1c78c5c5a099607184db"
+  # The Linux release binary statically links libpcap so it has NO runtime
+  # dependency on a system libpcap (Fedora Atomic / Bazzite and other non-
+  # Debian distros don't ship it). Ubuntu's libpcap-dev only provides a shared
+  # .so, and the `pcap` crate links dynamically by default, so we build a
+  # static libpcap.a from source here. Pinned + checksummed like the Npcap SDK.
+  # Bump both together; checksum is `sha256sum libpcap-<ver>.tar.xz` from
+  # https://www.tcpdump.org/release/.
+  LIBPCAP_VERSION: "1.10.5"
+  LIBPCAP_SHA256: "84fa89ac6d303028c1c5b754abff77224f45eca0a94eb1a34ff0aa9ceece3925"
 
 jobs:
   verify-version:
@@ -66,9 +75,35 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
-      - name: Install libpcap (Linux)
+      - name: Build static libpcap (Linux)
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libpcap-dev
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          # flex/bison build libpcap's BPF filter compiler; gcc + make already
+          # present on the runner. We deliberately do NOT install libpcap-dev —
+          # a system libpcap.so in the link path could be picked up instead of
+          # our static archive.
+          sudo apt-get install -y --no-install-recommends flex bison
+          url="https://www.tcpdump.org/release/libpcap-${LIBPCAP_VERSION}.tar.xz"
+          curl -fsSL -o libpcap.tar.xz "$url"
+          echo "${LIBPCAP_SHA256}  libpcap.tar.xz" | sha256sum -c -
+          tar xf libpcap.tar.xz
+          cd "libpcap-${LIBPCAP_VERSION}"
+          # --disable-shared → only libpcap.a is produced, so the linker has no
+          # .so to prefer. Disable the optional backends so the static archive
+          # doesn't drag in libdbus/libnl/libibverbs/etc. transitive .so deps.
+          ./configure --prefix="$HOME/libpcap-static" \
+            --disable-shared --disable-dbus --disable-rdma \
+            --disable-bluetooth --disable-usb --without-libnl
+          make -j"$(nproc)"
+          make install
+          # Point the `pcap` crate's build.rs at the dir holding only libpcap.a.
+          # With LIBPCAP_LIBDIR set it skips pkg-config, adds this dir to the
+          # link search path, and `-lpcap` resolves to the static archive.
+          echo "LIBPCAP_LIBDIR=$HOME/libpcap-static/lib" >> "$GITHUB_ENV"
+          echo "LIBPCAP_VER=${LIBPCAP_VERSION}" >> "$GITHUB_ENV"
 
       # macOS runners already ship libpcap headers via the Xcode Command
       # Line Tools SDK — no install step needed, for either Darwin target.
@@ -90,12 +125,21 @@ jobs:
           echo "LIB=$env:LIB;$sdkDir\Lib\x64" >> $env:GITHUB_ENV
 
       - name: Build
-        env:
-          # Statically link libpcap on Linux and macOS so the binary has no
-          # runtime dependency on the system libpcap. Not set for Windows —
-          # Npcap is a kernel driver/DLL and cannot be statically linked.
-          LIBPCAP_STATIC: ${{ runner.os != 'Windows' && '1' || '' }}
         run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Verify no dynamic libpcap dependency (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin="target/${{ matrix.target }}/release/avstreamlens"
+          if ldd "$bin" | grep -qi pcap; then
+            echo "::error::Release binary still dynamically links libpcap — static link failed:"
+            ldd "$bin" | grep -i pcap
+            exit 1
+          fi
+          echo "OK: libpcap is statically linked (no libpcap.so dependency)"
+          ldd "$bin" || true
 
       - name: Package (macOS / Linux)
         if: runner.os != 'Windows'
