@@ -62,7 +62,7 @@ The prebuilt **Linux and macOS** binaries are self-contained — no libpcap inst
 |---|---|
 | **Linux** (x86_64) | **Nothing.** libpcap is statically linked into the binary — it depends only on the system C library (glibc ≥ 2.35, i.e. any distro from ~2022 onward). Runs as-is on immutable/atomic distros (Fedora Silverblue, Bazzite, …) with no package layering. |
 | **macOS** (Apple Silicon / Intel) | **Nothing.** The binary links the libpcap, libiconv, and system frameworks that ship with every macOS. |
-| **Windows** (x86_64) | **[Npcap](https://npcap.com)** — the packet-capture driver (the same one Wireshark uses). During installation, enable **"Install Npcap in WinPcap API-compatible mode"**. If launching fails with a missing `VCRUNTIME140.dll`, also install the [Microsoft Visual C++ Redistributable](https://aka.ms/vs/17/release/vc_redist.x64.exe) (already present on most systems). |
+| **Windows** (x86_64) | **[Npcap](https://npcap.com)** — the packet-capture driver (the same one Wireshark uses), and the only dependency. During installation, enable **"Install Npcap in WinPcap API-compatible mode"**. (The C runtime is statically linked, so no Visual C++ Redistributable is needed.) |
 
 Capturing live packets requires elevated privileges — run with `sudo` on macOS/Linux, or as **Administrator** on Windows. Offline replay (`--read`) needs no privileges.
 
