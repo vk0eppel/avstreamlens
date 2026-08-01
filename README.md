@@ -46,7 +46,7 @@ cd avstreamlens-<version>-x86_64-pc-windows-msvc
 .\avstreamlens.exe
 ```
 
-You still need the runtime capture library installed regardless of how you got the binary — see [Prerequisites](#prerequisites) below.
+The prebuilt **Linux and macOS** binaries are self-contained — no libpcap install needed. The **Windows** binary needs Npcap installed. See [Prerequisites](#prerequisites) below.
 
 **Unsigned binary — v1 releases are not code-signed or notarized.** Your OS will warn you the first time you run it:
 - **macOS (Gatekeeper):** right-click the binary → *Open* → confirm in the dialog, or run `xattr -d com.apple.quarantine ./avstreamlens` once to clear the quarantine flag.
@@ -56,23 +56,23 @@ You still need the runtime capture library installed regardless of how you got t
 
 ## Prerequisites
 
-These are needed whether you downloaded a binary above or are building from source.
+### If you downloaded a prebuilt binary
 
-**macOS**
-```
-brew install libpcap   # usually already present
-```
+| OS | What you need to install |
+|---|---|
+| **Linux** (x86_64) | **Nothing.** libpcap is statically linked into the binary — it depends only on the system C library (glibc ≥ 2.35, i.e. any distro from ~2022 onward). Runs as-is on immutable/atomic distros (Fedora Silverblue, Bazzite, …) with no package layering. |
+| **macOS** (Apple Silicon / Intel) | **Nothing.** The binary links the libpcap, libiconv, and system frameworks that ship with every macOS. |
+| **Windows** (x86_64) | **[Npcap](https://npcap.com)** — the packet-capture driver (the same one Wireshark uses). During installation, enable **"Install Npcap in WinPcap API-compatible mode"**. If launching fails with a missing `VCRUNTIME140.dll`, also install the [Microsoft Visual C++ Redistributable](https://aka.ms/vs/17/release/vc_redist.x64.exe) (already present on most systems). |
 
-**Linux**
-```
-sudo apt install libpcap-dev
-```
+Capturing live packets requires elevated privileges — run with `sudo` on macOS/Linux, or as **Administrator** on Windows. Offline replay (`--read`) needs no privileges.
 
-**Windows**
+### If you're building from source
 
-Install [Npcap](https://npcap.com) (the modern WinPcap replacement). During installation, enable **"Install Npcap in WinPcap API-compatible mode"**.
+You additionally need libpcap's **development headers** (the prebuilt binaries don't, but the compiler does):
 
-Capturing packets requires elevated privileges — run as `sudo` on macOS/Linux, or as **Administrator** on Windows.
+- **macOS:** `brew install libpcap` (usually already present via the Xcode Command Line Tools)
+- **Linux (Debian/Ubuntu):** `sudo apt install libpcap-dev`
+- **Windows:** the Npcap **SDK** — see [Build](#build) below.
 
 ---
 
@@ -421,7 +421,8 @@ The health percentage reflects the overall network quality. Factors that reduce 
 
 ## Platform Notes
 
-- **macOS and Linux** — requires libpcap
+- **Linux** — prebuilt binary is self-contained (libpcap statically linked; needs only glibc ≥ 2.35). Building from source needs `libpcap-dev`
+- **macOS** — uses the libpcap that ships with the OS; no install needed for the prebuilt binary
 - **Windows** — requires [Npcap](https://npcap.com); run as Administrator; colour output requires Windows Terminal or VS Code (not supported in classic `cmd.exe`)
 - Loopback (`lo`/`lo0`) is excluded — macOS loopback uses a non-Ethernet link layer incompatible with the packet parser
 - Promiscuous mode is enabled automatically on the selected interface
