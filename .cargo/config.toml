@@ -1,0 +1,10 @@
+# Statically link the MSVC C runtime into the Windows binary so it does not
+# depend on VCRUNTIME140.dll (the Visual C++ Redistributable, which is not
+# guaranteed to be present on a fresh Windows install). This leaves Npcap
+# (wpcap.dll) as the only runtime dependency of the released Windows binary —
+# same requirement as Wireshark. wpcap.dll stays dynamic (it's the capture
+# driver); only the CRT is baked in.
+#
+# Scoped to the MSVC target: Linux/macOS builds are unaffected.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
