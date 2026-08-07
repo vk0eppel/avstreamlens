@@ -15,6 +15,14 @@
 //   [4-5]    u16 BE sequence number, monotonic per device
 //   [8-15]   sender identity — 8 bytes; see below for the two wire formats seen
 //   [16-23]  ASCII "Audinate" — protocol signature
+//   [24-25]  sub-header (byte 24 = 0x07 on metering, 0x00 on status; byte 25 varies)
+//   [26-27]  u16 BE message class. Observed 0x1002 = metering (8705), 0x0001 =
+//            status (8702/8708) — stable within a message type, differs across
+//            types. Confirmed from a live 8705+8702+8708 capture (2026-06-15),
+//            cross-referenced against the Yamaha DM7 naio-dante `conmon_cmm`
+//            binary's `size=0x%04x class=0x%04x` log format. Gates the metering
+//            channel-count path so a stray "MBC" in a status frame can't yield a
+//            bogus count.
 //
 // Sender identity at [8-15] has two observed encodings, and which one a device
 // uses is per-firmware, not per-vendor — a live 14-device capture (2026-07-04)
@@ -36,10 +44,17 @@
 // the channel count at [0x44], and one meter byte per channel from [0x47].
 // The meter byte scale/encoding is unverified — only the count is extracted.
 
+/// ConMon message class at payload[26..28] (BE). Observed values from a live
+/// capture: metering frames (port 8705) carry `0x1002`, status frames (8702/8708)
+/// carry `0x0001`. Not an exhaustive enum — only the classes seen on-wire.
+pub const CONMON_CLASS_METERING: u16 = 0x1002;
+
 /// Fields extracted from a validated ConMon frame.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ConmonInfo {
     pub device_mac: [u8; 6],
+    /// ConMon message class (payload[26..28], BE) — see [`CONMON_CLASS_METERING`].
+    pub message_class: u16,
     /// Channel count from a metering ("MBC") frame; None for other message types.
     pub channels: Option<u8>,
 }
@@ -58,6 +73,11 @@ pub fn parse_conmon(payload: &[u8]) -> Option<ConmonInfo> {
     if declared_len < 24 || declared_len > payload.len() {
         return None;
     }
+
+    let message_class = payload
+        .get(26..28)
+        .map(|b| u16::from_be_bytes([b[0], b[1]]))
+        .unwrap_or(0);
 
     let identity = &payload[8..16];
     let device_mac = if identity[3] == 0xff && identity[4] == 0xfe {
@@ -80,13 +100,16 @@ pub fn parse_conmon(payload: &[u8]) -> Option<ConmonInfo> {
     // not the channel count. Suppress rather than display a wrong value.
     let mbc_mac_matches = payload.get(0x30..0x36)
         .is_some_and(|m| m == device_mac);
-    let channels = (payload.get(0x2a..0x2d) == Some(&b"MBC"[..]) && mbc_mac_matches)
+    let channels = (message_class == CONMON_CLASS_METERING
+        && payload.get(0x2a..0x2d) == Some(&b"MBC"[..])
+        && mbc_mac_matches)
         .then(|| payload.get(0x44).copied())
         .flatten()
         .filter(|&c| c > 0 && 0x47 + c as usize <= declared_len);
 
     Some(ConmonInfo {
         device_mac,
+        message_class,
         channels,
     })
 }
@@ -130,11 +153,55 @@ mod tests {
     fn metering_frame_extracts_mac_and_channel_count() {
         let info = parse_conmon(&metering_frame()).expect("valid ConMon frame");
         assert_eq!(info.device_mac, [0x00, 0x1d, 0xc1, 0x19, 0x86, 0x2a]);
+        assert_eq!(info.message_class, CONMON_CLASS_METERING, "8705 metering class is 0x1002");
         assert_eq!(
             info.channels,
             Some(32),
             "channel count byte at 0x44 is 0x20"
         );
+    }
+
+    /// The exact 172-byte ConMon **status** payload captured on-wire (2026-06-15,
+    /// `pcapdanteTHV`) from 169.254.142.19:8700 → 224.0.0.233:8708 — a different
+    /// message family from metering. Message class is 0x0001 (not 0x1002); the
+    /// body is a TLV chain (0x8001, 0x8002, … type tags), not an MBC meter block.
+    fn status_frame_8708_real() -> Vec<u8> {
+        vec![
+            0xff, 0xfe, 0x00, 0xac, 0x24, 0x74, 0x00, 0x00, 0x00, 0x1d, 0xc1, 0xff, 0xfe, 0x80,
+            0x13, 0x8d, 0x41, 0x75, 0x64, 0x69, 0x6e, 0x61, 0x74, 0x65, 0x00, 0x08, 0x00, 0x01,
+            0x10, 0x00, 0x00, 0x00, 0x00, 0x10, 0x80, 0x01, 0x00, 0x04, 0x00, 0x04, 0x18, 0x9b,
+            0x00, 0x00, 0x00, 0x00, 0x3f, 0x35, 0x00, 0x24, 0x80, 0x00, 0x00, 0x04, 0x00, 0x04,
+            0x18, 0x9b, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0x01, 0x00, 0x10, 0x00, 0x00,
+            0x03, 0xfc, 0x00, 0x00, 0x5a, 0x57, 0x00, 0x00, 0x00, 0x99, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x1c, 0x80, 0x02, 0x00, 0x04, 0x00, 0x10, 0x18, 0x9b, 0x00, 0x00, 0x00, 0x02,
+            0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x18, 0x00, 0x00, 0xfe, 0xfe, 0xfd, 0xfd,
+            0x00, 0x20, 0x80, 0x03, 0x00, 0x04, 0x00, 0x14, 0x18, 0x9b, 0x00, 0x00, 0x00, 0x02,
+            0x00, 0x00, 0x00, 0x18, 0x00, 0x00, 0x00, 0x00, 0xbb, 0x80, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x1c, 0x80, 0x04, 0x00, 0x04, 0x00, 0x10, 0x18, 0x9b,
+            0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x14, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+        ]
+    }
+
+    #[test]
+    fn status_frame_has_status_class_and_no_channel_count() {
+        let info = parse_conmon(&status_frame_8708_real()).expect("valid ConMon status frame");
+        assert_eq!(info.device_mac, [0x00, 0x1d, 0xc1, 0x80, 0x13, 0x8d]);
+        assert_eq!(info.message_class, 0x0001, "8708 status class is 0x0001, not metering");
+        assert_eq!(info.channels, None, "status frame carries no MBC meter block");
+    }
+
+    #[test]
+    fn metering_class_gate_suppresses_channel_count_on_non_metering_frame() {
+        // A status-class frame that nonetheless contains the bytes "MBC" + a
+        // matching MAC at the metering offsets must NOT yield a channel count —
+        // the message-class gate (0x1002) is what distinguishes metering.
+        let mut p = metering_frame(); // has real MBC block + class 0x1002
+        p[26] = 0x00;
+        p[27] = 0x01; // rewrite class to status
+        let info = parse_conmon(&p).expect("still a valid ConMon frame");
+        assert_eq!(info.message_class, 0x0001);
+        assert_eq!(info.channels, None, "non-metering class must gate out the MBC count");
     }
 
     #[test]
