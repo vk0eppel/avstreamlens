@@ -315,12 +315,12 @@ impl DanteState {
     pub fn check_follower_census(&self, ptp: &PtpState) -> Vec<Alert> {
         let total   = self.sources.len();
         let syncing = ptp.v1_followers.len();
-        let has_ptpv1 = ptp.domains.keys().any(|(_, v)| *v == crate::protocols::PTP_VERSION_V1);
+        let has_ptpv1 = ptp.domains.keys().any(|(_, v, _)| *v == crate::protocols::PTP_VERSION_V1);
         if !has_ptpv1 || total < 2 || syncing == 0 {
             return vec![];
         }
         let gm_ip: Option<Ipv4Addr> = ptp.domains.iter()
-            .filter(|((_, v), _)| *v == crate::protocols::PTP_VERSION_V1)
+            .filter(|((_, v, _), _)| *v == crate::protocols::PTP_VERSION_V1)
             .filter_map(|(_, stats)| stats.grandmaster_src_ip)
             .next();
         let mut candidates: Vec<Ipv4Addr> = self.sources.iter()
@@ -529,12 +529,12 @@ impl Default for AvbState {
     fn default() -> Self { Self::new() }
 }
 
-/// PTP-specific substate: domains keyed by (domain, version) — separates
-/// Dante PTPv1 from AES67/ST2110 PTPv2 on the same domain number — plus the
-/// PTPv1 Delay_Req follower census used to detect Dante devices that have
-/// stopped syncing.
+/// PTP-specific substate: domains keyed by (domain, version, is_l2) —
+/// separates UDP PTPv2 (AES67/ST2110) from L2 gPTP (AVB) when both use domain
+/// zero, as well as separating Dante PTPv1. Includes the PTPv1 Delay_Req
+/// follower census used to detect Dante devices that have stopped syncing.
 pub struct PtpState {
-    pub domains:     HashMap<(u8, u8), PtpStats>,
+    pub domains:     HashMap<(u8, u8, bool), PtpStats>,
     pub v1_followers: HashMap<Ipv4Addr, Instant>,
 }
 
@@ -890,7 +890,7 @@ impl CaptureState {
         vec![]
     }
 
-    /// PTP: update the (domain, version) entry, return Detected/Changed alert if any.
+    /// PTP: update the (domain, version, transport) entry, return Detected/Changed alert if any.
     pub fn handle_ptp(&mut self, info: PtpInfo, now: Instant) -> Vec<Alert> {
         // PTPv1 Delay_Req (msg 0x01) — sender is a clock follower.
         if info.version == crate::protocols::PTP_VERSION_V1
@@ -902,8 +902,9 @@ impl CaptureState {
 
         let kind   = info.protocol_kind.clone();
         let src_ip = info.src_ip;
+        let is_l2  = src_ip.is_none();
         let stats  = self.ptp.domains
-            .entry((info.domain, info.version))
+            .entry((info.domain, info.version, is_l2))
             .or_insert_with(|| PtpStats::new(info.domain, info.version));
         let event  = stats.update(&info, &kind, now);
         let ip_str = src_ip.map(|ip| format!("  ({})", ip)).unwrap_or_default();
@@ -1660,8 +1661,8 @@ impl CaptureState {
             for m in &sdp.media {
                 if m.ts_refclk.is_empty() { continue; }
                 let Some((claimed_gm, claimed_domain)) = crate::parser::parse_ts_refclk(&m.ts_refclk) else { continue };
-                let entry = self.ptp.domains.get(&(claimed_domain, crate::protocols::PTP_VERSION_V2))
-                    .or_else(|| self.ptp.domains.get(&(claimed_domain, crate::protocols::PTP_VERSION_V1)));
+                let entry = self.ptp.domains.get(&(claimed_domain, crate::protocols::PTP_VERSION_V2, false))
+                    .or_else(|| self.ptp.domains.get(&(claimed_domain, crate::protocols::PTP_VERSION_V1, false)));
                 match entry {
                     None => {
                         alerts.push(Alert::warn(format!(
@@ -2815,7 +2816,7 @@ mod tests {
 
     fn make_ptpv1_domain(state: &mut CaptureState) {
         use crate::protocols::PTP_VERSION_V1;
-        state.ptp.domains.insert((0, PTP_VERSION_V1), {
+        state.ptp.domains.insert((0, PTP_VERSION_V1, false), {
             let mut s = crate::stats::PtpStats::new(0, PTP_VERSION_V1);
             s.clock_valid = true;
             s
@@ -3254,7 +3255,7 @@ mod tests {
     fn ptp_ok_when_aes67_stream_and_ptpv2_clock_present() {
         let mut state = CaptureState::new();
         seed_aes67_stream(&mut state);
-        state.ptp.domains.insert((0, PTP_VERSION_V2), valid_ptp_stats(PTP_VERSION_V2, "PTPv2"));
+        state.ptp.domains.insert((0, PTP_VERSION_V2, false), valid_ptp_stats(PTP_VERSION_V2, "PTPv2"));
         assert!(state.missing_ptp_clocks(&[ProtocolChoice::AES67]).is_empty());
     }
 
@@ -3270,7 +3271,7 @@ mod tests {
         // AES67 requires PTPv2 — a PTPv1 clock is not sufficient.
         let mut state = CaptureState::new();
         seed_aes67_stream(&mut state);
-        state.ptp.domains.insert((0, PTP_VERSION_V1), valid_ptp_stats(PTP_VERSION_V1, "PTPv1"));
+        state.ptp.domains.insert((0, PTP_VERSION_V1, false), valid_ptp_stats(PTP_VERSION_V1, "PTPv1"));
         assert!(!state.missing_ptp_clocks(&[ProtocolChoice::AES67]).is_empty());
     }
 
@@ -3279,7 +3280,7 @@ mod tests {
         // Dante accepts either PTPv1 or PTPv2.
         let mut state = CaptureState::new();
         state.handle_dante(DanteKind::AudioStream, Ipv4Addr::new(192,168,1,10), Ipv4Addr::new(192,168,1,60), 5004, &[], Instant::now());
-        state.ptp.domains.insert((0, PTP_VERSION_V1), valid_ptp_stats(PTP_VERSION_V1, "PTPv1"));
+        state.ptp.domains.insert((0, PTP_VERSION_V1, false), valid_ptp_stats(PTP_VERSION_V1, "PTPv1"));
         assert!(state.missing_ptp_clocks(&[ProtocolChoice::Dante]).is_empty());
     }
 
@@ -3290,7 +3291,7 @@ mod tests {
         // source" because needs_gptp was true based on selection alone.
         let mut state = CaptureState::new();
         seed_aes67_stream(&mut state);
-        state.ptp.domains.insert((0, PTP_VERSION_V2), valid_ptp_stats(PTP_VERSION_V2, "PTPv2"));
+        state.ptp.domains.insert((0, PTP_VERSION_V2, false), valid_ptp_stats(PTP_VERSION_V2, "PTPv2"));
         let expanded = ProtocolChoice::All.includes();
         assert!(state.missing_ptp_clocks(&expanded).is_empty());
     }
@@ -3301,7 +3302,7 @@ mod tests {
         // Seed an AVTP stream so the "observed" gate fires.
         state.handle_avb(0x00, Some([1,2,3,4,5,6,7,8]), 100, Some(0), None, Instant::now());
         // UDP PTPv2 is present but L2 gPTP (protocol_kind="AVB") is not.
-        state.ptp.domains.insert((0, PTP_VERSION_V2), valid_ptp_stats(PTP_VERSION_V2, "PTPv2"));
+        state.ptp.domains.insert((0, PTP_VERSION_V2, false), valid_ptp_stats(PTP_VERSION_V2, "PTPv2"));
         assert!(!state.missing_ptp_clocks(&[ProtocolChoice::AVB]).is_empty());
     }
 
@@ -3309,7 +3310,7 @@ mod tests {
     fn ptp_ok_for_avb_with_l2_gptp() {
         let mut state = CaptureState::new();
         state.handle_avb(0x00, Some([1,2,3,4,5,6,7,8]), 100, Some(0), None, Instant::now());
-        state.ptp.domains.insert((0, PTP_VERSION_V2), valid_ptp_stats(PTP_VERSION_V2, "AVB"));
+        state.ptp.domains.insert((0, PTP_VERSION_V2, true), valid_ptp_stats(PTP_VERSION_V2, "AVB"));
         assert!(state.missing_ptp_clocks(&[ProtocolChoice::AVB]).is_empty());
     }
 
@@ -3365,7 +3366,7 @@ mod tests {
         // PTPv1/PTPv2 on the IP network, so the gPTP clock must not satisfy it.
         let mut state = CaptureState::new();
         state.handle_dante(DanteKind::AudioStream, Ipv4Addr::new(192,168,1,50), Ipv4Addr::new(192,168,1,60), 5004, &[], Instant::now());
-        state.ptp.domains.insert((0, PTP_VERSION_V2), valid_ptp_stats(PTP_VERSION_V2, "AVB"));
+        state.ptp.domains.insert((0, PTP_VERSION_V2, true), valid_ptp_stats(PTP_VERSION_V2, "AVB"));
         let missing = state.missing_ptp_clocks(&[ProtocolChoice::Dante]);
         assert!(missing.iter().any(|m| m.kind == MissingClockKind::Ptp && m.affected == vec!["Dante"]),
             "AVB gPTP must not satisfy Dante's clock requirement");
@@ -3376,7 +3377,7 @@ mod tests {
         let mut state = CaptureState::new();
         state.handle_avb(0x00, Some([1,2,3,4,5,6,7,8]), 100, Some(0), None, Instant::now());
         // UDP PTPv2 present but no L2 gPTP — AVB still affected.
-        state.ptp.domains.insert((0, PTP_VERSION_V2), valid_ptp_stats(PTP_VERSION_V2, "PTPv2"));
+        state.ptp.domains.insert((0, PTP_VERSION_V2, false), valid_ptp_stats(PTP_VERSION_V2, "PTPv2"));
         let missing = state.missing_ptp_clocks(&[ProtocolChoice::AVB]);
         assert_eq!(missing.len(), 1);
         assert_eq!(missing[0].kind, MissingClockKind::Gptp);
@@ -3537,7 +3538,7 @@ mod tests {
             sequence_id: 0,
             log_sync_interval: 0,
             protocol_kind: Some("PTPv2".to_string()),
-            src_ip: None,
+            src_ip: Some(Ipv4Addr::new(192, 0, 2, 1)),
             stratum: None,
         }
     }
@@ -3606,7 +3607,7 @@ mod tests {
         state.handle_ptp(delay_resp(0, 500), Instant::now());
         state.handle_ptp(delay_resp(0, 1200), Instant::now());
         state.handle_ptp(delay_resp(0, 800), Instant::now());
-        let stats = state.ptp.domains.get(&(0, PTP_VERSION_V2)).expect("entry created");
+        let stats = state.ptp.domains.get(&(0, PTP_VERSION_V2, false)).expect("entry created");
         assert_eq!(stats.min_path_delay_ns, Some(500));
         assert_eq!(stats.max_path_delay_ns, Some(1200));
     }
@@ -3623,13 +3624,41 @@ mod tests {
         announce.path_delay_ns = None; // Announce doesn't carry path delay
         state.handle_ptp(announce.clone(), Instant::now());
         // Sanity: path delay still set from the earlier Delay_Resp.
-        assert!(state.ptp.domains.get(&(0, PTP_VERSION_V2)).unwrap().min_path_delay_ns.is_some());
+        assert!(state.ptp.domains.get(&(0, PTP_VERSION_V2, false)).unwrap().min_path_delay_ns.is_some());
 
         announce.grandmaster_id = Some("gm-B".to_string());
         state.handle_ptp(announce, Instant::now());
-        let stats = state.ptp.domains.get(&(0, PTP_VERSION_V2)).unwrap();
+        let stats = state.ptp.domains.get(&(0, PTP_VERSION_V2, false)).unwrap();
         assert_eq!(stats.min_path_delay_ns, None, "GM change should clear path-delay history");
         assert_eq!(stats.max_path_delay_ns, None);
+    }
+
+    #[test]
+    fn gptp_and_udp_ptpv2_same_domain_keep_separate_clock_state() {
+        let mut state = CaptureState::new();
+        let now = Instant::now();
+        seed_aes67_stream(&mut state);
+        state.handle_avb(0x00, Some([1, 2, 3, 4, 5, 6, 7, 8]), 100, Some(0), None, now);
+
+        let mut gptp = ptp_msg(0x0B, Some("02:00:00:00:00:01"));
+        gptp.grandmaster_id = Some("02:00:00:00:00:01".to_string());
+
+        let mut udp_ptp = ptp_msg(0x0B, Some("02:00:00:00:00:02"));
+        udp_ptp.protocol_kind = Some("PTPv2".to_string());
+        udp_ptp.src_ip = Some(Ipv4Addr::new(192, 0, 2, 2));
+        udp_ptp.grandmaster_id = Some("02:00:00:00:00:02".to_string());
+
+        assert_eq!(state.handle_ptp(gptp.clone(), now).len(), 1);
+        assert_eq!(state.handle_ptp(udp_ptp.clone(), now).len(), 1);
+        assert!(state.handle_ptp(gptp, now).is_empty());
+        assert!(state.handle_ptp(udp_ptp, now).is_empty());
+        assert_eq!(state.ptp.domains.len(), 2);
+
+        assert_eq!(state.ptp.domains.get(&(0, PTP_VERSION_V2, true))
+            .and_then(|s| s.last_grandmaster.as_deref()), Some("02:00:00:00:00:01"));
+        assert_eq!(state.ptp.domains.get(&(0, PTP_VERSION_V2, false))
+            .and_then(|s| s.last_grandmaster.as_deref()), Some("02:00:00:00:00:02"));
+        assert!(state.missing_ptp_clocks(&ProtocolChoice::All.includes()).is_empty());
     }
 
     #[test]
@@ -3936,7 +3965,7 @@ mod tests {
         let mut stats = PtpStats::new(0, PTP_VERSION_V1);
         stats.protocol_clock_lost = true;
         stats.protocol_kind = Some("PTPv1".to_string());
-        ps.domains.insert((0, PTP_VERSION_V1), stats);
+        ps.domains.insert((0, PTP_VERSION_V1, false), stats);
         ps
     }
 
@@ -3945,7 +3974,7 @@ mod tests {
         let mut stats = PtpStats::new(0, PTP_VERSION_V2);
         stats.protocol_clock_lost = true;
         stats.protocol_kind = Some("PTPv2".to_string());
-        ps.domains.insert((0, PTP_VERSION_V2), stats);
+        ps.domains.insert((0, PTP_VERSION_V2, false), stats);
         ps
     }
 
@@ -3993,7 +4022,7 @@ mod tests {
         let mut stats = PtpStats::new(0, PTP_VERSION_V1);
         stats.clock_valid = true;
         stats.protocol_clock_lost = false;
-        state.ptp.domains.insert((0, PTP_VERSION_V1), stats);
+        state.ptp.domains.insert((0, PTP_VERSION_V1, false), stats);
         state.streams.insert("Dante 1.2.3.4 → 5.6.7.8:5000".to_string(), dante_stream_with_loss());
         assert!(state.check_clock_dropout_correlation().is_none());
     }
@@ -4132,4 +4161,3 @@ mod tests {
         assert_eq!(s.pcp_violations, 0);
     }
 }
-

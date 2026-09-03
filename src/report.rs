@@ -128,7 +128,7 @@ use crate::capture::{Alert, emit as emit_alerts, MissingClock, MissingClockKind}
 pub struct ReportSnapshot<'a> {
     pub streams:        &'a HashMap<String, StreamStats>,
     pub tcp_streams:    &'a HashMap<String, TcpStreamStats>,
-    pub ptp_domains:    &'a HashMap<(u8, u8), PtpStats>,
+    pub ptp_domains:    &'a HashMap<(u8, u8, bool), PtpStats>,
     pub missing_ptp:    &'a [MissingClock],
     pub health:         &'a NetworkHealth,
     pub bytes_this_window: u64,
@@ -554,7 +554,7 @@ fn render_avdecc_entities(entities: &HashMap<[u8; 8], AvdeccEntity>) -> Vec<Rend
 /// rendered report line) and already follow their own return-data-emit-later
 /// pattern, so this function doesn't fold them into `RenderedLine`.
 fn render_clock_sources(
-    ptp_domains: &HashMap<(u8, u8), PtpStats>,
+    ptp_domains: &HashMap<(u8, u8, bool), PtpStats>,
     missing_ptp: &[MissingClock],
     dante_names: &HashMap<Ipv4Addr, String>,
     clock_dropout_correlated: bool,
@@ -566,7 +566,7 @@ fn render_clock_sources(
     let mut lines = Vec::new();
     let multi_domain = ptp_domains.len() > 1;
 
-    for ((domain, _version), stats) in ptp_domains.iter() {
+    for ((domain, _version, _is_l2), stats) in ptp_domains.iter() {
         let gm_icon = if stats.clock_valid { "✓" } else if stats.last_grandmaster.is_some() { "⚠" } else { "❌" };
 
         let proto_label = stats.protocol_kind.as_deref().unwrap_or("PTP");
@@ -1396,7 +1396,7 @@ mod tests {
         let mut ptp = PtpStats::new(0, PTP_VERSION_V1);
         ptp.min_path_delay_ns = Some(20_000); // 4 "hops" by the 5µs heuristic
         ptp.max_path_delay_ns = Some(20_000);
-        domains.insert((0, PTP_VERSION_V1), ptp);
+        domains.insert((0, PTP_VERSION_V1, false), ptp);
 
         let lines = render_clock_sources(&domains, &[], &HashMap::new(), false).unwrap();
         assert!(!lines.iter().any(|l| l.text.contains("Dante latency should be")),
