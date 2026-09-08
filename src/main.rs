@@ -792,7 +792,7 @@ mod tests {
         let mut ptp = crate::stats::PtpStats::new(0, protocols::PTP_VERSION_V2);
         ptp.clock_valid = true;
         ptp.last_grandmaster = Some("00:1a:e5:ff:fe:12:34:56".to_string());
-        state.ptp.domains.insert((0, protocols::PTP_VERSION_V2), ptp);
+        state.ptp.domains.insert((0, protocols::PTP_VERSION_V2, false), ptp);
 
         let alerts = state.ts_refclk_alerts();
 
@@ -810,7 +810,7 @@ mod tests {
         let mut ptp = crate::stats::PtpStats::new(0, protocols::PTP_VERSION_V2);
         ptp.clock_valid = true;
         ptp.last_grandmaster = Some("aa:bb:cc:dd:ee:ff:00:11".to_string());
-        state.ptp.domains.insert((0, protocols::PTP_VERSION_V2), ptp);
+        state.ptp.domains.insert((0, protocols::PTP_VERSION_V2, false), ptp);
 
         let alerts = state.ts_refclk_alerts();
 

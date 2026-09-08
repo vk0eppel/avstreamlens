@@ -943,7 +943,7 @@ impl ScorePenalty {
 pub struct ScoringInputs<'a> {
     pub streams:      &'a HashMap<String, StreamStats>,
     pub tcp_streams:  &'a HashMap<String, TcpStreamStats>,
-    pub ptp_domains:  &'a HashMap<(u8, u8), PtpStats>,
+    pub ptp_domains:  &'a HashMap<(u8, u8, bool), PtpStats>,
     pub msrp_state:   &'a HashMap<[u8; 8], crate::protocols::MsrpDeclaration>,
     pub eee_ports:    &'a HashMap<(String, String), (u16, u16)>,
     pub avtp_streams: &'a HashMap<[u8; 8], AvtpStreamStats>,
@@ -1117,7 +1117,7 @@ impl NetworkHealth {
         }
 
         // ── PTP clock health (deterministic order) ────────────────────────────
-        let mut keys: Vec<&(u8, u8)> = ptp_domains.keys().collect();
+        let mut keys: Vec<&(u8, u8, bool)> = ptp_domains.keys().collect();
         keys.sort();
         for key in keys {
             let ptp = &ptp_domains[key];
@@ -1278,7 +1278,9 @@ impl PtpStats {
     pub fn update(&mut self, info: &crate::protocols::PtpInfo, protocol_kind: &Option<String>, now: Instant) -> Option<PtpEvent> {
         self.packets += 1;
         self.last_seen = now;
-        self.protocol_kind = protocol_kind.as_ref().map(|s| s.to_string());
+        if self.protocol_kind.is_none() {
+            self.protocol_kind = protocol_kind.as_ref().map(|s| s.to_string());
+        }
         if let Some(ip) = info.src_ip { self.last_src_ip = Some(ip); }
         if let Some(ref id) = info.clock_id { self.last_clock_id = Some(id.clone()); }
 
@@ -1867,7 +1869,7 @@ mod tests {
     // ── build_health_summary ─────────────────────────────────────────────────
     fn empty_streams() -> HashMap<String, StreamStats> { HashMap::new() }
     fn empty_tcp() -> HashMap<String, TcpStreamStats> { HashMap::new() }
-    fn empty_ptp() -> HashMap<(u8, u8), PtpStats> { HashMap::new() }
+    fn empty_ptp() -> HashMap<(u8, u8, bool), PtpStats> { HashMap::new() }
     fn empty_msrp() -> HashMap<[u8; 8], crate::protocols::MsrpDeclaration> { HashMap::new() }
     fn empty_eee() -> HashMap<(String, String), (u16, u16)> { HashMap::new() }
     fn empty_avtp() -> HashMap<[u8; 8], AvtpStreamStats> { HashMap::new() }
@@ -1878,7 +1880,7 @@ mod tests {
     fn scoring<'a>(
         streams: &'a HashMap<String, StreamStats>,
         tcp: &'a HashMap<String, TcpStreamStats>,
-        ptp: &'a HashMap<(u8, u8), PtpStats>,
+        ptp: &'a HashMap<(u8, u8, bool), PtpStats>,
         msrp: &'a HashMap<[u8; 8], crate::protocols::MsrpDeclaration>,
         eee: &'a HashMap<(String, String), (u16, u16)>,
         avtp: &'a HashMap<[u8; 8], AvtpStreamStats>,
@@ -1965,7 +1967,7 @@ mod tests {
         let mut d0 = PtpStats::new(0, 1);
         d0.clock_valid = false;
         d0.protocol_clock_lost = true;             // clock lost
-        ptp.insert((0, 1), d0);
+        ptp.insert((0, 1, false), d0);
 
         let mut eee = empty_eee();
         eee.insert(("chassis".into(), "port3".into()), (10, 20));
