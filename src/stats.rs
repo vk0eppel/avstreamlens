@@ -1277,7 +1277,6 @@ impl PtpStats {
     /// Returns an event when grandmaster state changes, so the caller can print/log it.
     pub fn update(&mut self, info: &crate::protocols::PtpInfo, protocol_kind: &Option<String>, now: Instant) -> Option<PtpEvent> {
         self.packets += 1;
-        self.last_seen = now;
         self.protocol_kind = protocol_kind.as_ref().map(|s| s.to_string());
         if let Some(ip) = info.src_ip { self.last_src_ip = Some(ip); }
         if let Some(ref id) = info.clock_id { self.last_clock_id = Some(id.clone()); }
@@ -1475,6 +1474,54 @@ mod tests {
         let t1 = t0 + Duration::from_secs(2); // under the 5s default timeout
         assert_eq!(ptp.check_timeout(t1), None);
         assert!(ptp.clock_valid);
+    }
+
+    fn ptp_message(message_type: u8) -> crate::protocols::PtpInfo {
+        crate::protocols::PtpInfo {
+            version: crate::protocols::PTP_VERSION_V2,
+            message_type,
+            domain: 0,
+            clock_id: Some("00:11:22:33:44:55:66:77".to_string()),
+            grandmaster_id: None,
+            clock_quality: None,
+            correction_ns: None,
+            path_delay_ns: None,
+            message_name: String::new(),
+            port_id: None,
+            sequence_id: 0,
+            log_sync_interval: 0,
+            protocol_kind: Some("PTPv2".to_string()),
+            src_ip: None,
+            stratum: None,
+        }
+    }
+
+    #[test]
+    fn follower_delay_req_does_not_keep_dead_clock_valid() {
+        let mut ptp = PtpStats::new(0, crate::protocols::PTP_VERSION_V2);
+        let t0 = Instant::now();
+        ptp.clock_valid = true;
+        ptp.last_seen = t0;
+        let kind = Some("PTPv2".to_string());
+
+        ptp.update(&ptp_message(0x01), &kind, t0 + Duration::from_secs(4));
+
+        assert_eq!(ptp.last_seen, t0, "Delay_Req must not refresh clock liveness");
+        assert_eq!(ptp.check_timeout(t0 + Duration::from_secs(6)), Some(PtpEvent::ClockLost));
+    }
+
+    #[test]
+    fn sync_keeps_clock_valid() {
+        let mut ptp = PtpStats::new(0, crate::protocols::PTP_VERSION_V2);
+        let t0 = Instant::now();
+        ptp.clock_valid = true;
+        ptp.last_seen = t0;
+        let kind = Some("PTPv2".to_string());
+
+        ptp.update(&ptp_message(0x00), &kind, t0 + Duration::from_secs(4));
+
+        assert_eq!(ptp.last_seen, t0 + Duration::from_secs(4));
+        assert_eq!(ptp.check_timeout(t0 + Duration::from_secs(6)), None);
     }
 
     // ── Loss counter ─────────────────────────────────────────────────────────
