@@ -1,7 +1,7 @@
 // AVStreamLens — src/stats.rs
 // Contains all statistical tracking structs and their associated calculation methods.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::Ipv4Addr;
 use std::time::{Duration, Instant};
 
@@ -147,6 +147,10 @@ pub struct StreamStats {
     // Out-of-order packets (negative seq delta). Distinct from loss: indicates
     // path instability or per-packet ECMP load-balancing rather than drops.
     pub reorders_this_window:           u64,
+    // Recently inferred missing sequence numbers. A late arrival removes the
+    // corresponding provisional loss instead of creating permanent phantom loss.
+    recent_missing:                     HashMap<u16, u64>,
+    missing_this_window:                HashSet<u16>,
     // Packets received this window (not lost). Denominator for the window-scoped
     // loss percentage that drives the PacketLoss diagnostic's score deduction —
     // kept separate from the lifetime `packets` count so a stream that stops
@@ -212,6 +216,8 @@ impl StreamStats {
             lost_this_window:               0,
             ts_discontinuities_this_window: 0,
             reorders_this_window:           0,
+            recent_missing:                 HashMap::new(),
+            missing_this_window:            HashSet::new(),
             packets_this_window:            0,
             rtp_seen:                       false,
             ts_delta_samples:               Vec::new(),
@@ -284,6 +290,15 @@ impl StreamStats {
         self.packets_this_window += 1;
         self.rtp_seen = true;
 
+        const MAX_REORDER_AGE_PACKETS: u64 = 1024;
+        self.recent_missing.retain(|_, seen_at| {
+            self.packets.saturating_sub(*seen_at) <= MAX_REORDER_AGE_PACKETS
+        });
+        self.missing_this_window.retain(|missing| self.recent_missing.contains_key(missing));
+
+        let mut advance_sequence = true;
+        let mut sequence_steps = 1u16;
+
         // ── Losses (16-bit wrapping) ──────────────────
         if let Some(last) = self.last_seq {
             let expected = last.wrapping_add(1);
@@ -291,16 +306,30 @@ impl StreamStats {
                 // RFC 3550 §A.3: treat large negative delta as reorder/reset, not loss
                 let delta = seq.wrapping_sub(expected) as i16;
                 if delta > 0 {
+                    sequence_steps = delta as u16 + 1;
                     self.lost_packets += delta as u64;
                     self.lost_this_window += delta as u64;
+                    for offset in 0..(delta as u16).min(MAX_REORDER_AGE_PACKETS as u16) {
+                        let missing = expected.wrapping_add(offset);
+                        self.recent_missing.insert(missing, self.packets);
+                        self.missing_this_window.insert(missing);
+                    }
                 } else {
                     // Negative delta = packet arrived out of order. Distinct from
                     // loss; high reorder rate suggests per-packet ECMP load-balancing.
                     self.reorders_this_window += 1;
+                    if self.recent_missing.remove(&seq).is_some() {
+                        self.lost_packets = self.lost_packets.saturating_sub(1);
+                        if self.missing_this_window.remove(&seq) {
+                            self.lost_this_window = self.lost_this_window.saturating_sub(1);
+                        }
+                    }
+                    advance_sequence = false;
                 }
             }
         }
-        self.last_seq = Some(seq);
+        if advance_sequence {
+            self.last_seq = Some(seq);
 
         // ── Timestamp discontinuity detection ────────
         // Only runs when clock rate is confirmed from SDP — default 48 kHz would produce
@@ -308,12 +337,13 @@ impl StreamStats {
         if self.clock_hz_confirmed
             && let Some(last_ts) = self.last_rtp_ts
         {
-            let expected_diff = if self.clock_hz > 0.0 {
+            let expected_diff_per_packet = if self.clock_hz > 0.0 {
                 let ptime_ms = if self.ptime_ms > 0.0 { self.ptime_ms } else { 1.0 };
                 (self.clock_hz * ptime_ms / 1000.0) as i64
             } else {
                 48 // fallback: 1 ms @ 48 kHz
             };
+            let expected_diff = expected_diff_per_packet * i64::from(sequence_steps);
             // Cast through i32 first to preserve sign — u32::wrapping_sub
             // returns u32, and `as i64` would always be non-negative.
             let actual_diff = rtp_ts.wrapping_sub(last_ts) as i32 as i64;
@@ -368,8 +398,9 @@ impl StreamStats {
             let d            = (arrival_diff - rtp_diff).abs();
             self.jitter     += (d - self.jitter) / 16.0;
         }
-        self.last_rtp_ts  = Some(rtp_ts);
-        self.last_arrival = Some(now);
+            self.last_rtp_ts  = Some(rtp_ts);
+            self.last_arrival = Some(now);
+        }
 
         // ── SSRC tracking ────────────────────────────
         if self.last_ssrc.is_some_and(|prev| prev != ssrc) {
@@ -388,6 +419,12 @@ impl StreamStats {
             self.packets_at_check = self.packets;
             self.last_bitrate_check = now;
         }
+    }
+
+    pub fn reset_sequence_window(&mut self) {
+        self.lost_this_window = 0;
+        self.reorders_this_window = 0;
+        self.missing_this_window.clear();
     }
 
     /// Presence/bitrate tracking for flows whose payload is not RTP (Dante ATP).
@@ -748,6 +785,7 @@ pub struct AvtpStreamStats {
     pub pcp_violations:     u64,
     pub observed_pcp:       Option<u8>,
     pub msrp_declared_pcp:  Option<u8>,
+    recent_missing:         HashMap<u8, u64>,
 }
 
 impl AvtpStreamStats {
@@ -766,6 +804,7 @@ impl AvtpStreamStats {
             pcp_violations:     0,
             observed_pcp:       None,
             msrp_declared_pcp:  None,
+            recent_missing:     HashMap::new(),
         }
     }
 
@@ -786,16 +825,32 @@ impl AvtpStreamStats {
     /// Update sequence-loss tracking from the AVTP sequence_num byte (8-bit wrapping).
     /// Negative signed delta = reorder/reset, not loss (mirrors the RTP fix).
     pub fn update_seq(&mut self, seq: u8) {
+        const MAX_REORDER_AGE_FRAMES: u64 = 64;
+        self.recent_missing.retain(|_, seen_at| {
+            self.packets.saturating_sub(*seen_at) <= MAX_REORDER_AGE_FRAMES
+        });
+
+        let mut advance_sequence = true;
         if let Some(last) = self.last_seq {
             let expected = last.wrapping_add(1);
             if seq != expected {
                 let delta = seq.wrapping_sub(expected) as i8;
                 if delta > 0 {
                     self.lost_frames += delta as u64;
+                    for offset in 0..(delta as u8).min(MAX_REORDER_AGE_FRAMES as u8) {
+                        self.recent_missing.insert(expected.wrapping_add(offset), self.packets);
+                    }
+                } else {
+                    if self.recent_missing.remove(&seq).is_some() {
+                        self.lost_frames = self.lost_frames.saturating_sub(1);
+                    }
+                    advance_sequence = false;
                 }
             }
         }
-        self.last_seq = Some(seq);
+        if advance_sequence {
+            self.last_seq = Some(seq);
+        }
     }
 
     pub fn loss_pct(&self) -> f64 {
@@ -1556,6 +1611,27 @@ mod tests {
     }
 
     #[test]
+    fn reordered_rtp_swap_corrects_provisional_loss_without_regressing_timing() {
+        let mut s = aes67();
+        s.clock_hz_confirmed = true;
+        s.ptime_ms = 1.0;
+        let t0 = Instant::now();
+
+        s.update(9, 0, 1, 100, t0);
+        s.update(11, 96, 1, 100, t0 + Duration::from_millis(2));
+        s.update(10, 48, 1, 100, t0 + Duration::from_millis(3));
+        s.update(12, 144, 1, 100, t0 + Duration::from_millis(3));
+
+        assert_eq!(s.lost_packets, 0);
+        assert_eq!(s.lost_this_window, 0);
+        assert_eq!(s.reorders_this_window, 1);
+        assert_eq!(s.ts_discontinuities, 0);
+        assert_eq!(s.last_seq, Some(12));
+        assert_eq!(s.last_rtp_ts, Some(144));
+        assert!(s.jitter < f64::EPSILON, "reordered packet changed jitter: {}", s.jitter);
+    }
+
+    #[test]
     fn lost_this_window_tracks_per_window_drops() {
         let mut s = aes67();
         s.update(0, 0,   1, 100, Instant::now());
@@ -1594,6 +1670,18 @@ mod tests {
         s.update_seq(100);
         s.update_seq(90);
         assert_eq!(s.lost_frames, 0);
+    }
+
+    #[test]
+    fn avtp_reordered_swap_corrects_provisional_loss_and_keeps_highest_seq() {
+        let mut s = avtp();
+        for seq in [9, 11, 10, 12] {
+            s.packets += 1;
+            s.update_seq(seq);
+        }
+
+        assert_eq!(s.lost_frames, 0);
+        assert_eq!(s.last_seq, Some(12));
     }
 
     #[test]

@@ -724,9 +724,8 @@ impl CaptureState {
             s.dscp_violations = 0;
             s.pcp_violations  = 0;
             s.ssrc_changes    = 0;
-            s.lost_this_window               = 0;
+            s.reset_sequence_window();
             s.ts_discontinuities_this_window = 0;
-            s.reorders_this_window           = 0;
             s.packets_this_window            = 0;
         }
         self.streams.retain(|_, s| {
@@ -4132,4 +4131,3 @@ mod tests {
         assert_eq!(s.pcp_violations, 0);
     }
 }
-
