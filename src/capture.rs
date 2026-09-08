@@ -977,16 +977,18 @@ impl CaptureState {
     /// AES67 RTP audio.
     pub fn handle_aes67(&mut self, dst: Ipv4Addr, dst_port: u16, payload_type: u8, l2_payload: &[u8], pcp: Option<u8>, now: Instant) -> Vec<Alert> {
         let key = format!("AES67 {}:{}", dst, dst_port);
-        let sdp_match = self.find_sdp_media(dst, dst_port).map(|(name, m)| (name.to_string(), m.clone()));
-        let stats = self.streams.entry(key).or_insert_with(|| {
+        if !self.streams.contains_key(&key) {
+            let sdp_match = self.find_sdp_media(dst, dst_port)
+                .map(|(name, m)| (name.to_string(), m.clone()));
             let mut s = StreamStats::new_with_info(Protocol::Aes67, DEFAULT_CLOCK_HZ, is_aes67_multicast(dst), dst, dst_port);
             s.media_type = "audio".to_string();
             s.channels = 1;
             if let Some((name, media)) = &sdp_match {
                 s.apply_sdp(media, name);
             }
-            s
-        });
+            self.streams.insert(key.clone(), s);
+        }
+        let stats = self.streams.get_mut(&key).expect("AES67 stream inserted above");
         // AES67 requires DSCP EF (46) per spec; PT already extracted in detect_protocol.
         Self::update_rtp_media_packet(
             stats, &mut self.network_health, l2_payload, pcp,
@@ -1005,8 +1007,9 @@ impl CaptureState {
         };
         let key = format!("ST {} {}:{}", label, dst, dst_port);
         let default_clock = if matches!(stream_type, St2110Type::Video) { 90_000.0 } else { DEFAULT_CLOCK_HZ };
-        let sdp_match = self.find_sdp_media(dst, dst_port).map(|(name, m)| (name.to_string(), m.clone()));
-        let stats = self.streams.entry(key).or_insert_with(|| {
+        if !self.streams.contains_key(&key) {
+            let sdp_match = self.find_sdp_media(dst, dst_port)
+                .map(|(name, m)| (name.to_string(), m.clone()));
             let mut s = StreamStats::new_with_info(Protocol::St2110(stream_type), default_clock, is_st2110_multicast(dst), dst, dst_port);
             s.media_type = match stream_type {
                 St2110Type::Video => "video".to_string(),
@@ -1021,8 +1024,9 @@ impl CaptureState {
             if !confirmed && matches!(stream_type, St2110Type::Audio) {
                 s.ptime_ms = 1.0;
             }
-            s
-        });
+            self.streams.insert(key.clone(), s);
+        }
+        let stats = self.streams.get_mut(&key).expect("ST2110 stream inserted above");
         // ST2110-20 video accepts EF/CS5/AF41; audio/anc require EF only.
         let is_video = matches!(stream_type, St2110Type::Video);
         Self::update_rtp_media_packet(
@@ -4132,4 +4136,3 @@ mod tests {
         assert_eq!(s.pcp_violations, 0);
     }
 }
-
