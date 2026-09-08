@@ -763,7 +763,7 @@ mod tests {
 
     fn active_aes67_stream(port: u16) -> crate::stats::StreamStats {
         let mut s = crate::stats::StreamStats::new_with_info(
-            Protocol::Aes67, 48_000.0, true, Ipv4Addr::new(239, 69, 0, 1), port);
+            Protocol::Aes67, 48_000.0, true, Ipv4Addr::new(239, 69, 0, 1), port, Instant::now());
         s.packets = 10;
         s
     }
@@ -789,7 +789,7 @@ mod tests {
         state.sdp_cache.insert("1".into(),
             sdp_with_ts_refclk(5004, "ptp=IEEE1588-2008:00-1a-e5-ff-fe-12-34-56:0"));
 
-        let mut ptp = crate::stats::PtpStats::new(0, protocols::PTP_VERSION_V2);
+        let mut ptp = crate::stats::PtpStats::new(0, protocols::PTP_VERSION_V2, Instant::now());
         ptp.clock_valid = true;
         ptp.last_grandmaster = Some("00:1a:e5:ff:fe:12:34:56".to_string());
         state.ptp.domains.insert((0, protocols::PTP_VERSION_V2), ptp);
@@ -807,7 +807,7 @@ mod tests {
         state.sdp_cache.insert("1".into(),
             sdp_with_ts_refclk(5004, "ptp=IEEE1588-2008:00-1a-e5-ff-fe-12-34-56:0"));
 
-        let mut ptp = crate::stats::PtpStats::new(0, protocols::PTP_VERSION_V2);
+        let mut ptp = crate::stats::PtpStats::new(0, protocols::PTP_VERSION_V2, Instant::now());
         ptp.clock_valid = true;
         ptp.last_grandmaster = Some("aa:bb:cc:dd:ee:ff:00:11".to_string());
         state.ptp.domains.insert((0, protocols::PTP_VERSION_V2), ptp);

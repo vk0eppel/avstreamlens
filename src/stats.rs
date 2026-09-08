@@ -174,7 +174,7 @@ pub struct StreamStats {
 }
 
 impl StreamStats {
-    pub fn new(protocol: crate::protocols::Protocol, clock_hz: f64) -> Self {
+    pub fn new(protocol: crate::protocols::Protocol, clock_hz: f64, now: Instant) -> Self {
         Self {
             protocol,
             packets:             0,
@@ -193,7 +193,7 @@ impl StreamStats {
             media_type:          "unknown".to_string(),
             channels:            0,
             bitrate_bps:         0,
-            last_bitrate_check:  Instant::now(),
+            last_bitrate_check:  now,
             packets_at_check:    0,
             ts_discontinuities:  0,
             last_ts_diff:        None,
@@ -222,8 +222,8 @@ impl StreamStats {
     }
 
     // Constructor with enhanced info — useful when SDP is available at stream start
-    pub fn new_with_info(protocol: crate::protocols::Protocol, clock_hz: f64, is_multicast: bool, dst_ip: Ipv4Addr, dst_port: u16) -> Self {
-        let mut stats = Self::new(protocol, clock_hz);
+    pub fn new_with_info(protocol: crate::protocols::Protocol, clock_hz: f64, is_multicast: bool, dst_ip: Ipv4Addr, dst_port: u16, now: Instant) -> Self {
+        let mut stats = Self::new(protocol, clock_hz, now);
         stats.is_multicast = is_multicast;
         stats.dst_ip = Some(dst_ip);
         stats.dst_port = dst_port;
@@ -751,18 +751,18 @@ pub struct AvtpStreamStats {
 }
 
 impl AvtpStreamStats {
-    pub fn new(stream_id: [u8; 8], subtype: u8) -> Self {
+    pub fn new(stream_id: [u8; 8], subtype: u8, now: Instant) -> Self {
         Self {
             stream_id,
             subtype,
             packets:            0,
             lost_frames:        0,
             last_seq:           None,
-            last_seen:          Instant::now(),
+            last_seen:          now,
             bytes_total:        0,
             bytes_at_check:     0,
             bitrate_bps:        0,
-            last_bitrate_check: Instant::now(),
+            last_bitrate_check: now,
             pcp_violations:     0,
             observed_pcp:       None,
             msrp_declared_pcp:  None,
@@ -843,7 +843,7 @@ pub enum StreamQuality {
 }
 
 impl TcpStreamStats {
-    pub fn new(src_ip: Ipv4Addr, dst_ip: Ipv4Addr) -> Self {
+    pub fn new(src_ip: Ipv4Addr, dst_ip: Ipv4Addr, now: Instant) -> Self {
         Self {
             src_ip,
             dst_ip,
@@ -852,10 +852,10 @@ impl TcpStreamStats {
             retransmissions: 0,
             fin_packets: 0,
             rst_packets: 0,
-            last_seen: Instant::now(),
+            last_seen: now,
             stream_quality: StreamQuality::Healthy,
             bitrate_bps: 0,
-            last_bitrate_check: Instant::now(),
+            last_bitrate_check: now,
             bytes_at_check: 0,
             last_seq: None,
             last_ack: None,
@@ -1246,13 +1246,13 @@ pub enum PtpEvent {
 }
 
 impl PtpStats {
-    pub fn new(domain: u8, version: u8) -> Self {
+    pub fn new(domain: u8, version: u8, now: Instant) -> Self {
         Self {
             domain,
             version,
             packets: 0,
             protocol_kind: None,
-            last_seen: Instant::now(),
+            last_seen: now,
             last_grandmaster: None,
             grandmaster_changes: 0,
             clock_valid: false,
@@ -1418,7 +1418,7 @@ mod tests {
     use super::*;
 
     fn aes67() -> StreamStats {
-        StreamStats::new(Protocol::Aes67, 48_000.0)
+        StreamStats::new(Protocol::Aes67, 48_000.0, Instant::now())
     }
 
     // ── Bitrate reflects the caller's clock, not wall time (issue #35) ───────
@@ -1448,6 +1448,18 @@ mod tests {
             "expected ~4400 bits/sec from the 2s synthetic gap, got {}", s.bitrate_bps);
     }
 
+    #[test]
+    fn first_bitrate_window_starts_at_synthetic_stream_creation_time() {
+        let t0 = Instant::now() + Duration::from_secs(3600);
+        let mut s = StreamStats::new(Protocol::Aes67, 48_000.0, t0);
+
+        s.update(0, 0, 1, 100, t0);
+        s.update(1, 48, 1, 1000, t0 + Duration::from_secs(2));
+
+        assert_eq!(s.bitrate_bps, 4400,
+            "first window must use capture time, not constructor wall time");
+    }
+
     // ── PTP clock-loss timeout reflects the caller's clock, not wall time ────
     // (issue #35) — replay processes packets far faster than the capture's own
     // pace, so check_timeout must fire based on the `now` passed in, not on how
@@ -1455,7 +1467,7 @@ mod tests {
 
     #[test]
     fn check_timeout_fires_on_synthetic_gap_exceeding_timeout() {
-        let mut ptp = PtpStats::new(0, crate::protocols::PTP_VERSION_V2);
+        let mut ptp = PtpStats::new(0, crate::protocols::PTP_VERSION_V2, Instant::now());
         ptp.clock_valid = true;
         let t0 = Instant::now();
         ptp.last_seen = t0;
@@ -1468,7 +1480,7 @@ mod tests {
 
     #[test]
     fn check_timeout_silent_before_synthetic_gap_reaches_timeout() {
-        let mut ptp = PtpStats::new(0, crate::protocols::PTP_VERSION_V2);
+        let mut ptp = PtpStats::new(0, crate::protocols::PTP_VERSION_V2, Instant::now());
         ptp.clock_valid = true;
         let t0 = Instant::now();
         ptp.last_seen = t0;
@@ -1573,7 +1585,7 @@ mod tests {
     // ── AVTP 8-bit sequence wrap ────────────────────────────────────────────
 
     fn avtp() -> AvtpStreamStats {
-        AvtpStreamStats::new([0u8; 8], 0x00)
+        AvtpStreamStats::new([0u8; 8], 0x00, Instant::now())
     }
 
     #[test]
@@ -1962,7 +1974,7 @@ mod tests {
         health.multiple_queriers_this_window = true;
 
         let mut ptp = empty_ptp();
-        let mut d0 = PtpStats::new(0, 1);
+        let mut d0 = PtpStats::new(0, 1, Instant::now());
         d0.clock_valid = false;
         d0.protocol_clock_lost = true;             // clock lost
         ptp.insert((0, 1), d0);
@@ -2081,7 +2093,7 @@ mod tests {
     #[test]
     fn informational_only_diagnostics_produce_no_penalty() {
         let health = NetworkHealth::new();
-        let mut s = StreamStats::new(Protocol::St2110(St2110Type::Unknown), 90_000.0); // UnknownStreamType
+        let mut s = StreamStats::new(Protocol::St2110(St2110Type::Unknown), 90_000.0, Instant::now()); // UnknownStreamType
         s.packets = 100;
         s.packets_this_window = 100;
         s.last_packet_time = Some(Instant::now());
@@ -2107,7 +2119,7 @@ mod tests {
         // Health Summary — this pins the fix.
         let health = NetworkHealth::new();
         let mut avtp = empty_avtp();
-        let mut s = AvtpStreamStats::new([1, 2, 3, 4, 5, 6, 7, 8], 0x00);
+        let mut s = AvtpStreamStats::new([1, 2, 3, 4, 5, 6, 7, 8], 0x00, Instant::now());
         s.pcp_violations = 1;
         s.observed_pcp = Some(2);
         s.msrp_declared_pcp = Some(3);
@@ -2125,7 +2137,7 @@ mod tests {
     fn summary_no_bullet_for_avb_stream_without_pcp_violation() {
         let health = NetworkHealth::new();
         let mut avtp = empty_avtp();
-        let s = AvtpStreamStats::new([1, 2, 3, 4, 5, 6, 7, 8], 0x00);
+        let s = AvtpStreamStats::new([1, 2, 3, 4, 5, 6, 7, 8], 0x00, Instant::now());
         avtp.insert(s.stream_id, s);
 
         let out = health.build_health_summary(&scoring(&empty_streams(), &empty_tcp(), &empty_ptp(), &empty_msrp(), &empty_eee(), &avtp, Instant::now()));
@@ -2242,7 +2254,7 @@ mod tests {
     // ── TcpStreamStats::update_quality / update_bitrate ──────────────────────
 
     fn ndi_tcp() -> TcpStreamStats {
-        TcpStreamStats::new(Ipv4Addr::new(192, 168, 1, 60), Ipv4Addr::new(192, 168, 1, 5))
+        TcpStreamStats::new(Ipv4Addr::new(192, 168, 1, 60), Ipv4Addr::new(192, 168, 1, 5), Instant::now())
     }
 
     #[test]
@@ -2378,7 +2390,7 @@ mod tests {
 
     #[test]
     fn is_ip_ptp_domain_true_for_aes67() {
-        let mut s = PtpStats::new(0, crate::protocols::PTP_VERSION_V2);
+        let mut s = PtpStats::new(0, crate::protocols::PTP_VERSION_V2, Instant::now());
         s.protocol_kind = Some("AES67".to_string());
         assert!(s.is_ip_ptp_domain());
         assert!(!s.is_gptp_domain());
@@ -2386,7 +2398,7 @@ mod tests {
 
     #[test]
     fn is_gptp_domain_true_for_avb() {
-        let mut s = PtpStats::new(0, crate::protocols::PTP_VERSION_V2);
+        let mut s = PtpStats::new(0, crate::protocols::PTP_VERSION_V2, Instant::now());
         s.protocol_kind = Some("AVB".to_string());
         assert!(s.is_gptp_domain());
         assert!(!s.is_ip_ptp_domain());
@@ -2396,7 +2408,7 @@ mod tests {
     fn is_ip_ptp_domain_true_when_protocol_kind_unset() {
         // A domain seen before its protocol_kind is assigned is IP-PTP by default
         // (matches the existing `!= Some("AVB")` behavior for None).
-        let s = PtpStats::new(0, crate::protocols::PTP_VERSION_V2);
+        let s = PtpStats::new(0, crate::protocols::PTP_VERSION_V2, Instant::now());
         assert!(s.is_ip_ptp_domain());
         assert!(!s.is_gptp_domain());
     }
