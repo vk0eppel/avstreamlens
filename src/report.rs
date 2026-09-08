@@ -1200,9 +1200,10 @@ mod tests {
     use super::*;
     use crate::stats::StreamStats;
     use std::net::Ipv4Addr;
+    use std::time::Instant;
 
     fn dante_stream(src: Ipv4Addr, multicast: bool, atp: bool) -> StreamStats {
-        let mut s = StreamStats::new(Protocol::Dante, 48_000.0);
+        let mut s = StreamStats::new(Protocol::Dante, 48_000.0, Instant::now());
         s.src_ip = Some(src);
         s.is_multicast = multicast;
         s.rtp_seen = !atp; // ATP flows never set rtp_seen
@@ -1258,7 +1259,7 @@ mod tests {
     fn tx_flow_count_ignores_non_dante_protocols() {
         let ip = Ipv4Addr::new(192, 168, 1, 45);
         let mut streams = HashMap::new();
-        let mut aes = StreamStats::new(Protocol::Aes67, 48_000.0);
+        let mut aes = StreamStats::new(Protocol::Aes67, 48_000.0, Instant::now());
         aes.src_ip = Some(ip);
         streams.insert("AES67 x".into(), aes);
         assert_eq!(dante_tx_flow_count(&streams, ip), 0, "only Dante flows count toward Dante budget");
@@ -1393,7 +1394,7 @@ mod tests {
         // unreachable. Even when the path-delay fields are populated, a v1 domain
         // must not render it — v1 path delay is not a real measurement.
         let mut domains = HashMap::new();
-        let mut ptp = PtpStats::new(0, PTP_VERSION_V1);
+        let mut ptp = PtpStats::new(0, PTP_VERSION_V1, Instant::now());
         ptp.min_path_delay_ns = Some(20_000); // 4 "hops" by the 5µs heuristic
         ptp.max_path_delay_ns = Some(20_000);
         domains.insert((0, PTP_VERSION_V1), ptp);
@@ -1414,17 +1415,17 @@ mod tests {
         let ndi_ip = Ipv4Addr::new(192, 168, 1, 60);
         let peer = Ipv4Addr::new(192, 168, 1, 5);
         let mut streams = HashMap::new();
-        let mut s = StreamStats::new_with_info(Protocol::Ndi, 0.0, false, ndi_ip, 0);
+        let mut s = StreamStats::new_with_info(Protocol::Ndi, 0.0, false, ndi_ip, 0, Instant::now());
         s.bitrate_bps = 3_500_000; // aggregate_ndi_bitrate's sum of both connections
         s.last_packet_time = Some(std::time::Instant::now());
         streams.insert("NDI x".into(), s);
 
         let mut tcp_streams = HashMap::new();
-        let mut t1 = TcpStreamStats::new(ndi_ip, peer);
+        let mut t1 = TcpStreamStats::new(ndi_ip, peer, Instant::now());
         t1.bitrate_bps = 1_000_000;
         t1.retransmissions = 2; // quality stays Healthy
         tcp_streams.insert("t1".into(), t1);
-        let mut t2 = TcpStreamStats::new(peer, ndi_ip);
+        let mut t2 = TcpStreamStats::new(peer, ndi_ip, Instant::now());
         t2.bitrate_bps = 2_500_000;
         t2.retransmissions = 5;
         t2.stream_quality = StreamQuality::Critical;
@@ -1476,7 +1477,7 @@ mod tests {
     fn avb_stream_renders_pcp_mismatch_line() {
         use crate::stats::AvtpStreamStats;
         let sid = [1u8, 2, 3, 4, 5, 6, 7, 8];
-        let mut avtp = AvtpStreamStats::new(sid, 0x00);
+        let mut avtp = AvtpStreamStats::new(sid, 0x00, Instant::now());
         avtp.pcp_violations = 1;
         avtp.observed_pcp = Some(2);
         avtp.msrp_declared_pcp = Some(3);
@@ -1499,7 +1500,7 @@ mod tests {
     fn avb_stream_no_pcp_line_when_no_violation() {
         use crate::stats::AvtpStreamStats;
         let sid = [1u8, 2, 3, 4, 5, 6, 7, 8];
-        let avtp = AvtpStreamStats::new(sid, 0x00);
+        let avtp = AvtpStreamStats::new(sid, 0x00, Instant::now());
         let mut avtp_streams = HashMap::new();
         avtp_streams.insert(sid, avtp);
 
@@ -1520,7 +1521,7 @@ mod tests {
         use crate::stats::AvtpStreamStats;
         let sid = [1u8, 2, 3, 4, 5, 6, 7, 8];
         let t0 = std::time::Instant::now();
-        let mut avtp = AvtpStreamStats::new(sid, 0x00);
+        let mut avtp = AvtpStreamStats::new(sid, 0x00, Instant::now());
         avtp.last_seen = t0;
         let mut avtp_streams = HashMap::new();
         avtp_streams.insert(sid, avtp);
@@ -1561,8 +1562,8 @@ mod tests {
     #[test]
     fn qos_status_reads_no_ip_streams_when_all_ndi_or_avb() {
         let mut streams = HashMap::new();
-        streams.insert("NDI a".into(), StreamStats::new(Protocol::Ndi, 0.0));
-        streams.insert("AVB a".into(), StreamStats::new(Protocol::Avb, 0.0));
+        streams.insert("NDI a".into(), StreamStats::new(Protocol::Ndi, 0.0, Instant::now()));
+        streams.insert("AVB a".into(), StreamStats::new(Protocol::Avb, 0.0, Instant::now()));
         let health = NetworkHealth::new();
 
         let lines = render_network_status(&network_status_inputs(&streams, &health, &HashMap::new()));
@@ -1574,7 +1575,7 @@ mod tests {
     #[test]
     fn qos_status_reads_all_correct_when_no_dscp_violations() {
         let mut streams = HashMap::new();
-        streams.insert("AES67 a".into(), StreamStats::new(Protocol::Aes67, 48_000.0));
+        streams.insert("AES67 a".into(), StreamStats::new(Protocol::Aes67, 48_000.0, Instant::now()));
         let health = NetworkHealth::new();
 
         let lines = render_network_status(&network_status_inputs(&streams, &health, &HashMap::new()));
@@ -1586,7 +1587,7 @@ mod tests {
     #[test]
     fn qos_status_reports_violation_count() {
         let mut streams = HashMap::new();
-        let mut bad = StreamStats::new(Protocol::Aes67, 48_000.0);
+        let mut bad = StreamStats::new(Protocol::Aes67, 48_000.0, Instant::now());
         bad.dscp_violations = 3;
         streams.insert("AES67 a".into(), bad);
         let health = NetworkHealth::new();
@@ -1654,7 +1655,7 @@ mod tests {
         use crate::capture::CaptureState;
 
         let mut state = CaptureState::new();
-        state.streams.insert("s1".into(), StreamStats::new(Protocol::Aes67, 48_000.0));
+        state.streams.insert("s1".into(), StreamStats::new(Protocol::Aes67, 48_000.0, Instant::now()));
         state.dante.sources.insert(Ipv4Addr::new(169, 254, 1, 1));
 
         let checks = state.end_of_window(&[], false, std::time::Instant::now());
